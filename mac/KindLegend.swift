@@ -158,7 +158,11 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
     func show(_ kinds: [KindUsage]) {
         followed = nil
         rows = kinds
-        orderRows()
+        if let sort = table.sortDescriptors.first, sort.key == "bytes" && !sort.ascending {
+            reloadRows()
+        } else {
+            orderRows()
+        }
     }
     private func orderRows() {
         let sorter = table.sortDescriptors.first
@@ -171,6 +175,9 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
             if cmp == .orderedSame { return a.kind.identifier < b.kind.identifier }
             return key == "kind" && !ascending ? cmp == .orderedDescending : cmp == .orderedAscending
         }
+        reloadRows()
+    }
+    private func reloadRows() {
         indices = Dictionary(uniqueKeysWithValues: rows.enumerated().map { ($1.kind.id, $0) })
         table.reloadData()
         if let followed, let i = indices[followed] { table.scrollRowToVisible(i) }
@@ -212,7 +219,7 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
         field.identifier = id
         field.alignment = .right
         field.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        field.textColor = .secondaryLabelColor
+        field.textColor = .labelColor.withAlphaComponent(0.83)
         field.stringValue = id.rawValue == "bytes" ? formatBytes(item.bytes) : formatCount(item.files)
         return field
     }

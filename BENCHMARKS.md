@@ -4,12 +4,12 @@ Measured on an Apple M4 Pro running macOS 27.0.1. The tests used the local APFS 
 
 ## Opening a document
 
-On a generated tree containing **50,048 entries** across 128 groups and six subfolders per group, opening a fresh DiskTally window took a median **0.439 s**. Disk Inventory X 1.3 took **5.101 s**, an **11.6×** difference. Each run launched a new process. Both apps had to show a document window with the requested name and a populated native outline with a nonzero-height visible row. DiskTally additionally had to report a completed file raster. The timer included launch and accessibility polling. Each app had one warm-up followed by three alternating measured launches. An earlier series using the same readiness checks measured 0.524 s and 5.493 s respectively.
+On a generated tree containing **50,048 entries** across 128 groups and six subfolders per group, opening a fresh DiskTally window took a median **0.509 s** with the Finder icons and file-kind legend. Disk Inventory X 1.3 took **5.018 s**, a **9.9×** difference. Each run launched a new process. Both apps had to show a document window with the requested name and a populated native outline with a nonzero-height visible row. DiskTally additionally had to report a completed file raster. The timer included launch and accessibility polling. Each app had one warm-up followed by three alternating measured launches. These are warm-cache observations on the local APFS volume.
 
 | Application | Run 1 | Run 2 | Run 3 |
 | --- | ---: | ---: | ---: |
-| DiskTally, native Apple silicon | 0.439 s | 0.433 s | 0.490 s |
-| Disk Inventory X 1.3, Intel under Rosetta | 5.596 s | 5.045 s | 5.101 s |
+| DiskTally, native Apple silicon | 0.476 s | 0.517 s | 0.509 s |
+| Disk Inventory X 1.3, Intel under Rosetta | 4.996 s | 5.018 s | 5.021 s |
 
 ## Scanning
 
@@ -25,8 +25,8 @@ Use `python3 bench.py /path/to/tree` after building. Optional `--dua` and `--szt
 
 ## Interaction
 
-- **Treemap.** The Xcode tree had 137,232 file shapes, including 11,205 zero-allocation entries. Their areas summed to the full map within floating-point tolerance. The geometry used 14.34 MiB and took 33.0 ms to construct. A 1,500 × 1,000-pixel overview rendered in 10.94 ms at the median. A render centered on the smallest rectangle took 0.41 ms. These timings cover the file raster and label preparation. Display composition adds work. Center-point hit tests on a systematic sample matched the original file keys, and the containing folder ranges covered those rectangles.
-- **Folder outline.** Expanding a folder with 24,000 children took 19.4 ms the first time and 8.3 ms on subsequent expansions. Collapse took 6.0 ms initially and 5.8 ms on subsequent collapses. Revealing a file four levels down took 22.4 ms and reached its exact 4,096-byte row.
+- **Treemap.** The Xcode tree had 137,232 file shapes, including 11,205 zero-allocation entries. Their areas summed to the full map within floating-point tolerance. The geometry used 15.50 MiB. Construction, including kind lookup and package statistics, took 81.0 ms. The 1,500 × 1,000-pixel gradient overview rendered in about 4.6 ms with a warmed allocator. A render centered on the smallest rectangle took 0.25 ms. These timings cover the file raster and label preparation. Display composition adds work. Center-point hit tests on a systematic sample matched the original file keys, and the containing folder ranges covered those rectangles.
+- **Folder outline.** Expanding a folder with 24,000 children took 27.2 ms the first time and about 10.6 ms on subsequent expansions. Collapse took 6.3 ms initially and about 6.0 ms on subsequent collapses. Revealing a file four levels down took 33.4 ms and reached its exact 4,096-byte row.
 - **Cached reopen.** Two observations of an unchanged local test root took 3.9 ms and 20.6 ms for identity and event-stream validation. A recently written fixture also triggered conservative revalidation while macOS delivered its coalesced events. After nested writes and a rename, incremental refresh produced the same allocation and entry count as a fresh scan.
 - **Trash.** Moving an isolated generated folder containing 4,041 entries took 164 ms. This included preparing the batch review, performing the system Trash operation, updating the index, and rendering the resulting 1,500 × 1,000-pixel map. It excludes the time a person spends reading the review. The same check verified that an unrelated hard link retained its allocation and that a replaced file stayed in place. This single local measurement depends on the volume and filesystem load.
 
