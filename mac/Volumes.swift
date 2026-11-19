@@ -58,15 +58,17 @@ final class VolumePicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             col.title = title; col.width = CGFloat(width); col.minWidth = 82
             table.addTableColumn(col)
         }
-        table.style = .inset; table.rowHeight = 30; table.allowsMultipleSelection = false
+        table.rowHeight = 30; table.allowsMultipleSelection = false
         table.delegate = self; table.dataSource = self; table.target = self; table.doubleAction = #selector(choose)
         table.setAccessibilityLabel("Mounted volumes")
-        let scroll = NSScrollView(); scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        let surface = NativeTableSurface(table)
         let buttons = NSStackView(views: [cancel,scanButton]); buttons.spacing = 8
-        for v in [scroll,showAll!,buttons] as [NSView] { content.addSubview(v); v.translatesAutoresizingMaskIntoConstraints = false }
+        scanButton.setContentHuggingPriority(.required, for: .vertical)
+        for v in [surface,showAll!,buttons] as [NSView] { content.addSubview(v); v.translatesAutoresizingMaskIntoConstraints = false }
         NSLayoutConstraint.activate([
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10), scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
-            scroll.topAnchor.constraint(equalTo: content.topAnchor, constant: 8), scroll.bottomAnchor.constraint(equalTo: buttons.topAnchor, constant: -12),
+            buttons.heightAnchor.constraint(equalTo: scanButton.heightAnchor),
+            surface.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10), surface.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
+            surface.topAnchor.constraint(equalTo: content.topAnchor, constant: 8), surface.bottomAnchor.constraint(equalTo: buttons.topAnchor, constant: -12),
             showAll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18), showAll.centerYAnchor.constraint(equalTo: buttons.centerYAnchor),
             buttons.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16), buttons.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -14)])
         let center = NSWorkspace.shared.notificationCenter
@@ -98,14 +100,14 @@ final class VolumePicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard visible.indices.contains(row), let id = tableColumn?.identifier else { return nil }
         let volume = visible[row]
         let text = id.rawValue == "name" ? volume.name : id.rawValue == "path" ? volume.url.path : (volume.available.map(formatBytes) ?? "—")
-        let label = NSTextField(labelWithString: text)
-        label.lineBreakMode = .byTruncatingMiddle; label.toolTip = text
-        if id.rawValue == "name" {
-            let icon = NSImageView(image: NSImage(systemSymbolName: volume.symbol, accessibilityDescription: nil) ?? NSImage())
-            icon.contentTintColor = .controlAccentColor
-            let stack = NSStackView(views: [icon,label]); stack.spacing = 6; return stack
+        let isName = id.rawValue == "name"
+        let cell = CenteredTableCell.make(in: table, column: id, icon: isName, numeric: id.rawValue == "free")
+        cell.textField?.stringValue = text; cell.toolTip = text
+        cell.textField?.textColor = isName ? .labelColor : .secondaryLabelColor
+        if isName {
+            cell.imageView?.image = NSImage(systemSymbolName: volume.symbol, accessibilityDescription: nil)
+            cell.imageView?.contentTintColor = .controlAccentColor
         }
-        label.textColor = .secondaryLabelColor
-        return label
+        return cell
     }
 }

@@ -15,14 +15,21 @@ To build on macOS with a current Rust toolchain and a Swift compiler with the ma
 | Click a file tile | Expands its ancestors, selects the exact file, scrolls to its outline row, and shows its allocated size. |
 | Hover a tile or outline row | Shows its full path in the top header and in a native tooltip. The matching file kind gets a muted highlight in the right sidebar. |
 | Click a folder in the outline | Highlights the contiguous footprint of its files, including nested descendants. |
-| Double-click a folder in the outline | Fills the map with that subtree. The enclosing-folder toolbar button goes back up. |
+| Back and Forward, or ⌘[ and ⌘] | Restores a previous or next selection from the outline or map, along with its folder and zoom. A new selection starts a new branch. |
+| Down, ⌘↓, or double-click a folder | Opens the selected folder in the map. |
+| Up or ⌘↑ | Opens the enclosing folder within the scan and selects the folder you just left. |
 | Click the glass zoom buttons or press ⌘+ / ⌘− | Magnifies or reduces the map. |
 | Command-scroll or pinch | Zooms around the pointer. Normal scrolling or Option-drag pans a magnified map. |
 | Double-click a tile, or press ⇧⌘F | Fits the selected file or folder footprint. ⌘0 restores the overview. |
 | Control-click or Command-click | Adds or removes an item from the selection. |
+| ⌥⌘A or Edit → Deselect All | Clears the selection in the outline and map. Back restores it. |
 | Shift-click | Selects a range in visible outline order. Adding Command or Control extends the existing selection. |
 | Drag on the map or in the outline | Selects the files intersecting a rectangle, or a contiguous run of outline rows. |
 | Right-click | Opens a native menu with Open, Open With, Open in Finder, Refresh, and Move to Trash. |
+
+The file outline, file-kind legend, and mounted-volume picker use native inset tables with rounded surfaces and centered headers and cells. On macOS 26 and later each table shares one Liquid Glass background across all its rows. The folder chooser uses the system Open panel.
+
+File opens folders (⌘O), lists mounted volumes (⇧⌘O), scans Home (⇧⌘H), and refreshes a scan (⌘R) or its selection. Edit copies selected file URLs (⌘C) or their pathnames as text (⌥⌘C). Select All (⌘A) selects the rows inside the folder displayed on the map, including expanded rows offscreen. View includes map zoom, toolbar visibility (⌥⌘T), and full screen (⌃⌘F). Window provides the standard window commands and a list of open windows.
 
 Open in Finder and Move to Trash occupy a dedicated footer below the map. A single selected folder opens in Finder. For files or a multiple selection, Finder reveals the selected items.
 

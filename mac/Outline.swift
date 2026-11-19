@@ -57,6 +57,12 @@ final class FileOutlineView: NSOutlineView {
     override func mouseExited(with event: NSEvent) { inside = false; updateHover(-1); super.mouseExited(with: event) }
     var makeMenu: (() -> NSMenu?)?
     var selectGesture: ((Int, SelectionMode) -> Void)?
+    var selectScope: (() -> Void)?
+    override func selectAll(_ sender: Any?) {
+        if let selectScope { selectScope() } else { super.selectAll(sender) }
+    }
+    var gestureEnded: (() -> Void)?
+    var trackingSelection: Bool { dragOrigin >= 0 }
     private var dragOrigin = -1
     private var dragBase = IndexSet()
     private var dragMode = SelectionMode.replace
@@ -92,9 +98,11 @@ final class FileOutlineView: NSOutlineView {
         selectRowIndexes(result, byExtendingSelection: false)
     }
     override func mouseUp(with event: NSEvent) {
+        let finished = trackingSelection
         if dragOrigin < 0 { super.mouseUp(with: event) }
         dragOrigin = -1
         dragBase.removeAll()
+        if finished { gestureEnded?() }
     }
     override func rightMouseDown(with event: NSEvent) {
         if event.modifierFlags.contains(.control) {
@@ -144,7 +152,6 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         view.outlineTableColumn = name
         view.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
         view.indentationPerLevel = 13
-        view.style = .inset
         view.rowHeight = 25
         view.usesAutomaticRowHeights = false
         view.allowsMultipleSelection = true
@@ -212,12 +219,51 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         return parent
     }
     func reveal(_ route: [DiskItem]) { select([route], mode: .replace) }
+    func expand(_ route: [DiskItem]) {
+        if let node = resolve(route), !view.isItemExpanded(node) { view.expandItem(node) }
+    }
+    func selectAll(in route: [DiskItem]) {
+        applyingSelection = true
+        defer { applyingSelection = false }
+        var first = 0, end = view.numberOfRows
+        if !route.isEmpty {
+            guard let node = resolve(route) else { return }
+            view.expandItem(node)
+            let parent = view.row(forItem: node)
+            guard parent >= 0 else { return }
+            let level = view.level(forRow: parent), count = view.numberOfRows
+            first = parent + 1; end = first
+            while end < count && view.level(forRow: end) > level { end += 1 }
+        }
+        view.selectRowIndexes(IndexSet(integersIn: first..<end), byExtendingSelection: false)
+        anchor = first < end ? view.item(atRow: first) as? TreeRow : nil
+        selectionChanged?()
+    }
+    var selectedFolderRoute: [DiskItem]? {
+        guard view.numberOfSelectedRows == 1, let row = view.item(atRow: view.selectedRow) as? TreeRow, row.raw.isFolder else { return nil }
+        return row.route
+    }
+    var leadKey: UInt64? { anchor?.key }
+    func selectSaved(_ keys: [UInt64], lead: UInt64?) {
+        guard let model else { return }
+        applyingSelection = true
+        defer { applyingSelection = false }
+        let nodes = keys.compactMap { key -> TreeRow? in
+            if let known = objects[key], view.row(forItem: known) >= 0 { return known }
+            return model.route(to: DTKey(key), from: 0).flatMap(resolve)
+        }
+        let indexes = IndexSet(nodes.map { view.row(forItem: $0) }.filter { $0 >= 0 })
+        view.selectRowIndexes(indexes, byExtendingSelection: false)
+        anchor = lead.flatMap { objects[$0] }.flatMap { node in
+            let row = view.row(forItem: node)
+            return row >= 0 && indexes.contains(row) ? node : nil
+        }
+            ?? indexes.first.flatMap { view.item(atRow: $0) as? TreeRow }
+        if let anchor { view.scrollRowToVisible(view.row(forItem: anchor)) }
+        selectionChanged?()
+    }
     var expandedURLs: [URL] {
         expanded.values.compactMap { $0.model.url(folder: $0.folder, slot: $0.raw.slot, directory: true) }
-    }
-    func restore(expansions: [[DiskItem]], selections: [[DiskItem]]) {
-        for path in expansions { if let row = resolve(path) { view.expandItem(row) } }
-        select(selections, mode: .replace)
     }
     func select(_ routes: [[DiskItem]], mode: SelectionMode) {
         applyingSelection = true
@@ -312,31 +358,7 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         guard let row = item as? TreeRow, let id = tableColumn?.identifier else { return nil }
         let isName = id.rawValue == "name"
-        let cell: NSTableCellView
-        if let reused = view.makeView(withIdentifier: id, owner: self) as? NSTableCellView { cell = reused }
-        else {
-            cell = NSTableCellView(); cell.identifier = id
-            let label = NSTextField(labelWithString: "")
-            label.lineBreakMode = .byTruncatingMiddle
-            label.translatesAutoresizingMaskIntoConstraints = false
-            cell.textField = label; cell.addSubview(label)
-            var leading = cell.leadingAnchor
-            if isName {
-                let icon = NSImageView()
-                icon.translatesAutoresizingMaskIntoConstraints = false
-                cell.addSubview(icon); cell.imageView = icon
-                NSLayoutConstraint.activate([icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor),
-                    icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor), icon.widthAnchor.constraint(equalToConstant: 16),
-                    icon.heightAnchor.constraint(equalToConstant: 16)])
-                leading = icon.trailingAnchor
-            } else {
-                label.alignment = .right
-                label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-            }
-            NSLayoutConstraint.activate([label.leadingAnchor.constraint(equalTo: leading, constant: 5),
-                label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
-                label.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
-        }
+        let cell = CenteredTableCell.make(in: view, column: id, icon: isName, numeric: !isName)
         cell.textField?.stringValue = isName ? row.raw.title : formatBytes(row.raw.bytes)
         if isName {
             let url = row.model.url(folder: row.folder, slot: row.raw.slot, directory: row.raw.isFolder)

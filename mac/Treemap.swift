@@ -203,6 +203,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
         magnify(by: inward ? 1.7 : 1 / 1.7, around: anchor)
     }
     func fitMap() { move(to: Self.whole) }
+    func restoreViewport(_ viewport: CGRect) { move(to: viewport) }
     func fitSelection() {
         guard let r = selectedBounds else { return }
         let span = max(r.width, r.height) * 1.2

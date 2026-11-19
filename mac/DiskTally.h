@@ -18,6 +18,12 @@ typedef struct {
 
 typedef struct { uint64_t bytes, entries, issues, boundaries; } DTSummary;
 typedef struct { uint32_t folder, slot; } DTKey;
+typedef struct DTBookmark DTBookmark;
+typedef struct { uint64_t device, inode; } DTDirectoryIdentity;
+DTDirectoryIdentity dt_directory_identity(const DTModel *, uint32_t folder);
+DTBookmark *dt_bookmark_new(const DTModel *, const uint64_t *keys, size_t count);
+size_t dt_bookmark_resolve(const DTModel *, const DTBookmark *, bool same_index, uint64_t *out, size_t capacity);
+void dt_bookmark_free(DTBookmark *);
 typedef struct DTScene DTScene;
 typedef struct DTFrame DTFrame;
 typedef struct DTSelection DTSelection;

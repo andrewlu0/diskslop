@@ -2,6 +2,8 @@ use super::*;
 use std::ffi::CString;
 use std::ptr;
 use std::sync::RwLock;
+#[path = "bookmark.rs"]
+mod bookmark;
 #[path = "treemap.rs"]
 mod treemap;
 
@@ -166,12 +168,7 @@ unsafe extern "C" fn dt_route(m: &Model, path: *const c_char) -> *mut Listing {
         let Some(f) = scan.folders.get(dir as usize) else {
             return ptr::null_mut();
         };
-        let Some(slot) = f
-            .entries
-            .iter()
-            .enumerate()
-            .position(|(i, e)| e.flags & REMOVED == 0 && f.name(i) == component.as_bytes())
-        else {
+        let Some((slot, _)) = f.named_entry(component.as_bytes()) else {
             return ptr::null_mut();
         };
         let row = make_row(&scan, dir, slot as u32);

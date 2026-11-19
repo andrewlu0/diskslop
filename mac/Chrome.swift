@@ -18,13 +18,28 @@ final class WindowToolbar: NSObject, NSToolbarDelegate {
         window.titlebarSeparatorStyle = .none
     }
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.init("back"), .init("zoomOut"), .init("zoomIn"), .flexibleSpace, .init("choose"), .init("home"), .init("disk"), .space, .init("refresh")]
+        [.init("history"), .init("folders"), .space, .init("zoom"), .flexibleSpace, .init("choose"), .init("home"), .init("disk"), .space, .init("refresh")]
     }
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         toolbarDefaultItemIdentifiers(toolbar)
     }
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier,
                  willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        let pair: (String, [String])
+        switch id.rawValue {
+        case "history": pair = ("Selection History", ["back", "forward"])
+        case "folders": pair = ("Folder Navigation", ["up", "down"])
+        case "zoom": pair = ("Map Zoom", ["zoomOut", "zoomIn"])
+        default: return makeItem(id)
+        }
+        let group = NSToolbarItemGroup(itemIdentifier: id)
+        group.label = pair.0; group.paletteLabel = pair.0
+        group.selectionMode = .momentary; group.controlRepresentation = .expanded
+        group.isBordered = true; group.isNavigational = true; group.autovalidates = false
+        group.subitems = pair.1.compactMap { makeItem(.init($0)) }
+        return group
+    }
+    private func makeItem(_ id: NSToolbarItem.Identifier) -> NSToolbarItem? {
         guard let spec = commands.first(where: { $0.id == id.rawValue }) else { return nil }
         let item = NSToolbarItem(itemIdentifier: id)
         item.label = spec.title
@@ -35,8 +50,7 @@ final class WindowToolbar: NSObject, NSToolbarDelegate {
         item.action = spec.action
         item.isBordered = true
         item.autovalidates = false
-        if ["back", "zoomOut", "zoomIn"].contains(spec.id) { item.isNavigational = true }
-        if spec.id == "zoomIn" || spec.id == "zoomOut" { item.isEnabled = false }
+        if ["back", "forward", "up", "down", "zoomIn", "zoomOut"].contains(spec.id) { item.isEnabled = false }
         items[spec.id] = item
         return item
     }
@@ -44,9 +58,11 @@ final class WindowToolbar: NSObject, NSToolbarDelegate {
         items["zoomIn"]?.isEnabled = hasScan && scale < CGFloat(1 << 30)
         items["zoomOut"]?.isEnabled = hasScan && scale > 1
     }
-    func update(busy: Bool, scanning: Bool, canGoBack: Bool, hasScan: Bool) {
+    func update(busy: Bool, scanning: Bool, back: Bool, forward: Bool, up: Bool, down: Bool, hasScan: Bool) {
         for name in ["choose", "home", "disk"] { items[name]?.isEnabled = !busy }
-        items["back"]?.isEnabled = !busy && canGoBack
+        for (id, enabled) in [("back", back), ("forward", forward), ("up", up), ("down", down)] {
+            items[id]?.isEnabled = !busy && enabled
+        }
         guard let item = items["refresh"] else { return }
         let label = scanning ? "Cancel Scan" : "Rescan"
         if item.label != label {

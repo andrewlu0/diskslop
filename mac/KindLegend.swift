@@ -22,11 +22,14 @@ private final class KindCell: NSTableCellView {
         swatch.layer?.cornerRadius = 2
         glyph.imageScaling = .scaleProportionallyUpOrDown
         name.font = .systemFont(ofSize: 12, weight: .medium)
+        name.alignment = .center
         name.lineBreakMode = .byTruncatingTail
         for v in [swatch, glyph, name] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
         }
+        let centered = name.centerXAnchor.constraint(equalTo: centerXAnchor)
+        centered.priority = .defaultLow
         NSLayoutConstraint.activate([
             swatch.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
             swatch.widthAnchor.constraint(equalToConstant: 8),
@@ -34,8 +37,9 @@ private final class KindCell: NSTableCellView {
             glyph.leadingAnchor.constraint(equalTo: swatch.trailingAnchor, constant: 5),
             glyph.widthAnchor.constraint(equalToConstant: 17),
             glyph.heightAnchor.constraint(equalToConstant: 17), glyph.centerYAnchor.constraint(equalTo: centerYAnchor),
-            name.leadingAnchor.constraint(equalTo: glyph.trailingAnchor, constant: 6),
-            name.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -2),
+            name.leadingAnchor.constraint(greaterThanOrEqualTo: glyph.trailingAnchor, constant: 6),
+            name.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -2),
+            centered,
             name.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
@@ -103,7 +107,7 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
         scroll.borderType = .noBorder
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
-        table.style = .plain
+        table.style = .inset
         table.rowHeight = 27
         table.intercellSpacing = .init(width: 2, height: 0)
         table.backgroundColor = .clear
@@ -122,7 +126,7 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
             col.width = CGFloat(width)
             col.minWidth = CGFloat(minWidth)
             col.resizingMask = id == "kind" ? [.autoresizingMask, .userResizingMask] : [.userResizingMask]
-            col.headerCell.alignment = id == "kind" ? .left : .right
+            col.headerCell.alignment = .center
             col.sortDescriptorPrototype = NSSortDescriptor(key: id, ascending: id == "kind")
             table.addTableColumn(col)
         }
@@ -215,12 +219,10 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
             cell.configure(item.kind)
             return cell
         }
-        let field = table.makeView(withIdentifier: id, owner: self) as? NSTextField ?? NSTextField(labelWithString: "")
-        field.identifier = id
-        field.alignment = .right
-        field.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        field.textColor = .labelColor.withAlphaComponent(0.83)
-        field.stringValue = id.rawValue == "bytes" ? formatBytes(item.bytes) : formatCount(item.files)
-        return field
+        let cell = CenteredTableCell.make(in: table, column: id, icon: false, numeric: true)
+        cell.textField?.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        cell.textField?.textColor = .labelColor.withAlphaComponent(0.83)
+        cell.textField?.stringValue = id.rawValue == "bytes" ? formatBytes(item.bytes) : formatCount(item.files)
+        return cell
     }
 }

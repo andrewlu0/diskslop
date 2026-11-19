@@ -94,6 +94,12 @@ impl Folder {
         let e = &self.entries[slot];
         &self.names[e.start..e.start + usize::from(e.len)]
     }
+    fn named_entry(&self, name: &[u8]) -> Option<(usize, &Entry)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .find(|(i, e)| e.flags & REMOVED == 0 && self.name(*i) == name)
+    }
     fn push(&mut self, name: &[u8], facts: bulk::Facts) {
         if facts.kind == EntryKind::Directory && matches!(name, b".Trash" | b".Trashes") {
             return;
@@ -333,12 +339,7 @@ impl Inventory {
             let mut parts = relative.iter().peekable();
             while let Some(part) = parts.next() {
                 let f = &self.folders[dir as usize];
-                let found = f
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .find(|(i, e)| e.flags & REMOVED == 0 && f.name(*i) == part.as_bytes());
-                if let Some((_, e)) = found
+                if let Some((_, e)) = f.named_entry(part.as_bytes())
                     && e.kind == EntryKind::Directory
                 {
                     if parts.peek().is_some() {
