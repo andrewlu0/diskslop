@@ -390,6 +390,7 @@ unsafe extern "C" fn dt_selection_free(s: *mut Selection) {
 struct Label {
     rect: Rect,
     key: Key,
+    light_ink: bool,
 }
 struct Frame {
     pixels: Vec<u32>,
@@ -415,6 +416,7 @@ struct GlassTint {
     top: u32,
     bottom: u32,
     seam: u32,
+    light_ink: bool,
 }
 impl GlassTint {
     fn new(rgb: u32) -> Self {
@@ -426,11 +428,21 @@ impl GlassTint {
             };
             pixel(rgb, light)
         });
+        let linear = |shift: u32| {
+            let value = ((surface[24] >> shift) & 255) as f64 / 255.0;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance = 0.2126 * linear(0) + 0.7152 * linear(8) + 0.0722 * linear(16);
         Self {
             surface,
             top: pixel(rgb, 76),
             bottom: pixel(rgb, 35),
             seam: pixel(rgb, -42),
+            light_ink: luminance < 0.179,
         }
     }
 }
@@ -505,7 +517,14 @@ extern "C" fn dt_map_render(
                 }
             }
             if (x1 - x0) as f64 >= 44.0 * scale && (y1 - y0) as f64 >= 21.0 * scale {
-                labels.push(((x1 - x0) * (y1 - y0), Label { rect, key }));
+                labels.push((
+                    (x1 - x0) * (y1 - y0),
+                    Label {
+                        rect,
+                        key,
+                        light_ink: tint.light_ink,
+                    },
+                ));
             }
             false
         },

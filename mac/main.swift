@@ -269,15 +269,31 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         tree.openFolder = { [weak self] route in self?.enterFolder(route) }
         let sidebar = NSView()
         let surface = NativeTableSurface(tree.view)
+        let sidebarMinimum = sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 265)
+        let legendMinimum = legend.widthAnchor.constraint(greaterThanOrEqualToConstant: 225)
+        let mapMinimum: CGFloat = 185
+        let updateWindowMinimum = { [weak self] in
+            guard let self else { return }
+            let minimum = sidebarMinimum.constant + legendMinimum.constant + mapMinimum + self.split.dividerThickness * 2
+            self.window.minSize.width = max(770, ceil(minimum))
+        }
+        surface.scroll.minimumWidthChanged = { required in
+            sidebarMinimum.constant = max(265, required + 18)
+            updateWindowMinimum()
+        }
+        legend.minimumWidthChanged = { required in
+            legendMinimum.constant = max(225, required)
+            updateWindowMinimum()
+        }
         sidebar.addSubview(surface); surface.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             surface.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 10),
             surface.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -8),
             surface.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 1),
             surface.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -1),
-            sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 265)
+            sidebarMinimum
         ])
-        map.widthAnchor.constraint(greaterThanOrEqualToConstant: 185).isActive = true
+        map.widthAnchor.constraint(greaterThanOrEqualToConstant: mapMinimum).isActive = true
         map.zoomChanged = { [weak self] in
             guard let self else { return }
             self.toolbar.updateZoom(hasScan: self.listing != nil, scale: self.map.zoom)
@@ -301,7 +317,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         split.addArrangedSubview(sidebar)
         split.addArrangedSubview(map)
         split.addArrangedSubview(legend)
-        legend.widthAnchor.constraint(greaterThanOrEqualToConstant: 225).isActive = true
+        legendMinimum.isActive = true
         split.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
         split.setHoldingPriority(.defaultLow, forSubviewAt: 1)
         split.setHoldingPriority(.defaultHigh, forSubviewAt: 2)

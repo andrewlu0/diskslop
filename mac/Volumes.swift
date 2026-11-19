@@ -55,13 +55,16 @@ final class VolumePicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         cancel.keyEquivalent = "\u{1b}"
         for (id, title, width) in [("name","Volume",190),("path","Mount point",245),("free","Available",110)] {
             let col = NSTableColumn(identifier: .init(id))
-            col.title = title; col.width = CGFloat(width); col.minWidth = 82
+            col.title = title; col.minWidth = id == "free" ? max(82, TableTextCell.sizeColumnMinimum) : 82
+            col.width = max(CGFloat(width), col.minWidth)
+            col.headerCell.alignment = id == "free" ? .right : .left
             table.addTableColumn(col)
         }
         table.rowHeight = 30; table.allowsMultipleSelection = false
+        table.allowsColumnReordering = false
         table.delegate = self; table.dataSource = self; table.target = self; table.doubleAction = #selector(choose)
         table.setAccessibilityLabel("Mounted volumes")
-        let surface = NativeTableSurface(table)
+        let surface = NativeTableSurface(table, flexibleColumn: "path")
         let buttons = NSStackView(views: [cancel,scanButton]); buttons.spacing = 8
         scanButton.setContentHuggingPriority(.required, for: .vertical)
         for v in [surface,showAll!,buttons] as [NSView] { content.addSubview(v); v.translatesAutoresizingMaskIntoConstraints = false }
@@ -97,12 +100,13 @@ final class VolumePicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     @objc private func dismiss() { finish(nil) }
     func numberOfRows(in tableView: NSTableView) -> Int { visible.count }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard visible.indices.contains(row), let id = tableColumn?.identifier else { return nil }
+        guard visible.indices.contains(row), let tableColumn else { return nil }
+        let id = tableColumn.identifier
         let volume = visible[row]
         let text = id.rawValue == "name" ? volume.name : id.rawValue == "path" ? volume.url.path : (volume.available.map(formatBytes) ?? "—")
         let isName = id.rawValue == "name"
-        let cell = CenteredTableCell.make(in: table, column: id, icon: isName, numeric: id.rawValue == "free")
-        cell.textField?.stringValue = text; cell.toolTip = text
+        let cell = TableTextCell.make(in: table, column: id, icon: isName, numeric: id.rawValue == "free")
+        cell.setText(text)
         cell.textField?.textColor = isName ? .labelColor : .secondaryLabelColor
         if isName {
             cell.imageView?.image = NSImage(systemSymbolName: volume.symbol, accessibilityDescription: nil)

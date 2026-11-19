@@ -14,16 +14,6 @@ final class FileOutlineView: NSOutlineView {
     private var hoverTracking: NSTrackingArea?
     private var hoverIndex = -1
     private var inside = false
-    private var columnSpace: CGFloat = -1
-    override func layout() {
-        super.layout()
-        guard let width = enclosingScrollView?.contentView.bounds.width, width > 0,
-              width != columnSpace, tableColumns.count == 2 else { return }
-        columnSpace = width
-        let overhead = max(0, rect(ofColumn: 1).maxX - tableColumns[0].width - tableColumns[1].width)
-        tableColumns[0].width = max(tableColumns[0].minWidth, width - tableColumns[1].width - overhead - 3)
-        frame.size.width = width
-    }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let hoverTracking { removeTrackingArea(hoverTracking) }
@@ -145,12 +135,14 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
     override init() {
         super.init()
         let name = NSTableColumn(identifier: .init("name"))
-        name.title = "Name"; name.minWidth = 115; name.width = 260
+        name.title = "Name"; name.minWidth = 72; name.width = 260
         let size = NSTableColumn(identifier: .init("size"))
-        size.title = "Allocated"; size.minWidth = 78; size.width = 95; size.maxWidth = 145
+        size.title = "Size"; size.headerToolTip = "Allocated size on disk"
+        size.minWidth = max(78, TableTextCell.sizeColumnMinimum); size.width = max(95, size.minWidth)
+        name.headerCell.alignment = .left; size.headerCell.alignment = .right
         view.addTableColumn(name); view.addTableColumn(size)
         view.outlineTableColumn = name
-        view.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
+        view.autoresizesOutlineColumn = false
         view.indentationPerLevel = 13
         view.rowHeight = 25
         view.usesAutomaticRowHeights = false
@@ -356,15 +348,16 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         (item as? TreeRow)?.raw.title
     }
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
-        guard let row = item as? TreeRow, let id = tableColumn?.identifier else { return nil }
+        guard let row = item as? TreeRow, let tableColumn else { return nil }
+        let id = tableColumn.identifier
         let isName = id.rawValue == "name"
-        let cell = CenteredTableCell.make(in: view, column: id, icon: isName, numeric: !isName)
-        cell.textField?.stringValue = isName ? row.raw.title : formatBytes(row.raw.bytes)
+        let cell = TableTextCell.make(in: view, column: id, icon: isName, numeric: !isName)
         if isName {
+            cell.textField?.stringValue = row.raw.title
             let url = row.model.url(folder: row.folder, slot: row.raw.slot, directory: row.raw.isFolder)
             if let image = cell.imageView { icons.display(url, in: image, row: row.raw) }
             cell.toolTip = url?.path
-        }
+        } else { cell.setText(formatBytes(row.raw.bytes)) }
         return cell
     }
 }

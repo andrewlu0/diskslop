@@ -15,10 +15,10 @@ extension DTRect {
 }
 
 struct FileLabel {
-    let rect: CGRect, title: String, size: String
+    let rect: CGRect, title: String, size: String, lightInk: Bool
 }
 struct RenderedFiles {
-    let image: CGImage, labels: [FileLabel], viewport: CGRect, dark: Bool
+    let image: CGImage, labels: [FileLabel], viewport: CGRect
 }
 
 final class FileMap: @unchecked Sendable {
@@ -88,7 +88,7 @@ final class FileMap: @unchecked Sendable {
         let labels: [FileLabel] = UnsafeBufferPointer(start: rawLabels, count: count).compactMap { raw in
             var item = DTRow()
             guard dt_entry(model.handle, raw.key.folder, raw.key.slot, &item) else { return nil }
-            return FileLabel(rect: raw.rect.rect, title: item.title, size: formatBytes(item.bytes))
+            return FileLabel(rect: raw.rect.rect, title: item.title, size: formatBytes(item.bytes), lightInk: raw.light_ink)
         }
         guard let provider = CGDataProvider(dataInfo: UnsafeMutableRawPointer(frame), data: dt_frame_pixels(frame),
             size: width * height * 4, releaseData: { p, _, _ in if let p { dt_frame_free(OpaquePointer(p)) } }) else {
@@ -99,6 +99,6 @@ final class FileMap: @unchecked Sendable {
         guard let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
             space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: info, provider: provider, decode: nil,
             shouldInterpolate: false, intent: .defaultIntent) else { return nil }
-        return RenderedFiles(image: image, labels: labels, viewport: viewport, dark: dark)
+        return RenderedFiles(image: image, labels: labels, viewport: viewport)
     }
 }

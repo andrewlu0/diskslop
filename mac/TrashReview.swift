@@ -92,14 +92,14 @@ final class TrashReview: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let path = NSTableColumn(identifier: .init("path"))
         path.title = "Selected location"; path.minWidth = 180; path.width = 368
         let size = NSTableColumn(identifier: .init("size"))
-        size.title = "Allocated"; size.minWidth = 65; size.width = 85
+        size.title = "Allocated"; size.minWidth = max(65, TableTextCell.sizeColumnMinimum); size.width = max(85, size.minWidth)
         table.addTableColumn(path); table.addTableColumn(size)
+        path.headerCell.alignment = .left; size.headerCell.alignment = .right
         table.dataSource = self; table.delegate = self
         table.rowHeight = 25; table.style = .inset
-        table.allowsColumnReordering = false; table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
+        table.allowsColumnReordering = false
         table.setAccessibilityLabel("Selected locations to move to Trash")
-        let scroll = NSScrollView()
-        scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+        let scroll = FittingTableScrollView(table, flexibleColumn: "path")
         scroll.borderType = .bezelBorder
         let stack = NSStackView()
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 9
@@ -159,13 +159,10 @@ final class TrashReview: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     func numberOfRows(in tableView: NSTableView) -> Int { plan.roots.count }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard let id = tableColumn?.identifier, let item = plan.item(at: row) else { return nil }
-        let label = tableView.makeView(withIdentifier: id, owner: self) as? NSTextField ?? NSTextField(labelWithString: "")
-        label.identifier = id
-        let path = id.rawValue == "path"
-        label.stringValue = path ? item.path.path : formatBytes(item.size)
-        label.toolTip = label.stringValue; label.lineBreakMode = .byTruncatingMiddle
-        label.alignment = path ? .left : .right
-        return label
+        guard let column = tableColumn, let item = plan.item(at: row) else { return nil }
+        let isSize = column.identifier.rawValue == "size"
+        let cell = TableTextCell.make(in: tableView, column: column.identifier, icon: false, numeric: isSize)
+        cell.setText(isSize ? formatBytes(item.size) : item.path.path)
+        return cell
     }
 }

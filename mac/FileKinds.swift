@@ -1,15 +1,24 @@
 import AppKit
 import UniformTypeIdentifiers
 
-struct KindTone {
-    let ink: UInt32, nightInk: UInt32, lightTile: UInt32, darkTile: UInt32
-    init(_ ink: UInt32, _ night: UInt32) {
-        self.ink = ink
-        nightInk = night
-        lightTile = Self.mix(ink, 0xffffff, 0.53)
-        darkTile = Self.mix(Self.mix(ink, night, 0.23), 0x15171d, 0.28)
-    }
-    static func mix(_ a: UInt32, _ b: UInt32, _ fraction: Double) -> UInt32 {
+struct KindTone: Equatable {
+    let light: UInt32, dark: UInt32
+    init(_ light: UInt32, _ dark: UInt32) { self.light = light; self.dark = dark }
+
+    // sRGB equivalents of the 600 tones and the dark appearance's 300/400 OKLCH midpoint.
+    static let blue = Self(0x2f5ff5, 0x83a9ff), violet = Self(0x7f22fe, 0xb59cff)
+    static let green = Self(0x00a63e, 0x53e88e), cyan = Self(0x0092b8, 0x16dff7)
+    static let amber = Self(0xe17100, 0xffc600), orange = Self(0xf54a00, 0xffa244)
+    static let pink = Self(0xe60076, 0xfd86c7), rose = Self(0xec003f, 0xff8496)
+    static let teal = Self(0x009689, 0x11e1c9), indigo = Self(0x4f39f6, 0x8e9dff)
+    static let lime = Self(0x5ea500, 0xabed27), sky = Self(0x0084d1, 0x49c8ff)
+    static let purple = Self(0x9810fa, 0xce97ff), red = Self(0xe7000b, 0xff8485)
+    static let fuchsia = Self(0xc800de, 0xf18bff), yellow = Self(0xd08700, 0xffd400)
+    static let emerald = Self(0x009966, 0x33dfa3), neutral = Self(0x45556c, 0xacbbce)
+    private static let spectrum: [Self] = [.red, .orange, .amber, .yellow, .lime, .green, .emerald, .teal, .cyan,
+        .sky, .blue, .indigo, .violet, .purple, .fuchsia, .pink, .rose]
+
+    private static func mix(_ a: UInt32, _ b: UInt32, _ fraction: Double) -> UInt32 {
         func channel(_ shift: UInt32) -> UInt32 {
             let x = Double((a >> shift) & 255)
             let y = Double((b >> shift) & 255)
@@ -17,32 +26,14 @@ struct KindTone {
         }
         return channel(16) | channel(8) | channel(0)
     }
-    static let blue = Self(0x3455df, 0x96adff), violet = Self(0x7c3aed, 0xc4b5fd)
-    static let green = Self(0x168044, 0x86efac), cyan = Self(0x087e96, 0x67e8f9)
-    static let amber = Self(0xb46909, 0xfcd34d), orange = Self(0xc45013, 0xfdba74)
-    static let pink = Self(0xb42b83, 0xf9a8d4), rose = Self(0xc43752, 0xfda4af)
-    static let teal = Self(0x0c8377, 0x74e1cf), indigo = Self(0x5046c7, 0xa5b4fc)
-    static let lime = Self(0x648815, 0xc4e777), sky = Self(0x217ab4, 0x90d8ff)
-    static let purple = Self(0x893ac9, 0xd8b4fe), red = Self(0xc24138, 0xf6aaa4)
-    static let neutral = Self(0x666b7d, 0xc0c3d0)
-    static let coral = Self(0xd74744, 0xffa9a4), gold = Self(0xb88d08, 0xf3db7e)
-    static let glacier = Self(0x3283a8, 0x9cdeed)
-
-    static func variation(_ hash: UInt32, near ink: UInt32?) -> Self {
-        var hue = Double(hash % 65521) / 65521
-        if let ink {
-            let anchor = Double(NSColor(rgb: ink).hueComponent)
-            hue = (anchor + (hue - 0.5) * 0.38 + 1).truncatingRemainder(dividingBy: 1)
-        }
-        hue *= 6
-        let sector = Int(hue)
-        let x = hue - Double(sector)
-        let channels = [(1.0, x, 0.0), (1 - x, 1, 0), (0, 1, x), (0, 1 - x, 1), (x, 0, 1), (1, 0, 1 - x)][sector]
-        func color(low: Double, high: Double) -> UInt32 {
-            func channel(_ value: Double) -> UInt32 { UInt32((low + (high - low) * value).rounded()) }
-            return channel(channels.0) << 16 | channel(channels.1) << 8 | channel(channels.2)
-        }
-        return Self(color(low: 38, high: 178), color(low: 125, high: 240))
+    func variation(for identifier: String, acrossSpectrum: Bool) -> Self {
+        let hash = identifier.utf8.reduce(UInt32(2_166_136_261)) { ($0 ^ UInt32($1)) &* 16_777_619 }
+        let tones = Self.spectrum
+        let index = acrossSpectrum ? Int(hash) % tones.count : tones.firstIndex(of: self) ?? 0
+        let direction = hash & 256 == 0 ? 1 : -1
+        let a = tones[index], b = tones[(index + tones.count + direction) % tones.count]
+        let fraction = Double((hash >> 16) & 255) / 255 * (acrossSpectrum ? 1 : 0.65)
+        return Self(Self.mix(a.light, b.light, fraction), Self.mix(a.dark, b.dark, fraction))
     }
 }
 extension NSColor {
@@ -58,24 +49,27 @@ extension NSAppearance {
 
 struct FileKind {
     let id: UInt32, identifier: String, title: String, glyph: String
-    let tone: KindTone, light: UInt32, dark: UInt32
+    let tone: KindTone
 
     init(id: UInt32, identifier: String, title: String, glyph: String, tone: KindTone, vary: Bool) {
         self.id = id
         self.identifier = identifier
         self.title = title
         self.glyph = glyph
-        self.tone = tone
-        let hash = title.lowercased().utf8.reduce(UInt32(2_166_136_261)) { ($0 ^ UInt32($1)) &* 16_777_619 }
-        let accent = KindTone.variation(hash, near: glyph == "file" ? nil : tone.ink)
-        let amount = glyph == "file" ? 0.82 : vary ? 0.35 + Double((hash >> 8) % 30) / 100 : 0.08
-        light = KindTone.mix(tone.lightTile, accent.lightTile, amount)
-        dark = KindTone.mix(tone.darkTile, accent.darkTile, amount)
+        self.tone = vary ? tone.variation(for: identifier, acrossSpectrum: glyph == "file") : tone
     }
-    func fill(darkMode: Bool) -> UInt32 { darkMode ? dark : light }
-    func tint(darkMode: Bool) -> NSColor { NSColor(rgb: darkMode ? tone.nightInk : tone.ink) }
+    func fill(darkMode: Bool) -> UInt32 { darkMode ? tone.dark : tone.light }
 }
-struct KindUsage { let kind: FileKind, bytes: UInt64, files: UInt64 }
+struct KindUsage {
+    let kind: FileKind, bytes: UInt64, files: UInt64
+    let formattedSize: String, formattedFiles: String
+
+    init(kind: FileKind, bytes: UInt64, files: UInt64) {
+        self.kind = kind; self.bytes = bytes; self.files = files
+        formattedSize = formatBytes(bytes)
+        formattedFiles = formatCount(files)
+    }
+}
 
 private struct KindStyle {
     let glyph: String, tone: KindTone
@@ -88,9 +82,9 @@ private struct KindStyle {
 
     static func resolve(_ type: UTType, suffix: String, identifier: String) -> Self {
         let id = type.identifier.lowercased()
-        if type.conforms(to: .applicationBundle) || id == "com.apple.application" { return Self("applications", .coral) }
+        if type.conforms(to: .applicationBundle) || id == "com.apple.application" { return Self("applications", .red) }
         if type.conforms(to: .applicationExtension) || id.contains("plug-in") || suffix == "plugin" {
-            return Self("plug-2", .orange)
+            return Self("plug-2", .orange, vary: true)
         }
         if type.conforms(to: .framework) { return Self("cubes", .indigo) }
         if ["mlmodelc", "mlpackage", "safetensors", "gguf"].contains(suffix) || id.contains("coreml")
@@ -100,12 +94,12 @@ private struct KindStyle {
         }
         if suffix == "xcarchive" || id.contains("xcode.archive") { return Self("code-editor", .blue) }
         if type.conforms(to: .diskImage) || ["dmg", "iso", "sparseimage", "sparsebundle"].contains(suffix) {
-            return Self("hard-drive", .red)
+            return Self("hard-drive", .rose)
         }
-        if ["pkg", "mpkg"].contains(suffix) || id.contains("installer-package") { return Self("box-archive-2", .orange) }
+        if ["pkg", "mpkg"].contains(suffix) || id.contains("installer-package") { return Self("box-archive-2", .orange, vary: true) }
         if type.conforms(to: .package) || type.conforms(to: .bundle) { return Self("box-archive-2", .violet, vary: true) }
-        if type.conforms(to: .symbolicLink) || type.conforms(to: .aliasFile) { return Self("file-link", .sky) }
-        if type.conforms(to: .pdf) { return Self("report-file", .glacier) }
+        if type.conforms(to: .symbolicLink) || type.conforms(to: .aliasFile) { return Self("file-link", .emerald, vary: true) }
+        if type.conforms(to: .pdf) { return Self("report-file", .sky) }
         if type.conforms(to: .json) || ["json", "jsonl", "ndjson", "geojson"].contains(suffix) {
             return Self("brackets-curly", .cyan, vary: type != .json)
         }
@@ -113,7 +107,7 @@ private struct KindStyle {
         if type.conforms(to: .png) { return Self("file-image", .amber) }
         if type.conforms(to: .jpeg) { return Self("image", .green) }
         if suffix == "svg" || id.contains("vector") { return Self("color-palette", .pink) }
-        if suffix == "gif" { return Self("file-gif", .orange) }
+        if suffix == "gif" { return Self("file-gif", .fuchsia) }
         if type.conforms(to: .image) { return Self("file-image", .teal, vary: true) }
         if type.conforms(to: .audio) { return Self("file-music", .violet, vary: true) }
         if type.conforms(to: .movie) || type.conforms(to: .audiovisualContent) {
@@ -132,17 +126,17 @@ private struct KindStyle {
         if type.conforms(to: .archive) || ["zip", "gz", "bz2", "xz", "zst", "rar", "7z", "tar", "xip"].contains(suffix) {
             return Self("file-zip", .amber, vary: true)
         }
-        if suffix == "dylib" || id.contains("dynamic-library") { return Self("cubes", .sky) }
+        if suffix == "dylib" || id.contains("dynamic-library") { return Self("cubes", .sky, vary: true) }
         if suffix == "o" || id.contains("object-code") { return Self("cube", .purple) }
         if ["pyc", "wasm", "class", "bc", "air", "metallib", "a", "so"].contains(suffix) {
             return Self("microchip", .indigo, vary: true)
         }
-        if type.conforms(to: .unixExecutable) || type.conforms(to: .executable) { return Self("terminal", .gold) }
+        if type.conforms(to: .unixExecutable) || type.conforms(to: .executable) { return Self("terminal", .yellow) }
         if suffix == "md" || suffix == "markdown" || id.contains("markdown") { return Self("markdown", .indigo) }
         if type.conforms(to: .html) { return Self("window-code", .orange) }
-        if suffix == "js" || suffix == "mjs" || suffix == "cjs" { return Self("square-code", .amber) }
+        if suffix == "js" || suffix == "mjs" || suffix == "cjs" { return Self("square-code", .yellow, vary: true) }
         if suffix == "py" { return Self("terminal", .blue) }
-        if suffix == "sql" { return Self("database", .cyan) }
+        if suffix == "sql" { return Self("database", .cyan, vary: true) }
         if type.conforms(to: .propertyList) || ["yml", "yaml", "toml", "ini"].contains(suffix) {
             return Self("file-settings", .orange, vary: true)
         }
@@ -154,7 +148,7 @@ private struct KindStyle {
         if ["epub", "mobi"].contains(suffix) { return Self("book-open-2", .orange) }
         if ["cer", "p12", "pem", "keychain", "pfx"].contains(suffix) { return Self("file-key", .amber, vary: true) }
         if type.conforms(to: .text) { return Self("file-content", .blue, vary: true) }
-        if identifier == UTType.data.identifier { return Self("database", .green) }
+        if identifier == UTType.data.identifier { return Self("database", .lime) }
         return Self("file", .violet, vary: true)
     }
 }
@@ -167,7 +161,7 @@ final class FileKindCatalog: @unchecked Sendable {
     private static let folder = FileKind(
         id: 0, identifier: "public.folder", title: "Folder", glyph: "folder", tone: .neutral, vary: false)
     private var kinds = [folder]
-    private var lightPalette = [dt_glass_tint(folder.light)], darkPalette = [dt_glass_tint(folder.dark)]
+    private var lightPalette = [dt_glass_tint(folder.tone.light)], darkPalette = [dt_glass_tint(folder.tone.dark)]
     private static let fallbackNames = [
         "parquet": "Apache Parquet", "arrow": "Apache Arrow", "wasm": "WebAssembly module",
         "ndjson": "Newline-delimited JSON", "jsonl": "Newline-delimited JSON", "geojson": "GeoJSON", "avif": "AVIF image",
@@ -232,8 +226,8 @@ final class FileKindCatalog: @unchecked Sendable {
             let kind = FileKind(
                 id: value, identifier: id, title: name, glyph: style.glyph, tone: style.tone, vary: style.vary)
             kinds.append(kind)
-            lightPalette.append(dt_glass_tint(kind.light))
-            darkPalette.append(dt_glass_tint(kind.dark))
+            lightPalette.append(dt_glass_tint(kind.tone.light))
+            darkPalette.append(dt_glass_tint(kind.tone.dark))
             byName[group] = value
             byTag[key] = value
             return value

@@ -241,6 +241,18 @@ final class Treemap: NSView, NSViewToolTipOwner {
         cg.draw(view.image, in: CGRect(origin: .zero, size: area.size))
         cg.restoreGState()
     }
+    private func drawHairline(_ rect: CGRect, in context: CGContext) {
+        let pixels = context.convertToDeviceSpace(rect).standardized
+        let x = pixels.width < 1 ? floor(pixels.midX) : pixels.minX.rounded()
+        let y = pixels.height < 1 ? floor(pixels.midY) : pixels.minY.rounded()
+        let outer = CGRect(x: x, y: y, width: max(1, pixels.maxX.rounded() - x), height: max(1, pixels.maxY.rounded() - y))
+        context.beginPath()
+        context.addRect(context.convertToUserSpace(outer))
+        if outer.width > 2 && outer.height > 2 {
+            context.addRect(context.convertToUserSpace(outer.insetBy(dx: 1, dy: 1)))
+        }
+        context.drawPath(using: .eoFill)
+    }
     fileprivate func drawOverlay(_ dirty: NSRect) {
         if rendered == nil || geometry?.count == 0 {
             let title = geometry?.count == 0 ? "No files in this folder" : "Drawing file map…"
@@ -250,40 +262,34 @@ final class Treemap: NSView, NSViewToolTipOwner {
             return
         }
         let para = NSMutableParagraphStyle(); para.lineBreakMode = .byTruncatingMiddle
-        let ink = rendered?.dark == true ? NSColor.white : NSColor(calibratedWhite: 0.10, alpha: 1)
         for label in rendered?.labels ?? [] {
             let r = screen(label.rect).intersection(bounds)
             guard r.intersects(dirty), r.width >= 44, r.height >= 21 else { continue }
+            let ink = label.lightInk ? NSColor.white : NSColor.black
             let large = r.width >= 150 && r.height >= 74
             let inset: CGFloat = large ? 9 : 4
             let box = CGRect(x: r.minX + inset, y: r.minY + inset, width: r.width - 2 * inset, height: large ? 23 : 16)
             (label.title as NSString).draw(in: box, withAttributes: [.font: NSFont.systemFont(ofSize: large ? 16 : 11, weight: .semibold), .foregroundColor: ink, .paragraphStyle: para])
             if r.height > 39 {
                 (label.size as NSString).draw(in: box.offsetBy(dx: 0, dy: large ? 22 : 15), withAttributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: large ? 12 : 10, weight: .regular), .foregroundColor: ink.withAlphaComponent(0.84), .paragraphStyle: para])
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: large ? 12 : 10, weight: .regular), .foregroundColor: ink, .paragraphStyle: para])
             }
         }
         if !marked.isEmpty, let cg = NSGraphicsContext.current?.cgContext {
-            let regions = marked.filter { $0.intersects(viewport) }.map { screen($0) }
             cg.saveGState()
-            cg.beginTransparencyLayer(auxiliaryInfo: nil)
-            cg.setFillColor(NSColor.black.withAlphaComponent(0.43).cgColor)
-            cg.fill(dirty)
-            cg.setBlendMode(.clear)
-            for r in regions { cg.fill(r.intersection(bounds)) }
-            cg.endTransparencyLayer(); cg.restoreGState()
-            for r in regions {
-                if r.width < 4 || r.height < 4 {
-                    NSColor.white.setFill(); CGRect(x: r.midX - 2, y: r.midY - 2, width: 4, height: 4).fill()
-                } else {
-                    let path = NSBezierPath(rect: r.insetBy(dx: 1, dy: 1))
-                    NSColor.white.withAlphaComponent(0.95).setStroke(); path.lineWidth = 2; path.stroke()
-                }
-            }
+            cg.setShouldAntialias(false)
+            let outline = effectiveAppearance.usesDarkColors ? NSColor.black : NSColor.white
+            cg.setFillColor(outline.withAlphaComponent(0.95).cgColor)
+            for region in marked where region.intersects(viewport) { drawHairline(screen(region), in: cg) }
+            cg.restoreGState()
         }
-        if let marquee {
+        if let marquee, let cg = NSGraphicsContext.current?.cgContext {
             NSColor.selectedContentBackgroundColor.withAlphaComponent(0.20).setFill(); marquee.fill()
-            NSColor.white.setStroke(); NSBezierPath(rect: marquee).stroke()
+            cg.saveGState()
+            cg.setShouldAntialias(false)
+            cg.setFillColor(NSColor.white.cgColor)
+            drawHairline(marquee, in: cg)
+            cg.restoreGState()
         }
     }
     private func route(at event: NSEvent) -> [DiskItem]? {

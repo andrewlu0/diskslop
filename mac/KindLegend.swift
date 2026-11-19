@@ -10,53 +10,31 @@ private final class LegendRow: NSTableRowView {
     }
 }
 
-private final class KindCell: NSTableCellView {
-    private let swatch = NSView()
-    private let glyph = NSImageView()
-    private let name = NSTextField(labelWithString: "")
+private final class KindMarkerCell: NSTableCellView {
+    private let marker = NSImageView()
     private var kind: FileKind?
     private static var icons = [String: NSImage]()
+    private static let markers: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 512
+        return cache
+    }()
+    private static let markerSize = NSSize(width: 30, height: 17)
     override init(frame: NSRect) {
         super.init(frame: frame)
-        swatch.wantsLayer = true
-        swatch.layer?.cornerRadius = 2
-        glyph.imageScaling = .scaleProportionallyUpOrDown
-        name.font = .systemFont(ofSize: 12, weight: .medium)
-        name.alignment = .center
-        name.lineBreakMode = .byTruncatingTail
-        for v in [swatch, glyph, name] {
-            v.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(v)
-        }
-        let centered = name.centerXAnchor.constraint(equalTo: centerXAnchor)
-        centered.priority = .defaultLow
+        addSubview(marker)
+        marker.translatesAutoresizingMaskIntoConstraints = false
+        marker.imageScaling = .scaleNone
         NSLayoutConstraint.activate([
-            swatch.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
-            swatch.widthAnchor.constraint(equalToConstant: 8),
-            swatch.heightAnchor.constraint(equalToConstant: 15), swatch.centerYAnchor.constraint(equalTo: centerYAnchor),
-            glyph.leadingAnchor.constraint(equalTo: swatch.trailingAnchor, constant: 5),
-            glyph.widthAnchor.constraint(equalToConstant: 17),
-            glyph.heightAnchor.constraint(equalToConstant: 17), glyph.centerYAnchor.constraint(equalTo: centerYAnchor),
-            name.leadingAnchor.constraint(greaterThanOrEqualTo: glyph.trailingAnchor, constant: 6),
-            name.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -2),
-            centered,
-            name.centerYAnchor.constraint(equalTo: centerYAnchor),
+            marker.widthAnchor.constraint(equalToConstant: Self.markerSize.width),
+            marker.heightAnchor.constraint(equalToConstant: Self.markerSize.height),
+            marker.centerXAnchor.constraint(equalTo: centerXAnchor), marker.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
+        setAccessibilityElement(false)
     }
     required init?(coder: NSCoder) { nil }
     func configure(_ next: FileKind) {
         kind = next
-        name.stringValue = next.title
-        if Self.icons[next.glyph] == nil,
-            let url = Bundle.main.url(forResource: next.glyph, withExtension: "svg", subdirectory: "KindIcons"),
-            let icon = NSImage(contentsOf: url)
-        {
-            icon.size = NSSize(width: 18, height: 18)
-            icon.isTemplate = true
-            Self.icons[next.glyph] = icon
-        }
-        glyph.image = Self.icons[next.glyph]
-        setAccessibilityLabel(next.title)
         toolTip = next.title
         updateColor()
     }
@@ -66,102 +44,122 @@ private final class KindCell: NSTableCellView {
     }
     private func updateColor() {
         guard let kind else { return }
-        let dark = effectiveAppearance.usesDarkColors
-        swatch.layer?.backgroundColor = NSColor(rgb: kind.fill(darkMode: dark)).cgColor
-        glyph.contentTintColor = kind.tint(darkMode: dark)
+        let rgb = kind.fill(darkMode: effectiveAppearance.usesDarkColors)
+        let key = "\(kind.glyph)-\(rgb)" as NSString
+        if let image = Self.markers.object(forKey: key) { marker.image = image; return }
+        if Self.icons[kind.glyph] == nil,
+            let url = Bundle.main.url(forResource: kind.glyph, withExtension: "svg", subdirectory: "KindIcons") {
+            Self.icons[kind.glyph] = NSImage(contentsOf: url)
+        }
+        let icon = Self.icons[kind.glyph], tint = NSColor(rgb: rgb)
+        let image = NSImage(size: Self.markerSize, flipped: false) { rect in
+            guard let cg = NSGraphicsContext.current?.cgContext else { return false }
+            cg.beginTransparencyLayer(auxiliaryInfo: nil)
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: NSRect(x: 0, y: 1, width: 8, height: 15), xRadius: 2, yRadius: 2).fill()
+            icon?.draw(in: NSRect(x: 13, y: 0, width: 17, height: 17))
+            tint.setFill()
+            rect.fill(using: .sourceIn)
+            cg.endTransparencyLayer()
+            return true
+        }
+        Self.markers.setObject(image, forKey: key)
+        marker.image = image
     }
 }
 
 final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    private let background: NSView
+    private let title = NSTextField(labelWithString: "File Kinds")
     private let table = NSTableView()
-    private let scroll = NSScrollView()
-    private var columnSpace: CGFloat = -1
+    private lazy var scroll = FittingTableScrollView(table, flexibleColumn: "kind")
+    private let numberFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+    var minimumWidthChanged: ((CGFloat) -> Void)? {
+        didSet { minimumWidthChanged?(scroll.minimumWidth + 23) }
+    }
     private var rows: [KindUsage] = []
     private var indices: [UInt32: Int] = [:]
     private var followed: UInt32?
     override init(frame: NSRect) {
-        super.init(frame: frame)
-        let pane = NSView()
-        let background: NSView
         if #available(macOS 26.0, *) {
             let glass = NSGlassEffectView()
             glass.style = .regular
             glass.cornerRadius = 14
-            glass.contentView = pane
             background = glass
         } else {
             let visual = NSVisualEffectView()
             visual.material = .sidebar
             visual.blendingMode = .withinWindow
-            visual.addSubview(pane)
-            pane.frame = visual.bounds
-            pane.autoresizingMask = [.width, .height]
             background = visual
         }
+        super.init(frame: frame)
         addSubview(background)
-        background.translatesAutoresizingMaskIntoConstraints = false
-        let title = NSTextField(labelWithString: "File Kinds")
         title.font = .systemFont(ofSize: 15, weight: .semibold)
-        scroll.drawsBackground = false
-        scroll.contentView.drawsBackground = false
-        scroll.borderType = .noBorder
-        scroll.hasVerticalScroller = true
-        scroll.autohidesScrollers = true
         table.style = .inset
         table.rowHeight = 27
         table.intercellSpacing = .init(width: 2, height: 0)
         table.backgroundColor = .clear
         table.allowsEmptySelection = true
         table.allowsColumnReordering = false
-        table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
         table.usesAutomaticRowHeights = false
         table.delegate = self
         table.dataSource = self
         table.setAccessibilityLabel("File kinds, allocated sizes and file counts")
+        let marker = NSTableColumn(identifier: .init("marker"))
+        marker.title = ""
+        marker.headerCell.alignment = .left
+        marker.headerCell.setAccessibilityLabel("File kind color and icon")
+        marker.minWidth = 31; marker.maxWidth = 31; marker.width = 31; marker.resizingMask = []
+        table.addTableColumn(marker)
         for (id, title, width, minWidth) in [
-            ("kind", "Kind", 138, 70), ("bytes", "Size", 68, 52), ("files", "Files", 57, 39),
+            ("kind", "Kind", 110, 40), ("files", "Files", 57, 39), ("bytes", "Size", 68, 52),
         ] {
             let col = NSTableColumn(identifier: .init(id))
             col.title = title
             col.width = CGFloat(width)
             col.minWidth = CGFloat(minWidth)
             col.resizingMask = id == "kind" ? [.autoresizingMask, .userResizingMask] : [.userResizingMask]
-            col.headerCell.alignment = .center
+            col.headerCell.alignment = id == "bytes" ? .right : .left
+            if id == "bytes" { col.headerToolTip = "Allocated size on disk" }
             col.sortDescriptorPrototype = NSSortDescriptor(key: id, ascending: id == "kind")
             table.addTableColumn(col)
         }
         table.sortDescriptors = [NSSortDescriptor(key: "bytes", ascending: false)]
-        scroll.documentView = table
-        for v in [title, scroll] {
-            pane.addSubview(v)
-            v.translatesAutoresizingMaskIntoConstraints = false
-        }
-        NSLayoutConstraint.activate([
-            background.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            background.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
-            background.topAnchor.constraint(equalTo: topAnchor), background.bottomAnchor.constraint(equalTo: bottomAnchor),
-            title.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 12),
-            title.topAnchor.constraint(equalTo: pane.topAnchor, constant: 10),
-            scroll.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 5),
-            scroll.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -5),
-            scroll.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 7),
-            scroll.bottomAnchor.constraint(equalTo: pane.bottomAnchor, constant: -6),
-        ])
+        scroll.drawsBackground = false
+        scroll.contentView.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.minimumWidthChanged = { [weak self] width in self?.minimumWidthChanged?(width + 23) }
+        addSubview(scroll)
+        addSubview(title)
+        positionContents()
     }
     required init?(coder: NSCoder) { nil }
-    override func layout() {
-        super.layout()
-        let available = scroll.contentView.bounds.width
-        guard available > 0, available != columnSpace, table.tableColumns.count == 3 else { return }
-        columnSpace = available
-        let cols = table.tableColumns
-        let overhead = max(0, table.rect(ofColumn: 2).maxX - cols.reduce(0) { $0 + $1.width })
-        cols[0].width = max(cols[0].minWidth, available - cols[1].width - cols[2].width - overhead - 3)
-        table.frame.size.width = available
+    override func resizeSubviews(withOldSize oldSize: NSSize) {
+        super.resizeSubviews(withOldSize: oldSize)
+        positionContents()
+    }
+    private func positionContents() {
+        guard title.superview === self else { return }
+        let panel = NSRect(x: 6, y: 0, width: max(0, bounds.width - 13), height: bounds.height)
+        let titleHeight = ceil(title.intrinsicContentSize.height)
+        let titleY = panel.maxY - 10 - titleHeight
+        background.frame = panel
+        title.frame = NSRect(x: panel.minX + 10, y: titleY, width: max(0, panel.width - 20), height: titleHeight)
+        scroll.frame = NSRect(x: panel.minX + 5, y: 6, width: max(0, panel.width - 10), height: max(0, titleY - 13))
     }
     func show(_ kinds: [KindUsage]) {
         followed = nil
         rows = kinds
+        let byteWidth = kinds.reduce(CGFloat(52)) { max($0, TableTextCell.numberWidth($1.formattedSize, font: numberFont)) }
+        let largestCount = kinds.max { $0.files < $1.files }?.formattedFiles ?? formatCount(0)
+        let countWidth = max(39, TableTextCell.numberWidth(largestCount, font: numberFont))
+        for (id, width) in [("bytes", byteWidth), ("files", countWidth)] {
+            guard let col = table.tableColumn(withIdentifier: .init(id)) else { continue }
+            col.maxWidth = max(col.maxWidth, width)
+            col.minWidth = width
+            if col.width < width { col.width = width }
+        }
+        scroll.fitColumns()
         if let sort = table.sortDescriptors.first, sort.key == "bytes" && !sort.ascending {
             reloadRows()
         } else {
@@ -213,16 +211,19 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
         guard let col = tableColumn, rows.indices.contains(row) else { return nil }
         let item = rows[row]
         let id = col.identifier
-        if id.rawValue == "kind" {
-            let cell = table.makeView(withIdentifier: id, owner: self) as? KindCell ?? KindCell()
+        if id.rawValue == "marker" {
+            let cell = table.makeView(withIdentifier: id, owner: self) as? KindMarkerCell ?? KindMarkerCell()
             cell.identifier = id
             cell.configure(item.kind)
             return cell
         }
-        let cell = CenteredTableCell.make(in: table, column: id, icon: false, numeric: true)
-        cell.textField?.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        cell.textField?.textColor = .labelColor.withAlphaComponent(0.83)
-        cell.textField?.stringValue = id.rawValue == "bytes" ? formatBytes(item.bytes) : formatCount(item.files)
+        let name = id.rawValue == "kind"
+        let cell = TableTextCell.make(in: table, column: id, icon: false, numeric: !name)
+        let text = name ? item.kind.title : id.rawValue == "bytes" ? item.formattedSize : item.formattedFiles
+        cell.textField?.font = name ? .systemFont(ofSize: 12, weight: .medium) : numberFont
+        cell.textField?.alignment = id.rawValue == "bytes" ? .right : .left
+        cell.textField?.textColor = .labelColor
+        cell.setText(text)
         return cell
     }
 }
