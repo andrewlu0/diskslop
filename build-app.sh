@@ -13,5 +13,12 @@ swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos13.0" -module-cache-p
 cp mac/Info.plist "$bundle/Info.plist"
 mkdir -p "$bundle/Resources/KindIcons"
 cp mac/KindIcons/*.svg "$bundle/Resources/KindIcons/"
-if [ -f mac/AppIcon.icns ]; then cp mac/AppIcon.icns "$bundle/Resources/"; fi
+if xcrun --find actool >/dev/null 2>&1; then
+    xcrun actool "$PWD/mac/AppIcon.icon" --compile "$PWD/$bundle/Resources" --platform macosx \
+        --minimum-deployment-target "$MACOSX_DEPLOYMENT_TARGET" --target-device mac \
+        --app-icon AppIcon --standalone-icon-behavior all \
+        --output-partial-info-plist "$(cd "$build_dir" && pwd)/icon-info.plist"
+else
+    cp mac/AppIcon.icns "$bundle/Resources/"
+fi
 codesign --force --sign - DiskTally.app

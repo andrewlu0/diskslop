@@ -1,3 +1,5 @@
+<img src="mac/DiskTally.png" alt="DiskTally logo" width="112" height="112">
+
 # DiskTally
 
 DiskTally is a native macOS disk-usage explorer. A Rust scanner reads file metadata in bulk. An AppKit outline and a zoomable, file-only treemap share the same index.
