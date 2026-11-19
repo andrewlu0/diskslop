@@ -180,6 +180,7 @@ impl Scene {
             let f = &scan.folders[id];
             let sheet = &mut sheets[id];
             weighted.clear();
+            let mut file_rank = 0;
             for &slot in &scan.order[id] {
                 let e = &f.entries[slot as usize];
                 let weight = if e.child == NONE {
@@ -190,11 +191,13 @@ impl Scene {
                 if weight == 0 {
                     continue;
                 }
-                let hash = hash_name(f.name(slot as usize));
                 let shift = if e.child != NONE {
-                    hash % 12
+                    hash_name(f.name(slot as usize)) % COLORS.len() as u32
                 } else {
-                    [0, 0, 0, 1, 2, 5, 6, 9][(hash % 8) as usize]
+                    let order = [0, 3, 5, 1, 4, 7, 9, 8, 6, 2, 10, 11];
+                    let shift = order[file_rank % order.len()];
+                    file_rank += 1;
+                    shift
                 };
                 let tone = (u32::from(family) + shift) as u8 % COLORS.len() as u8;
                 weighted.push(Weighted {

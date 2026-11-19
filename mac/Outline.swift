@@ -52,7 +52,7 @@ final class FileOutlineView: NSOutlineView {
         dragBase.removeAll()
     }
     override func rightMouseDown(with event: NSEvent) {
-        if event.buttonNumber == 0 || event.modifierFlags.contains(.control) {
+        if event.modifierFlags.contains(.control) {
             let i = row(at: convert(event.locationInWindow, from: nil))
             if i >= 0 { selectGesture?(i, .toggle) }
         } else { super.rightMouseDown(with: event) }

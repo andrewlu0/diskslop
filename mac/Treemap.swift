@@ -277,11 +277,11 @@ final class Treemap: NSView {
         return g.model.route(to: key, from: g.folder)
     }
     override func menu(for event: NSEvent) -> NSMenu? {
-        guard event.buttonNumber != 0, !event.modifierFlags.contains(.control), let file = route(at: event) else { return nil }
+        guard !event.modifierFlags.contains(.control), let file = route(at: event) else { return nil }
         return menuForRoute?(file)
     }
     override func rightMouseDown(with event: NSEvent) {
-        if event.buttonNumber == 0 || event.modifierFlags.contains(.control) {
+        if event.modifierFlags.contains(.control) {
             if let file = route(at: event) { choose?([file], .toggle) }
         } else if let menu = menu(for: event) { NSMenu.popUpContextMenu(menu, with: event, for: self) }
     }
