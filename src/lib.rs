@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 const NONE: u32 = u32::MAX;
 const LINKED: u8 = 1;
 const REMOVED: u8 = 2;
+const EXECUTABLE: u8 = 4;
+const FINDER_BUNDLE: u8 = 8;
 
 #[derive(Default)]
 pub struct Progress {
@@ -60,6 +62,7 @@ pub struct Key {
 
 #[derive(Clone)]
 struct Entry {
+    finder_type: u32,
     inode: u64,
     bytes: u64,
     start: usize,
@@ -100,12 +103,15 @@ impl Folder {
             return;
         };
         self.entries.push(Entry {
+            finder_type: facts.finder_type,
             inode: facts.inode,
             bytes: facts.bytes,
             start: self.names.len(),
             len,
             child: NONE,
-            flags: if facts.linked { LINKED } else { 0 },
+            flags: (u8::from(facts.linked) * LINKED)
+                | (u8::from(facts.executable) * EXECUTABLE)
+                | (u8::from(facts.bundle) * FINDER_BUNDLE),
             kind: facts.kind,
         });
         self.names.extend_from_slice(name);
@@ -132,6 +138,7 @@ pub struct Inventory {
 }
 
 struct Build<'a> {
+    file_kinds: bool,
     folders: Mutex<Vec<Folder>>,
     root_error: Mutex<Option<io::Error>>,
     progress: &'a Progress,
@@ -199,7 +206,13 @@ fn visit<'s>(scope: &Scope<'s>, build: &'s Build<'_>, job: Job) {
         bulk::open_dir(&job.path, build.device, job.inode).and_then(|(fd, own_bytes)| {
             folder.own_bytes = own_bytes;
             folder.total = own_bytes;
-            bulk::enumerate(&fd, build.device, &mut folder, build.progress)
+            bulk::enumerate(
+                &fd,
+                build.device,
+                &mut folder,
+                build.progress,
+                build.file_kinds,
+            )
         })
     };
     if let Err(err) = result {
@@ -359,6 +372,7 @@ impl Inventory {
             reuse.filter(|r| (r.scan.device, r.scan.folders[0].inode) == (meta.dev(), meta.ino()));
         let root_prior = if reuse.is_some() { 0 } else { NONE };
         let build = Build {
+            file_kinds: index,
             folders: Mutex::new(vec![Folder::default()]),
             root_error: Mutex::default(),
             progress,

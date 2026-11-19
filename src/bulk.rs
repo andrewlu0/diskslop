@@ -20,6 +20,9 @@ thread_local! { static BUFFER: RefCell<Vec<u64>> = RefCell::new(vec![0; 8192]); 
 pub struct Facts {
     pub inode: u64,
     pub bytes: u64,
+    pub finder_type: u32,
+    pub executable: bool,
+    pub bundle: bool,
     pub linked: bool,
     pub kind: EntryKind,
 }
@@ -68,6 +71,9 @@ fn fallback_entry(fd: &File, name: &CStr, device: u64, folder: &mut Folder) {
                 Facts {
                     inode: s.st_ino,
                     bytes: s.st_blocks.max(0) as u64 * 512,
+                    finder_type: 0,
+                    executable: s.st_mode & 0o111 != 0,
+                    bundle: false,
                     linked: s.st_nlink > 1 && kind != EntryKind::Directory,
                     kind,
                 },
@@ -168,8 +174,24 @@ fn parse_record(r: &[u8], fd: &File, device: u64, folder: &mut Folder) -> Option
         5 => EntryKind::Link,
         _ => EntryKind::Other,
     };
-    let inode = wide(r, p + 4)?;
-    p += 12;
+    p += 4;
+    let mut finder_type = 0;
+    let mut bundle = false;
+    if common & libc::ATTR_CMN_FNDRINFO != 0 {
+        let info = r.get(p..p + 32)?;
+        if kind == EntryKind::File {
+            finder_type = u32::from_be_bytes(info[..4].try_into().ok()?);
+        }
+        bundle = u16::from_be_bytes([info[8], info[9]]) & 0x2000 != 0;
+        p += 32;
+    }
+    let mut executable = false;
+    if common & libc::ATTR_CMN_ACCESSMASK != 0 {
+        executable = word(r, p)? & 0o111 != 0;
+        p += 4;
+    }
+    let inode = wide(r, p)?;
+    p += 8;
     if dirs & libc::ATTR_DIR_MOUNTSTATUS != 0 {
         if word(r, p)? & libc::DIR_MNTSTATUS_MNTPOINT != 0 {
             folder.boundaries += 1;
@@ -183,6 +205,9 @@ fn parse_record(r: &[u8], fd: &File, device: u64, folder: &mut Folder) -> Option
             Facts {
                 inode,
                 bytes: 0,
+                finder_type,
+                executable: false,
+                bundle,
                 linked: false,
                 kind,
             },
@@ -194,6 +219,9 @@ fn parse_record(r: &[u8], fd: &File, device: u64, folder: &mut Folder) -> Option
             Facts {
                 inode,
                 bytes: bytes.max(0) as u64,
+                finder_type,
+                executable,
+                bundle,
                 linked: word(r, p)? > 1,
                 kind,
             },
@@ -209,11 +237,17 @@ pub fn enumerate(
     device: u64,
     folder: &mut Folder,
     progress: &Progress,
+    file_kinds: bool,
 ) -> io::Result<()> {
+    let kind_attrs = if file_kinds {
+        libc::ATTR_CMN_FNDRINFO | libc::ATTR_CMN_ACCESSMASK
+    } else {
+        0
+    };
     let mut attrs = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
-        commonattr: COMMON,
+        commonattr: COMMON | kind_attrs,
         volattr: 0,
         dirattr: libc::ATTR_DIR_MOUNTSTATUS,
         fileattr: FILE,

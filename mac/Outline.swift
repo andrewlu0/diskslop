@@ -10,6 +10,51 @@ enum SelectionMode {
 }
 
 final class FileOutlineView: NSOutlineView {
+    var hoverRow: ((Int) -> Void)?
+    private var hoverTracking: NSTrackingArea?
+    private var hoverIndex = -1
+    private var inside = false
+    private var columnSpace: CGFloat = -1
+    override func layout() {
+        super.layout()
+        guard let width = enclosingScrollView?.contentView.bounds.width, width > 0,
+              width != columnSpace, tableColumns.count == 2 else { return }
+        columnSpace = width
+        let overhead = max(0, rect(ofColumn: 1).maxX - tableColumns[0].width - tableColumns[1].width)
+        tableColumns[0].width = max(tableColumns[0].minWidth, width - tableColumns[1].width - overhead - 3)
+        frame.size.width = width
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTracking { removeTrackingArea(hoverTracking) }
+        let area = NSTrackingArea(rect: .zero, options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved], owner: self, userInfo: nil)
+        addTrackingArea(area)
+        hoverTracking = area
+    }
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: nil)
+        if let clip = enclosingScrollView?.contentView {
+            clip.postsBoundsChangedNotifications = true
+            NotificationCenter.default.addObserver(self, selector: #selector(scrollDidMove), name: NSView.boundsDidChangeNotification, object: clip)
+        }
+    }
+    private func updateHover(_ index: Int) {
+        guard hoverIndex != index else { return }
+        hoverIndex = index
+        hoverRow?(index)
+    }
+    @objc private func scrollDidMove() {
+        guard inside, let window else { return }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        updateHover(visibleRect.contains(point) ? row(at: point) : -1)
+    }
+    override func mouseMoved(with event: NSEvent) {
+        inside = true; updateHover(row(at: convert(event.locationInWindow, from: nil)))
+        super.mouseMoved(with: event)
+    }
+    override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
+    override func mouseExited(with event: NSEvent) { inside = false; updateHover(-1); super.mouseExited(with: event) }
     var makeMenu: (() -> NSMenu?)?
     var selectGesture: ((Int, SelectionMode) -> Void)?
     private var dragOrigin = -1
@@ -79,6 +124,7 @@ private final class TreeRow: NSObject {
 
 final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
     let view = FileOutlineView()
+    var hovered: ((URL?, DTKey?) -> Void)?
     var selectionChanged: (() -> Void)?
     var openFolder: (([DiskItem]) -> Void)?
     private var model: ScanModel?
@@ -86,9 +132,7 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
     private var expanded: [UInt64: TreeRow] = [:]
     private var anchor: TreeRow?
     private var applyingSelection = false
-    private let folderIcon = NSImage(systemSymbolName: "folder.fill", accessibilityDescription: "Folder")
-    private let fileIcon = NSImage(systemSymbolName: "doc", accessibilityDescription: "File")
-    private let linkIcon = NSImage(systemSymbolName: "link", accessibilityDescription: "Symbolic link")
+    private let icons = FinderIcons()
 
     override init() {
         super.init()
@@ -109,6 +153,12 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         view.delegate = self; view.dataSource = self
         view.target = self; view.doubleAction = #selector(openClicked)
         view.setAccessibilityLabel("File tree, largest first")
+        view.hoverRow = { [weak self] index in
+            guard let self else { return }
+            guard index >= 0, let row = self.view.item(atRow: index) as? TreeRow else { self.hovered?(nil, nil); return }
+            let url = row.model.url(folder: row.folder, slot: row.raw.slot, directory: row.raw.isFolder)
+            self.hovered?(url, DTKey(folder: row.folder, slot: row.raw.slot))
+        }
         view.selectGesture = { [weak self] row, mode in
             guard let self, let node = self.view.item(atRow: row) as? TreeRow else { return }
             self.select([node.route], mode: mode)
@@ -116,6 +166,7 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
     }
 
     func show(_ newModel: ScanModel, refresh: Bool) {
+        if refresh || model !== newModel { icons.reset() }
         if model !== newModel {
             model = newModel
             anchor = nil
@@ -288,9 +339,9 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         }
         cell.textField?.stringValue = isName ? row.raw.title : formatBytes(row.raw.bytes)
         if isName {
-            cell.imageView?.image = row.raw.isFolder ? folderIcon : row.raw.kind == 2 ? linkIcon : fileIcon
-            cell.imageView?.contentTintColor = row.raw.isFolder ? .systemTeal : .secondaryLabelColor
-            cell.toolTip = row.raw.partial ? "Some entries here could not be read." : row.raw.title
+            let url = row.model.url(folder: row.folder, slot: row.raw.slot, directory: row.raw.isFolder)
+            if let image = cell.imageView { icons.display(url, in: image, row: row.raw) }
+            cell.toolTip = url?.path
         }
         return cell
     }

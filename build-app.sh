@@ -7,9 +7,11 @@ build_dir="${CARGO_TARGET_DIR:-target}"
 bundle="DiskTally.app/Contents"
 mkdir -p "$bundle/MacOS" "$bundle/Resources" "$build_dir/swift-cache"
 swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos13.0" -module-cache-path "$build_dir/swift-cache" \
-    -import-objc-header mac/DiskTally.h mac/main.swift mac/Inventory.swift mac/FileMap.swift mac/Treemap.swift mac/Chrome.swift mac/Outline.swift mac/ApplicationMenu.swift mac/Volumes.swift mac/ScanCache.swift mac/TrashReview.swift \
+    -import-objc-header mac/DiskTally.h mac/*.swift \
     "$build_dir/release/libdisktally.a" -framework AppKit -framework Foundation \
     -o "$bundle/MacOS/DiskTally"
 cp mac/Info.plist "$bundle/Info.plist"
+mkdir -p "$bundle/Resources/KindIcons"
+cp mac/KindIcons/*.svg "$bundle/Resources/KindIcons/"
 if [ -f mac/AppIcon.icns ]; then cp mac/AppIcon.icns "$bundle/Resources/"; fi
 codesign --force --sign - DiskTally.app

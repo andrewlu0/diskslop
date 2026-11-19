@@ -2,10 +2,14 @@ import AppKit
 
 private struct Location { let id: UInt32; let url: URL; var item: DiskItem? = nil }
 
-final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSplitViewDelegate {
     private var window: NSWindow!
     private let tree = Outline()
     private let map = Treemap()
+    private let legend = KindLegend()
+    private let split = NSSplitView()
+    private var preferredPanes: [NSLayoutConstraint] = []
+    private let appearance = AppearanceSettings()
     private let folderLabel = NSTextField(labelWithString: "DiskTally")
     private let pathLabel = NSTextField(labelWithString: "Choose a folder or scan your startup data volume.")
     private let sizeLabel = NSTextField(labelWithString: "")
@@ -29,11 +33,13 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var pendingURL: URL?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        appearance.apply()
         buildMenus()
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1050, height: 660),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1240, height: 700),
             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "DiskTally"
-        window.minSize = NSSize(width: 700, height: 410)
+        window.minSize = NSSize(width: 770, height: 410)
+        window.acceptsMouseMovedEvents = true
         window.center()
         window.setFrameAutosaveName("DiskTallyMain")
         toolbar = WindowToolbar(target: self, commands: [
@@ -68,6 +74,8 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return sub
         }
         let app = menu("DiskTally")
+        app.addItem(withTitle: "Settings…", action: #selector(AppearanceSettings.show(_:)), keyEquivalent: ",").target = appearance
+        app.addItem(.separator())
         app.addItem(withTitle: "Quit DiskTally", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         let file = menu("File")
         file.addItem(withTitle: "Choose Volume…", action: #selector(chooseVolume), keyEquivalent: "").target = self
@@ -158,6 +166,12 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         pathLabel.lineBreakMode = .byTruncatingMiddle
         pathLabel.textColor = .secondaryLabelColor
         pathLabel.font = .systemFont(ofSize: 12)
+        pathLabel.setAccessibilityLabel("Path")
+        map.hovered = { [weak self] url, kind in self?.showHover(url, kind: kind) }
+        tree.hovered = { [weak self] url, key in
+            guard let self else { return }
+            self.showHover(url, kind: key.flatMap { self.listing?.geometry.kind(at: $0) })
+        }
         sizeLabel.font = .monospacedDigitSystemFont(ofSize: 22, weight: .medium)
         let heading = row([folderLabel, spacer(), sizeLabel], spacing: 11)
         tree.selectionChanged = { [weak self] in
@@ -188,12 +202,16 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return self.itemMenu()
         }
         tree.view.makeMenu = { [weak self] in self?.itemMenu() }
-        let split = NSSplitView()
         split.isVertical = true
+        split.delegate = self
         split.dividerStyle = .thin
         split.addArrangedSubview(scroll)
         split.addArrangedSubview(map)
+        split.addArrangedSubview(legend)
+        legend.widthAnchor.constraint(greaterThanOrEqualToConstant: 225).isActive = true
+        split.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
         split.setHoldingPriority(.defaultLow, forSubviewAt: 1)
+        split.setHoldingPriority(.defaultHigh, forSubviewAt: 2)
         status.lineBreakMode = .byTruncatingTail
         status.font = .systemFont(ofSize: 12)
         status.textColor = .secondaryLabelColor
@@ -245,8 +263,22 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             shelf.widthAnchor.constraint(equalToConstant: 275), shelf.heightAnchor.constraint(equalToConstant: 36)])
         mainViews = [heading, pathLabel, split]
         content.layoutSubtreeIfNeeded()
-        split.setPosition(350, ofDividerAt: 0)
         controls()
+    }
+
+    private func showHover(_ url: URL?, kind: UInt32?) {
+        let path = url?.path ?? locations.last?.url.path ?? ""
+        if path != pathLabel.stringValue { pathLabel.stringValue = path; pathLabel.toolTip = path }
+        legend.highlight(kind)
+    }
+
+    func splitView(_ splitView: NSSplitView, constrainSplitPosition proposedPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
+        if preferredPanes.indices.contains(dividerIndex), let event = NSApp.currentEvent,
+           event.type == .leftMouseDragged || event.type == .leftMouseDown {
+            preferredPanes[dividerIndex].constant = dividerIndex == 0 ? proposedPosition
+                : splitView.bounds.width - proposedPosition - splitView.dividerThickness
+        }
+        return proposedPosition
     }
 
     private var mainViews: [NSView] = []
@@ -352,13 +384,26 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         tree.show(list.model, refresh: reloadTree)
         welcome.isHidden = true
         for v in mainViews { v.isHidden = false }
+        if preferredPanes.isEmpty {
+            window.contentView?.layoutSubtreeIfNeeded()
+            let width = split.bounds.width
+            if width > 0 {
+                let left = split.arrangedSubviews[0].widthAnchor.constraint(equalToConstant: max(265, min(320, width * 0.25)))
+                let right = legend.widthAnchor.constraint(equalToConstant: max(245, min(345, width * 0.28)))
+                left.priority = .init(900)
+                right.priority = .init(910)
+                preferredPanes = [left, right]
+                NSLayoutConstraint.activate(preferredPanes)
+                window.contentView?.layoutSubtreeIfNeeded()
+            }
+        }
+        legend.show(list.geometry.kinds)
+        showHover(nil, kind: nil)
         map.show(list, ancestors: Set(locations.compactMap { $0.item?.key }))
         map.selection = tree.selectedKeys()
         if let here = locations.last {
             folderLabel.stringValue = here.url.lastPathComponent.isEmpty ? here.url.path : here.url.lastPathComponent
             window.title = "\(folderLabel.stringValue) — DiskTally"
-            pathLabel.stringValue = here.url.path
-            pathLabel.toolTip = here.url.path
         }
         sizeLabel.stringValue = formatBytes(list.summary.bytes)
         var parts = [message, "\(formatCount(list.summary.entries)) \(list.summary.entries == 1 ? "entry" : "entries")", String(format: "Scan %.2f s", scanTime)].compactMap { $0 }

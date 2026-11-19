@@ -8,10 +8,11 @@ private final class MapOverlay: FlippedCanvas {
     override func draw(_ dirtyRect: NSRect) { map?.drawOverlay(dirtyRect) }
 }
 
-final class Treemap: NSView {
+final class Treemap: NSView, NSViewToolTipOwner {
     var choose: (([[DiskItem]], SelectionMode) -> Void)?
     var menuForRoute: (([DiskItem]) -> NSMenu?)?
     var zoomChanged: (() -> Void)?
+    var hovered: ((URL?, UInt32?) -> Void)?
     private var geometry: FileMap?
     private var rendered: RenderedFiles?
     private var revision = 0, drawing = false
@@ -26,8 +27,12 @@ final class Treemap: NSView {
     private var marked: [CGRect] = []
     private var selectedBounds: CGRect?
     var selection = Set<UInt64>() { didSet { if selection != oldValue { updateSelection() } } }
-    private let overlay = MapOverlay(), glassHost = FlippedCanvas()
-    private var glassLayer: NSView?, glassTiles: [NSView] = []
+    private let overlay = MapOverlay()
+    private var hoverTracking: NSTrackingArea?
+    private var hoverPoint: CGPoint?
+    private var hoverKey: UInt64?
+    private var hoverPath: String?
+    private var hoverTip: NSView.ToolTipTag?
     override var isFlipped: Bool { true }
     override func hitTest(_ point: NSPoint) -> NSView? {
         !isHidden && frame.contains(point) ? self : nil
@@ -37,14 +42,6 @@ final class Treemap: NSView {
         super.init(frame: frame)
         wantsLayer = true
         layer?.masksToBounds = true
-        if #available(macOS 26.0, *) {
-            let glass = NSGlassEffectContainerView()
-            glass.spacing = 0
-            glass.contentView = glassHost
-            glass.frame = bounds; glass.autoresizingMask = [.width, .height]
-            addSubview(glass)
-            glassLayer = glass
-        }
         overlay.map = self
         overlay.frame = bounds; overlay.autoresizingMask = [.width, .height]
         addSubview(overlay)
@@ -56,7 +53,44 @@ final class Treemap: NSView {
         setAccessibilityHelp("Select a file to reveal its size in the outline. Command-scroll or pinch to zoom.")
     }
     required init?(coder: NSCoder) { nil }
-    @objc private func accessibilityChanged() { updateGlass(); overlay.needsDisplay = true }
+    @objc private func accessibilityChanged() { revision += 1; scheduleFrame(); overlay.needsDisplay = true }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        accessibilityChanged()
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTracking { removeTrackingArea(hoverTracking) }
+        let area = NSTrackingArea(rect: .zero, options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved], owner: self, userInfo: nil)
+        addTrackingArea(area)
+        hoverTracking = area
+    }
+    override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
+    override func mouseMoved(with event: NSEvent) {
+        hoverPoint = convert(event.locationInWindow, from: nil)
+        updateHover()
+    }
+    override func mouseExited(with event: NSEvent) { hoverPoint = nil; updateHover() }
+
+    private func updateHover(force: Bool = false) {
+        let key = hoverPoint.flatMap { p in bounds.contains(p) ? geometry?.hit(world(p)) : nil }
+        let packed = key.map { UInt64($0.folder) << 32 | UInt64($0.slot) }
+        guard packed != hoverKey || (force && hoverPoint != nil) else { return }
+        hoverKey = packed
+        if let hoverTip { removeToolTip(hoverTip); self.hoverTip = nil }
+        guard let key, let packed, let geometry, let url = geometry.model.url(folder: key.folder, slot: key.slot, directory: false) else {
+            hoverPath = nil; hovered?(nil, nil); return
+        }
+        hoverPath = url.path
+        if let rect = geometry.bounds(of: packed) {
+            let area = screen(rect).intersection(bounds)
+            if !area.isEmpty { hoverTip = addToolTip(area, owner: self, userData: nil) }
+        }
+        hovered?(url, geometry.kind(at: key))
+    }
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData: UnsafeMutableRawPointer?) -> String {
+        hoverPath ?? ""
+    }
 
     func show(_ listing: FolderListing, ancestors: Set<UInt64>) {
         reflow?.cancel()
@@ -66,7 +100,7 @@ final class Treemap: NSView {
         rendered = nil; down = nil; marquee = nil; panOrigin = nil
         updateSelection()
         revision += 1
-        updateGlass()
+        updateHover(force: true)
         needsDisplay = true; overlay.needsDisplay = true
         setAccessibilityValue("Preparing file map")
         scheduleFrame()
@@ -81,7 +115,7 @@ final class Treemap: NSView {
         lastSize = bounds.size; lastScale = scale
         revision += 1
         scheduleFrame()
-        updateGlass()
+        updateHover(force: true)
         scheduleReflow()
     }
     override func viewDidChangeBackingProperties() {
@@ -100,6 +134,7 @@ final class Treemap: NSView {
                     guard self.geometry === current, self.viewport == Self.whole, abs(log(self.aspect / target)) < 0.2 else { return }
                     self.geometry = new
                     self.updateSelection()
+                    self.updateHover(force: true)
                     self.revision += 1; self.scheduleFrame()
                 }
             }
@@ -112,16 +147,16 @@ final class Treemap: NSView {
         guard !drawing, let current = geometry, bounds.width >= 1, bounds.height >= 1 else { return }
         let scale = min(window?.backingScaleFactor ?? 2, sqrt(24_000_000 / (bounds.width * bounds.height)))
         let w = max(1, Int((bounds.width * scale).rounded())), h = max(1, Int((bounds.height * scale).rounded()))
-        let port = viewport, token = revision
+        let port = viewport, token = revision, dark = effectiveAppearance.usesDarkColors
+        let shine = !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         drawing = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let frame = current.render(viewport: port, width: w, height: h, scale: scale)
+            let frame = current.render(viewport: port, width: w, height: h, scale: scale, dark: dark, shine: shine)
             DispatchQueue.main.async {
                 self.drawing = false
                 if self.geometry === current, let frame {
                     self.rendered = frame
                     self.needsDisplay = true; self.overlay.needsDisplay = true
-                    self.updateGlass()
                     self.setAccessibilityValue("\(current.count.formatted()) file shapes · \(Int(self.zoom.rounded()))×")
                 }
                 if self.revision != token { self.scheduleFrame() }
@@ -146,7 +181,7 @@ final class Treemap: NSView {
         guard next != viewport else { return }
         viewport = next; revision += 1
         needsDisplay = true; overlay.needsDisplay = true
-        updateGlass(); scheduleFrame(); zoomChanged?()
+        updateHover(force: true); scheduleFrame(); zoomChanged?()
         if next == Self.whole { scheduleReflow() }
     }
     private func magnify(by factor: CGFloat, around anchor: CGPoint) {
@@ -194,29 +229,6 @@ final class Treemap: NSView {
         selectedBounds = marked.reduce(nil as CGRect?) { $0?.union($1) ?? $1 }
         overlay.needsDisplay = true
     }
-    private func updateGlass() {
-        guard #available(macOS 26.0, *), let glassLayer else { return }
-        let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
-        glassLayer.isHidden = reduce
-        guard !reduce else { return }
-        var count = 0
-        for label in rendered?.labels ?? [] {
-            let projected = screen(label.rect), r = projected.intersection(bounds)
-            guard count < 12, r.width >= 66, r.height >= 36, abs(r.width - projected.width) < 1,
-                  abs(r.height - projected.height) < 1 else { continue }
-            let tile: NSGlassEffectView
-            if count < glassTiles.count { tile = glassTiles[count] as! NSGlassEffectView }
-            else {
-                tile = NSGlassEffectView(); tile.style = .clear; tile.cornerRadius = 0
-                glassHost.addSubview(tile); glassTiles.append(tile)
-            }
-            let c = label.rgb
-            tile.tintColor = NSColor(srgbRed: CGFloat(c >> 16) / 255, green: CGFloat((c >> 8) & 255) / 255,
-                                     blue: CGFloat(c & 255) / 255, alpha: 0.28)
-            tile.frame = r; tile.isHidden = false; count += 1
-        }
-        for tile in glassTiles.dropFirst(count) { tile.isHidden = true }
-    }
     override func draw(_ dirtyRect: NSRect) {
         NSColor.controlBackgroundColor.setFill(); dirtyRect.fill()
         guard let view = rendered, geometry?.count != 0, let cg = NSGraphicsContext.current?.cgContext else { return }
@@ -237,16 +249,17 @@ final class Treemap: NSView {
             return
         }
         let para = NSMutableParagraphStyle(); para.lineBreakMode = .byTruncatingMiddle
+        let ink = rendered?.dark == true ? NSColor.white : NSColor(calibratedWhite: 0.10, alpha: 1)
         for label in rendered?.labels ?? [] {
             let r = screen(label.rect).intersection(bounds)
             guard r.intersects(dirty), r.width >= 44, r.height >= 21 else { continue }
             let large = r.width >= 150 && r.height >= 74
             let inset: CGFloat = large ? 9 : 4
             let box = CGRect(x: r.minX + inset, y: r.minY + inset, width: r.width - 2 * inset, height: large ? 23 : 16)
-            (label.title as NSString).draw(in: box, withAttributes: [.font: NSFont.systemFont(ofSize: large ? 16 : 11, weight: .semibold), .foregroundColor: NSColor.white, .paragraphStyle: para])
+            (label.title as NSString).draw(in: box, withAttributes: [.font: NSFont.systemFont(ofSize: large ? 16 : 11, weight: .semibold), .foregroundColor: ink, .paragraphStyle: para])
             if r.height > 39 {
                 (label.size as NSString).draw(in: box.offsetBy(dx: 0, dy: large ? 22 : 15), withAttributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: large ? 12 : 10, weight: .regular), .foregroundColor: NSColor.white, .paragraphStyle: para])
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: large ? 12 : 10, weight: .regular), .foregroundColor: ink.withAlphaComponent(0.84), .paragraphStyle: para])
             }
         }
         if !marked.isEmpty, let cg = NSGraphicsContext.current?.cgContext {
