@@ -6,7 +6,7 @@ final class AppearanceSettings: NSObject {
         case light = "Light"
         case dark = "Dark"
     }
-    private let key = "DiskTallyAppearance"
+    private let key = "DiskSlopAppearance"
     private var window: NSWindow?
     private var control: NSSegmentedControl?
     private var choice: Choice { UserDefaults.standard.string(forKey: key).flatMap(Choice.init(rawValue:)) ?? .system }

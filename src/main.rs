@@ -1,9 +1,9 @@
-use disktally::{EntryKind, Inventory, Key, Progress, default_threads};
+use diskslop::{EntryKind, Inventory, Key, Progress, default_threads};
 use std::{
     env, ffi::OsStr, io, os::unix::ffi::OsStrExt, path::PathBuf, process::ExitCode, time::Instant,
 };
 
-const USAGE: &str = "disktally [--summary] [--top N] [--threads N] [--] FOLDER";
+const USAGE: &str = "diskslop [--summary] [--top N] [--threads N] [--] FOLDER";
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1);

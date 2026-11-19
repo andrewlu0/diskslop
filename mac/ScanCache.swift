@@ -45,7 +45,7 @@ private final class EventState: @unchecked Sendable {
 final class ChangeWatch: @unchecked Sendable {
     private let stream: FSEventStreamRef
     private let state: EventState
-    private let queue = DispatchQueue(label: "local.disktally.filesystem-events", qos: .utility)
+    private let queue = DispatchQueue(label: "local.diskslop.filesystem-events", qos: .utility)
 
     init?(url: URL, identity: RootIdentity?) {
         guard identity?.isLocal == true else { return nil }

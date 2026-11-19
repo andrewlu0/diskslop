@@ -1,14 +1,14 @@
-<img src="mac/DiskTally.png" alt="DiskTally logo" width="112" height="112">
+<img src="mac/DiskSlop.png" alt="DiskSlop logo" width="112" height="112">
 
-# DiskTally
+# DiskSlop
 
-DiskTally is a native macOS disk-usage explorer. A Rust scanner reads file metadata in bulk. An AppKit outline and a zoomable, file-only treemap share the same index.
+DiskSlop is a native macOS disk-usage explorer. A Rust scanner reads file metadata in bulk. An AppKit outline and a zoomable, file-only treemap share the same index.
 
 ## Run it
 
-Open `DiskTally.app` in the repository. Choose **Volume** for a mounted startup, external, or network volume, or **Choose Folder** for a directory. The volume picker can also show hidden system mounts. Scan scope follows the selected filesystem and the current user’s access.
+Open `DiskSlop.app` in the repository. Choose **Volume** for a mounted startup, external, or network volume, or **Choose Folder** for a directory. The volume picker can also show hidden system mounts. Scan scope follows the selected filesystem and the current user’s access.
 
-To build on macOS with a current Rust toolchain and a Swift compiler with the macOS 26 SDK or later, run `./build-app.sh`. The script creates and locally signs `DiskTally.app` for the host architecture. It also builds the Rust CLI. For an allocated-byte total, run `target/release/disktally --summary /path/to/folder`. The app targets macOS 13 and later. Native Liquid Glass is available on macOS 26 and later.
+To build on macOS with a current Rust toolchain and a Swift compiler with the macOS 26 SDK or later, run `./build-app.sh`. The script creates and locally signs `DiskSlop.app` for the host architecture. It also builds the Rust CLI. For an allocated-byte total, run `target/release/diskslop --summary /path/to/folder`. The app targets macOS 13 and later. Native Liquid Glass is available on macOS 26 and later.
 
 ## Navigate the map
 
@@ -37,7 +37,7 @@ Open in Finder and Move to Trash occupy a dedicated footer below the map. A sing
 
 Every Trash action opens a review sheet showing the selected paths, their allocated bytes and the scanned count of files and folders inside them. Return and Escape cancel. Moving a parent folder includes its descendants once. The Rust backend blocks a complete scanned volume or home folder, including a marquee covering every scanned file, and protects folders containing nested mounts. A selection covering at least half the scanned bytes of a volume or home folder needs an extra acknowledgment in the same sheet.
 
-DiskTally uses the native Trash operation under the signed-in account’s permissions. A macOS refusal leaves the affected item in place. The app reports partial results and offers **Show in Finder** for the first affected item. Finder then handles any separate action you choose there.
+DiskSlop uses the native Trash operation under the signed-in account’s permissions. A macOS refusal leaves the affected item in place. The app reports partial results and offers **Show in Finder** for the first affected item. Finder then handles any separate action you choose there.
 
 ## Layout and scan behavior
 
@@ -47,10 +47,10 @@ The layout applies the squarified treemap algorithm independently within each di
 
 Each square tile uses the same base color as its legend swatch and the solid part of its duotone icon. Light mode uses deeper shades and dark mode uses brighter shades. A soft vertical gradient and narrow edge highlights distinguish adjacent files of the same kind. Labels use contrasting ink for each background. Selection draws a one-physical-pixel outline and preserves the colors across the map. Rust caches each kind’s color ramp and draws visible tiles into one image off the main thread. During a gesture the view reprojects the previous frame until the next is ready. The index hit-tests the underlying rectangles at every zoom level. With Reduce Transparency enabled, the map keeps its colors and dividers and uses a flat fill.
 
-The tree reuses native AppKit rows and preordered child indexes. Visible rows load their actual Finder icons on a bounded background queue and reuse a path-keyed cache. The glass legend pairs a map swatch with a tinted Nucleo duotone glyph. The entire app follows the system appearance by default. Choose **DiskTally → Settings…** (⌘,) for Light or Dark. [Finder icons via NSWorkspace](https://developer.apple.com/documentation/appkit/nsworkspace/icon(forfile:)) · [Nucleo icons](https://nucleoapp.com/)
+The tree reuses native AppKit rows and preordered child indexes. Visible rows load their actual Finder icons on a bounded background queue and reuse a path-keyed cache. The glass legend pairs a map swatch with a tinted Nucleo duotone glyph. The entire app follows the system appearance by default. Choose **DiskSlop → Settings…** (⌘,) for Light or Dark. [Finder icons via NSWorkspace](https://developer.apple.com/documentation/appkit/nsworkspace/icon(forfile:)) · [Nucleo icons](https://nucleoapp.com/)
 
 The scanner requests metadata through Darwin’s bulk directory API with a descriptor-based fallback. It counts each hard-linked allocation once, measures sparse files by their allocated blocks, skips Trash directories and stays within the selected mount. Symlinks are listed without traversing their targets. The status bar reports read errors and skipped mount boundaries. APFS clones can share storage, so the reported allocation can differ from space recovered after emptying Trash. [Apple’s bulk directory API](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/getattrlistbulk.2)
 
-Recent roots stay in memory while the app is open. DiskTally keeps up to three, targeting 512 MiB of estimated scan and geometry storage. A single larger scan can occupy the cache on its own. On reopen it checks the filesystem identity and flushes the local filesystem event stream. Changed paths trigger a background refresh of affected subtrees. Network mounts, incomplete scans, and missing or dropped events trigger a fresh scan. The toolbar’s Rescan always rereads the root. [Apple’s filesystem event guide](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html)
+Recent roots stay in memory while the app is open. DiskSlop keeps up to three, targeting 512 MiB of estimated scan and geometry storage. A single larger scan can occupy the cache on its own. On reopen it checks the filesystem identity and flushes the local filesystem event stream. Changed paths trigger a background refresh of affected subtrees. Network mounts, incomplete scans, and missing or dropped events trigger a fresh scan. The toolbar’s Rescan always rereads the root. [Apple’s filesystem event guide](https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/FSEvents_ProgGuide/UsingtheFSEventsFramework/UsingtheFSEventsFramework.html)
 
 [Performance measurements and Disk Inventory X comparison](BENCHMARKS.md)

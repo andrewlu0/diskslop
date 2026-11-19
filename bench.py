@@ -25,8 +25,8 @@ def main():
     args = p.parse_args()
     if args.runs < 1:
         p.error("--runs must be positive")
-    cli = Path(__file__).resolve().parent / "target/release/disktally"
-    tools = {"DiskTally": [str(cli), "--summary", "{root}"], "du": ["/usr/bin/du", "-skx", "{root}"]}
+    cli = Path(__file__).resolve().parent / "target/release/diskslop"
+    tools = {"DiskSlop": [str(cli), "--summary", "{root}"], "du": ["/usr/bin/du", "-skx", "{root}"]}
     if args.dua:
         # A second zero-size input prevents expansion of the root into separate output rows.
         tools["dua"] = [args.dua, "-x", "-f", "bytes", "aggregate", "--no-sort", "{root}", "/dev/null"]

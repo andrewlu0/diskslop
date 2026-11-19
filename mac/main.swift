@@ -10,7 +10,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private let split = NSSplitView()
     private var preferredPanes: [NSLayoutConstraint] = []
     private let appearance = AppearanceSettings()
-    private let folderLabel = NSTextField(labelWithString: "DiskTally")
+    private let folderLabel = NSTextField(labelWithString: "DiskSlop")
     private let pathLabel = NSTextField(labelWithString: "Choose a folder or scan your startup data volume.")
     private let sizeLabel = NSTextField(labelWithString: "")
     private let status = NSTextField(labelWithString: "")
@@ -39,12 +39,12 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         buildMenus()
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1240, height: 700),
             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "DiskTally"
+        window.title = "DiskSlop"
         window.collectionBehavior.insert(.fullScreenPrimary)
         window.minSize = NSSize(width: 770, height: 410)
         window.acceptsMouseMovedEvents = true
         window.center()
-        window.setFrameAutosaveName("DiskTallyMain")
+        window.setFrameAutosaveName("DiskSlopMain")
         toolbar = WindowToolbar(target: self, commands: [
             .init(id: "zoomOut", title: "Zoom Out", symbol: "minus.magnifyingglass", action: #selector(zoomOut)),
             .init(id: "zoomIn", title: "Zoom In", symbol: "plus.magnifyingglass", action: #selector(zoomIn)),
@@ -85,16 +85,16 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             item.keyEquivalentModifierMask = modifiers
             return item
         }
-        let app = menu("DiskTally")
-        command(app, "About DiskTally", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), responder: true)
+        let app = menu("DiskSlop")
+        command(app, "About DiskSlop", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), responder: true)
         app.addItem(.separator())
         app.addItem(withTitle: "Settings…", action: #selector(AppearanceSettings.show(_:)), keyEquivalent: ",").target = appearance
         app.addItem(.separator())
-        command(app, "Hide DiskTally", #selector(NSApplication.hide(_:)), "h", responder: true)
+        command(app, "Hide DiskSlop", #selector(NSApplication.hide(_:)), "h", responder: true)
         command(app, "Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option], responder: true)
         command(app, "Show All", #selector(NSApplication.unhideAllApplications(_:)), responder: true)
         app.addItem(.separator())
-        command(app, "Quit DiskTally", #selector(NSApplication.terminate(_:)), "q", responder: true)
+        command(app, "Quit DiskSlop", #selector(NSApplication.terminate(_:)), "q", responder: true)
 
         let file = menu("File")
         command(file, "Choose Folder…", #selector(choose), "o")
@@ -546,7 +546,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         map.selection = tree.selectedKeys()
         if let here = locations.last {
             folderLabel.stringValue = here.url.lastPathComponent.isEmpty ? here.url.path : here.url.lastPathComponent
-            window.title = "\(folderLabel.stringValue) — DiskTally"
+            window.title = "\(folderLabel.stringValue) — DiskSlop"
         }
         sizeLabel.stringValue = formatBytes(list.summary.bytes)
         var parts = [message, "\(formatCount(list.summary.entries)) \(list.summary.entries == 1 ? "entry" : "entries")", String(format: "Scan %.2f s", scanTime)].compactMap { $0 }
@@ -832,6 +832,19 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
 }
 
+private func importPreviousPreferences() {
+    let defaults = UserDefaults.standard
+    let marker = "ImportedPreviousPreferences"
+    guard !defaults.bool(forKey: marker),
+          let previous = defaults.persistentDomain(forName: "local.disktally.app") else { return }
+    for (key, value) in previous where key.contains("DiskTally") {
+        let newKey = key.replacingOccurrences(of: "DiskTally", with: "DiskSlop")
+        if defaults.object(forKey: newKey) == nil { defaults.set(value, forKey: newKey) }
+    }
+    defaults.set(true, forKey: marker)
+}
+
+importPreviousPreferences()
 let application = NSApplication.shared
 let delegate = DiskApp()
 application.setActivationPolicy(.regular)

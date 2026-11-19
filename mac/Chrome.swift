@@ -9,7 +9,7 @@ final class WindowToolbar: NSObject, NSToolbarDelegate {
         self.target = target
         self.commands = commands
         super.init()
-        let toolbar = NSToolbar(identifier: "DiskTallyTools")
+        let toolbar = NSToolbar(identifier: "DiskSlopTools")
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
         toolbar.allowsUserCustomization = false
@@ -103,7 +103,7 @@ final class Welcome: NSView {
         icon.image = NSApplication.shared.applicationIconImage
         icon.imageScaling = .scaleProportionallyUpOrDown
         NSLayoutConstraint.activate([icon.widthAnchor.constraint(equalToConstant: 105), icon.heightAnchor.constraint(equalToConstant: 105)])
-        let title = NSTextField(labelWithString: "DiskTally")
+        let title = NSTextField(labelWithString: "DiskSlop")
         title.font = .systemFont(ofSize: 34, weight: .bold)
         let subtitle = NSTextField(labelWithString: "Choose a location to map its disk usage.")
         subtitle.textColor = .secondaryLabelColor

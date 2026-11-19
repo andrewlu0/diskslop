@@ -1,15 +1,15 @@
 #!/bin/sh
 set -eu
-cd "$(dirname "$0")"
+cd -P "$(dirname "$0")"
 export MACOSX_DEPLOYMENT_TARGET=13.0
 cargo build --locked --release
 build_dir="${CARGO_TARGET_DIR:-target}"
-bundle="DiskTally.app/Contents"
+bundle="DiskSlop.app/Contents"
 mkdir -p "$bundle/MacOS" "$bundle/Resources" "$build_dir/swift-cache"
 swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos13.0" -module-cache-path "$build_dir/swift-cache" \
-    -import-objc-header mac/DiskTally.h mac/*.swift \
-    "$build_dir/release/libdisktally.a" -framework AppKit -framework Foundation \
-    -o "$bundle/MacOS/DiskTally"
+    -import-objc-header mac/DiskSlop.h mac/*.swift \
+    "$build_dir/release/libdiskslop.a" -framework AppKit -framework Foundation \
+    -o "$bundle/MacOS/DiskSlop"
 cp mac/Info.plist "$bundle/Info.plist"
 mkdir -p "$bundle/Resources/KindIcons"
 cp mac/KindIcons/*.svg "$bundle/Resources/KindIcons/"
@@ -21,4 +21,4 @@ if xcrun --find actool >/dev/null 2>&1; then
 else
     cp mac/AppIcon.icns "$bundle/Resources/"
 fi
-codesign --force --sign - DiskTally.app
+codesign --force --sign - DiskSlop.app

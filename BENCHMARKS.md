@@ -4,18 +4,18 @@ Measured on an Apple M4 Pro running macOS 27.0.1. The tests used the local APFS 
 
 ## Opening a document
 
-On a generated tree containing **50,048 entries** across 128 groups and six subfolders per group, opening a fresh DiskTally window took a median **0.509 s** with the Finder icons and file-kind legend. Disk Inventory X 1.3 took **5.018 s**, a **9.9×** difference. Each run launched a new process. Both apps had to show a document window with the requested name and a populated native outline with a nonzero-height visible row. DiskTally additionally had to report a completed file raster. The timer included launch and accessibility polling. Each app had one warm-up followed by three alternating measured launches. These are warm-cache observations on the local APFS volume.
+On a generated tree containing **50,048 entries** across 128 groups and six subfolders per group, opening a fresh DiskSlop window took a median **0.509 s** with the Finder icons and file-kind legend. Disk Inventory X 1.3 took **5.018 s**, a **9.9×** difference. Each run launched a new process. Both apps had to show a document window with the requested name and a populated native outline with a nonzero-height visible row. DiskSlop additionally had to report a completed file raster. The timer included launch and accessibility polling. Each app had one warm-up followed by three alternating measured launches. These are warm-cache observations on the local APFS volume.
 
 | Application | Run 1 | Run 2 | Run 3 |
 | --- | ---: | ---: | ---: |
-| DiskTally, native Apple silicon | 0.476 s | 0.517 s | 0.509 s |
+| DiskSlop, native Apple silicon | 0.476 s | 0.517 s | 0.509 s |
 | Disk Inventory X 1.3, Intel under Rosetta | 4.996 s | 5.018 s | 5.021 s |
 
 ## Scanning
 
-Median total command runtime in seconds. One warm-up and seven interleaved runs per tool and tree. DiskTally, macOS du and dua returned identical allocated-byte totals on all three inputs. The runs shared an active desktop, so the small timing differences are sensitive to system load.
+Median total command runtime in seconds. One warm-up and seven interleaved runs per tool and tree. DiskSlop, macOS du and dua returned identical allocated-byte totals on all three inputs. The runs shared an active desktop, so the small timing differences are sensitive to system load.
 
-| Tree | Entries | DiskTally | macOS du | dua 3.0.3 | szt 1.0.0 |
+| Tree | Entries | DiskSlop | macOS du | dua 3.0.3 | szt 1.0.0 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Nested generated tree | 50,048 | 0.0376 | 0.1582 | 0.0563 | 0.0331 |
 | One wide directory | 24,000 | 0.0364 | 0.0569 | 0.0836 | 0.0354 |
@@ -40,6 +40,6 @@ In the native review sheet, Return and Escape canceled. The table listed every s
 
 Inspection of the installed Disk Inventory X 1.3 executable with REA showed that it recursively loads filesystem items with Foundation metadata, including size and kind. It builds folder totals and refreshes file-kind statistics as part of opening a document. Its normal Trash path calls the native system Trash API, detaches the item from the model and walks the removed subtree to update file-kind statistics.
 
-Its kind resolver caches the localized description of the uniform type, with the URL’s localized type description as a fallback. The statistics pass groups by that description and sums bytes and counts. Its package-contents option controls whether packages count as individual items or expose their contents. In the original legend the largest kinds receive the first palette colors. DiskTally uses persistent type colors across scopes, keeps the file-level hit targets, and updates the header and kind highlight on hover. [Original Disk Inventory X screenshots](https://www.derlien.com/screenshots/index.html)
+Its kind resolver caches the localized description of the uniform type, with the URL’s localized type description as a fallback. The statistics pass groups by that description and sums bytes and counts. Its package-contents option controls whether packages count as individual items or expose their contents. In the original legend the largest kinds receive the first palette colors. DiskSlop uses persistent type colors across scopes, keeps the file-level hit targets, and updates the header and kind highlight on hover. [Original Disk Inventory X screenshots](https://www.derlien.com/screenshots/index.html)
 
-DiskTally uses the same recoverable macOS Trash operation. Its scan batches directory metadata, and its removal bookkeeping updates ancestor totals and any affected hard-link owners from an index. Rendering and map rebuilding run off the main thread. The launch timings include the combined cost of those operations. [Disk Inventory X](https://www.derlien.com/)
+DiskSlop uses the same recoverable macOS Trash operation. Its scan batches directory metadata, and its removal bookkeeping updates ancestor totals and any affected hard-link owners from an index. Rendering and map rebuilding run off the main thread. The launch timings include the combined cost of those operations. [Disk Inventory X](https://www.derlien.com/)
