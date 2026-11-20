@@ -4,6 +4,11 @@
 <p align="center">
   <a href="https://github.com/andrewlu0/diskslop/releases/download/v0.1.0-preview.1/DiskSlop-0.1.0-preview.1.dmg"><img src="docs/download-macos.svg" width="244" height="44" alt="Download the DiskSlop preview for macOS"></a>
 </p>
+
+```sh
+brew install --cask andrewlu0/tap/diskslop
+```
+
 <p align="center"><strong>Public preview</strong> · Apple hasn’t notarized this build. Gatekeeper blocks it by default. <a href="https://github.com/andrewlu0/diskslop/releases/tag/v0.1.0-preview.1">Release notes and checksum</a></p>
 <p align="center">
   <img src="https://img.shields.io/badge/deployment_target-macOS_13%2B-49655f" alt="Deployment target macOS 13 or later">
