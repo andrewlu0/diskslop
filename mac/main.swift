@@ -57,6 +57,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private let sizeLabel = NSTextField(labelWithString: "")
     private let status = NSTextField(labelWithString: "")
     private let spinner = NSProgressIndicator()
+    private let scanBadge = ScanBadge()
     private var toolbar: WindowToolbar!
     private var welcome: Welcome!
     private var shelf: NSView!
@@ -512,7 +513,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         status.font = .systemFont(ofSize: 12)
         status.textColor = .secondaryLabelColor
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let footer = row([spinner, status, spacer(), selectionLabel])
+        let footer = row([scanBadge, spinner, status, spacer(), selectionLabel])
         for v in [heading, pathLabel, split, footer, welcome!] as [NSView] {
             content.addSubview(v)
             v.translatesAutoresizingMaskIntoConstraints = false
@@ -837,7 +838,8 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         parentButton.isEnabled = canShowParent
         trashButton.isEnabled = !busy && count > 0 && !tree.isSelected(DiskItem.scanRootKey)
         updateZoom()
-        if busy { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+        spinner.isHidden = !busy || scanning != nil
+        if spinner.isHidden { spinner.stopAnimation(nil) } else { spinner.startAnimation(nil) }
     }
     @objc private func choose() {
         guard !busy else { return }
@@ -1017,7 +1019,8 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             pendingParentFile = nil
             cancelledScan = true
             dt_cancel(scanning.handle)
-            status.stringValue = "Cancelling…"
+            scanBadge.show(.cancelling)
+            status.stringValue = ""
         }
     }
 
@@ -1072,12 +1075,26 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         if !continuing { tree.selectSaved([], lead: nil) }
         applyingNavigation = false
     }
+    private func beginScan() -> ScanProgress {
+        let progress = ScanProgress()
+        scanning = progress
+        busy = true
+        cancelledScan = false
+        scanBadge.show(.scanning)
+        return progress
+    }
+
+    private func endScan(completed: Bool) {
+        scanning = nil
+        busy = false
+        scanBadge.show(completed && !cancelledScan ? .complete : .idle)
+    }
+
     private func obtainRoot(_ url: URL, force: Bool = false, keeping current: ScanModel? = nil, preview: ((RecentScan) -> Void)? = nil,
                             completion: @escaping (Result<RecentScan, Error>) -> Void) {
         pendingParentFile = nil
-        busy = true; cancelledScan = false; browsedDuringScan = false
-        let progress = ScanProgress()
-        scanning = progress
+        browsedDuringScan = false
+        let progress = beginScan()
         let began = ProcessInfo.processInfo.systemUptime
         let cached = force ? nil : cache.read(url)
         let workspace = cached == nil && (current == nil || (force && locations.count <= 1))
@@ -1090,7 +1107,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             if let indexed = workspace?.indexed {
                 self.status.stringValue = "Preparing map · \(formatCount(dt_summary(indexed.handle, 0).entries)) entries"
             } else {
-                self.status.stringValue = "Scanning \(url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent) · \(formatCount(dt_progress_count(progress.handle))) entries"
+                self.status.stringValue = "\(url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent) · \(formatCount(dt_progress_count(progress.handle))) entries"
             }
             if let file = self.pendingParentFile { self.status.stringValue += " · Will show \(file.deletingLastPathComponent().lastPathComponent) when ready" }
             if let workspace { self.updateScanWorkspace(workspace) }
@@ -1179,7 +1196,8 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                 finished = request.prepare(list, progress: progress).map { (request, $0) }
             } else { finished = nil }
             DispatchQueue.main.async {
-                self.timer?.invalidate(); self.timer = nil; self.scanning = nil; self.busy = false
+                self.timer?.invalidate(); self.timer = nil
+                self.endScan(completed: (try? result.get()) != nil)
                 if workspace != nil {
                     self.pendingRankSelection = Set(self.largest.selected.map(\.url))
                     self.scanWorkspace = nil
@@ -1507,8 +1525,8 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         let expansions = tree.expandedURLs
         let mapAspect = map.aspect
         let focus = locations
-        let progress = ScanProgress()
-        scanning = progress; busy = true; controls()
+        let progress = beginScan()
+        controls()
         status.stringValue = "Refreshing selection…"
         let start = ProcessInfo.processInfo.systemUptime
         DispatchQueue.global(qos: .userInitiated).async {
@@ -1527,11 +1545,17 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                 let selected = previous?.liveKeys(in: updated) ?? []
                 let elapsed = ProcessInfo.processInfo.systemUptime - start
                 DispatchQueue.main.async {
+                    self.endScan(completed: true)
+                    guard !self.cancelledScan else {
+                        self.status.stringValue = "Scan cancelled."
+                        self.controls()
+                        return
+                    }
                     if let prior, prior.model === old {
                         self.cache.put(RecentScan(model: updated, listing: list.folder == 0 ? list : nil, root: root.url,
                             identity: prior.identity, watcher: prior.watcher, elapsed: elapsed, startupSnapshot: prior.startupSnapshot), for: root.url)
                     }
-                    self.scanning = nil; self.busy = false; self.model = updated; self.locations = restored
+                    self.model = updated; self.locations = restored
                     self.display(list, message: String(format: "Refreshed in %.2f s", elapsed))
                     self.applyingNavigation = true
                     for route in opened { self.tree.expand(route) }
@@ -1543,7 +1567,9 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self.scanning = nil; self.busy = false; self.status.stringValue = error.localizedDescription; self.controls()
+                    self.endScan(completed: false)
+                    self.status.stringValue = error.localizedDescription
+                    self.controls()
                 }
             }
         }

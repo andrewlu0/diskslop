@@ -101,11 +101,11 @@ final class WindowToolbar: NSObject, NSToolbarDelegate {
     }
 }
 
-func glassShelf(_ content: NSView) -> NSView {
+func glassShelf(_ content: NSView, cornerRadius: CGFloat = 21) -> NSView {
     if #available(macOS 26.0, *) {
         let glass = NSGlassEffectView()
         glass.style = .regular
-        glass.cornerRadius = 21
+        glass.cornerRadius = cornerRadius
         glass.contentView = content
         return glass
     }
@@ -113,7 +113,7 @@ func glassShelf(_ content: NSView) -> NSView {
     visual.material = .popover
     visual.state = .active
     visual.wantsLayer = true
-    visual.layer?.cornerRadius = 21
+    visual.layer?.cornerRadius = cornerRadius
     visual.layer?.masksToBounds = true
     content.frame = visual.bounds
     content.autoresizingMask = [.width, .height]
