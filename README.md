@@ -2,14 +2,13 @@
 <h1 align="center">DiskSlop</h1>
 <p align="center">See what’s taking up space on your Mac and connected drives.</p>
 <p align="center">
-  <a href="https://github.com/andrewlu0/diskslop/releases/download/v0.1.0-preview.1/DiskSlop-0.1.0-preview.1.dmg"><img src="docs/download-macos.svg" width="244" height="44" alt="Download the DiskSlop preview for macOS"></a>
+  <a href="https://github.com/andrewlu0/diskslop/releases/latest/download/DiskSlop.dmg"><img src="docs/download-macos.svg" width="244" height="44" alt="Download DiskSlop for macOS"></a>
 </p>
 
 ```sh
 brew install --cask andrewlu0/tap/diskslop
 ```
 
-<p align="center"><strong>Public preview</strong> · Apple hasn’t notarized this build. Gatekeeper blocks it by default. <a href="https://github.com/andrewlu0/diskslop/releases/tag/v0.1.0-preview.1">Release notes and checksum</a></p>
 <p align="center">
   <img src="https://img.shields.io/badge/deployment_target-macOS_13%2B-49655f" alt="Deployment target macOS 13 or later">
   <img src="https://img.shields.io/badge/Liquid_Glass-macOS_26%2B-386b5c" alt="Liquid Glass on macOS 26 or later">
