@@ -48,8 +48,10 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private let sidebarWidthKey = "DiskSlopSidebarWidth"
     private let legendWidthKey = "DiskSlopLegendWidth"
     private var preferredPanes: [NSLayoutConstraint] = []
-    private lazy var appUpdater = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil)
-    private lazy var appearance = AppearanceSettings(updater: appUpdater.updater)
+    private let updateDriver = AppUpdateDriver(hostBundle: .main, delegate: nil)
+    private lazy var appUpdater = SPUUpdater(hostBundle: .main, applicationBundle: .main,
+                                             userDriver: updateDriver, delegate: updateDriver)
+    private lazy var appearance = AppearanceSettings(updater: appUpdater)
     private let folderLabel = NSTextField(labelWithString: "DiskSlop")
     private let pathLabel = NSTextField(labelWithString: "Choose a folder or scan your startup data volume.")
     private let sizeLabel = NSTextField(labelWithString: "")
@@ -95,6 +97,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             .init(id: "zoomIn", title: "Zoom In", symbol: "plus.magnifyingglass", action: #selector(zoomIn)),
             .init(id: "back", title: "Back", symbol: "chevron.backward", action: #selector(back)),
             .init(id: "forward", title: "Forward", symbol: "chevron.forward", action: #selector(forward)),
+            .init(id: "update", title: "Update available", symbol: "arrow.down.circle.fill", action: #selector(installAvailableUpdate)),
             .init(id: "choose", title: "Choose Folder…", symbol: "folder.badge.plus", action: #selector(choose)),
             .init(id: "home", title: "Scan Home", symbol: "house", action: #selector(home)),
             .init(id: "disk", title: "Choose Volume…", symbol: "externaldrive", action: #selector(chooseVolume)),
@@ -103,7 +106,13 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         buildContent()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.async { self.appUpdater.startUpdater() }
+        updateDriver.availabilityChanged = { [weak self] available in self?.toolbar.setUpdateAvailable(available) }
+        DispatchQueue.main.async {
+            do {
+                try self.appUpdater.start()
+                if self.appUpdater.automaticallyChecksForUpdates { self.appUpdater.checkForUpdatesInBackground() }
+            } catch { NSApp.presentError(error) }
+        }
         let argumentURL = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") })
             .map { URL(fileURLWithPath: $0, isDirectory: true) }
         if let url = pendingURL ?? argumentURL { scan(url) }
@@ -124,6 +133,9 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
     func applicationWillTerminate(_ notification: Notification) { updates.follow(nil); liveCheckpoints.cancel() }
 
+    @objc private func installAvailableUpdate() { updateDriver.installAvailableUpdate() }
+    @objc private func checkForAppUpdates() { updateDriver.checkFromMenu(using: appUpdater) }
+
     private func buildMenus() {
         let main = NSMenu()
         func menu(_ title: String) -> NSMenu {
@@ -141,8 +153,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         }
         let app = menu("DiskSlop")
         command(app, "About DiskSlop", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), responder: true)
-        app.addItem(withTitle: "Check for Updates…", action: #selector(SPUStandardUpdaterController.checkForUpdates(_:)),
-                    keyEquivalent: "").target = appUpdater
+        command(app, "Check for Updates…", #selector(checkForAppUpdates))
         app.addItem(.separator())
         app.addItem(withTitle: "Settings…", action: #selector(AppearanceSettings.show(_:)), keyEquivalent: ",").target = appearance
         app.addItem(.separator())
@@ -220,6 +231,10 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private var browserIsKey: Bool { window?.isKeyWindow == true && window.attachedSheet == nil }
     private var hasSelection: Bool { showingLargest ? largest.table.numberOfSelectedRows > 0 : tree.view.numberOfSelectedRows > 0 }
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(checkForAppUpdates) {
+            menuItem.title = updateDriver.menuTitle
+            return updateDriver.hasOffer || appUpdater.canCheckForUpdates
+        }
         if menuItem.action == #selector(quickLook) {
             return browserIsKey && !(window.firstResponder is NSTextView) && (showingLargest ? !largest.selected.isEmpty : hasSelection)
         }

@@ -5,8 +5,8 @@
     <key>CFBundleName</key><string>DiskSlop</string>
     <key>CFBundleDisplayName</key><string>DiskSlop</string>
     <key>CFBundleIdentifier</key><string>local.diskslop.app</string>
-    <key>CFBundleVersion</key><string>3</string>
-    <key>CFBundleShortVersionString</key><string>0.1.1</string>
+    <key>CFBundleVersion</key><string>4</string>
+    <key>CFBundleShortVersionString</key><string>0.1.2</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleIconName</key><string>AppIcon</string>
@@ -14,6 +14,7 @@
     <key>SUFeedURL</key><string>https://github.com/andrewlu0/diskslop/releases/latest/download/appcast.xml</string>
     <key>SUPublicEDKey</key><string>9Vftj5CSW37xiVR/w9+46k5pltV9W6S7oWTyCz1WXcI=</string>
     <key>SUVerifyUpdateBeforeExtraction</key><true/>
+    <key>SUEnableAutomaticChecks</key><true/>
     <key>SURequireSignedFeed</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHighResolutionCapable</key><true/>

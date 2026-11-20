@@ -5,11 +5,11 @@ final class WindowToolbar: NSObject, NSToolbarDelegate {
     private weak var target: AnyObject?
     private let commands: [Command]
     private var items: [String: NSToolbarItem] = [:]
+    private let toolbar = NSToolbar(identifier: "DiskSlopTools")
     init(target: AnyObject, commands: [Command], window: NSWindow) {
         self.target = target
         self.commands = commands
         super.init()
-        let toolbar = NSToolbar(identifier: "DiskSlopTools")
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
         toolbar.allowsUserCustomization = false
@@ -21,7 +21,18 @@ final class WindowToolbar: NSObject, NSToolbarDelegate {
         [.init("history"), .space, .init("zoom"), .flexibleSpace, .init("choose"), .init("home"), .init("disk"), .space, .init("refresh")]
     }
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        toolbarDefaultItemIdentifiers(toolbar)
+        toolbarDefaultItemIdentifiers(toolbar) + [.init("update")]
+    }
+    func setUpdateAvailable(_ available: Bool) {
+        let id = NSToolbarItem.Identifier("update")
+        if let index = toolbar.items.firstIndex(where: { $0.itemIdentifier == id }) {
+            if !available {
+                toolbar.removeItem(at: index)
+                items.removeValue(forKey: id.rawValue)
+            }
+        } else if available, let index = toolbar.items.firstIndex(where: { $0.itemIdentifier.rawValue == "choose" }) {
+            toolbar.insertItem(withItemIdentifier: id, at: index)
+        }
     }
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier,
                  willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
@@ -49,6 +60,22 @@ final class WindowToolbar: NSObject, NSToolbarDelegate {
         item.action = spec.action
         item.isBordered = true
         item.autovalidates = false
+        if spec.id == "update" {
+            let tint = NSColor(srgbRed: 83/255, green: 189/255, blue: 164/255, alpha: 1)
+            item.visibilityPriority = .high
+            if #available(macOS 26.0, *) {
+                item.style = .prominent
+                item.backgroundTintColor = tint
+            } else if let image = item.image {
+                let button = NSButton(image: image, target: target, action: spec.action)
+                button.bezelStyle = .rounded
+                button.bezelColor = tint
+                button.toolTip = spec.title
+                button.setAccessibilityLabel(spec.title)
+                button.sizeToFit()
+                item.view = button
+            }
+        }
         if ["back", "forward", "zoomIn", "zoomOut"].contains(spec.id) { item.isEnabled = false }
         items[spec.id] = item
         return item
