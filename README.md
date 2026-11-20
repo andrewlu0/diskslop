@@ -35,3 +35,7 @@ open DiskSlop.app
 ```
 
 [Benchmarks](BENCHMARKS.md) · [Third-party notices](THIRD-PARTY-NOTICES.txt)
+
+## License
+
+DiskSlop’s original code is available under the [MIT License](LICENSE). The Nucleo icons and other third-party components retain their respective [licenses and notices](THIRD-PARTY-NOTICES.txt).
