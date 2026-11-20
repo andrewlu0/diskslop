@@ -26,6 +26,29 @@ final class TrashPlan: @unchecked Sendable {
     }
     deinit { dt_trash_plan_free(handle) }
 
+    func visibleMovedKeys(_ result: TrashOutcome, geometry: FileMap, viewport: CGRect, scope: Set<UInt64>) -> Set<UInt64> {
+        guard result.moved > 0 else { return [] }
+        var candidates: [(area: CGFloat, key: UInt64)] = []
+        let limit = TrashGlass.regionLimit
+        for (index, entry) in roots.enumerated() {
+            guard result.failed == 0 || dt_trash_root_moved(handle, index) else { continue }
+            let key = UInt64(entry.folder) << 32 | UInt64(entry.slot)
+            if scope.contains(key) { return [key] }
+            if roots.count <= limit { candidates.append((0, key)); continue }
+            guard let rect = geometry.bounds(of: key) else { continue }
+            let visible = viewport.intersection(rect)
+            guard !visible.isEmpty else { continue }
+            let area = visible.width * visible.height
+            if candidates.count == limit {
+                guard area > candidates[limit - 1].area else { continue }
+                candidates.removeLast()
+            }
+            let at = candidates.firstIndex { $0.area < area } ?? candidates.endIndex
+            candidates.insert((area, key), at: at)
+        }
+        return Set(candidates.map(\.key))
+    }
+
     func item(at index: Int) -> (path: URL, size: UInt64)? {
         guard roots.indices.contains(index) else { return nil }
         let key = roots[index]
@@ -99,7 +122,7 @@ final class TrashReview: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         table.rowHeight = 25; table.style = .inset
         table.allowsColumnReordering = false
         table.setAccessibilityLabel("Selected locations to move to Trash")
-        let scroll = FittingTableScrollView(table, flexibleColumn: "path")
+        let scroll = FittingTableScrollView(table, preferencesName: "TrashReview", flexibleColumn: "path")
         scroll.borderType = .bezelBorder
         let stack = NSStackView()
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 9

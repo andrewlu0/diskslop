@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="244" height="44" viewBox="0 0 244 44" role="img" aria-label="Get DiskSlop for macOS">
+  <title>Get DiskSlop for macOS</title>
+  <rect x=".5" y=".5" width="243" height="43" rx="10" fill="#145849" stroke="#0e463a"/>
+  <path d="M26 12.5v13m-5-5 5 5 5-5M17.5 26v4.5h17V26" fill="none" stroke="#bcf5dc" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="46" y="27.5" font-family="-apple-system,BlinkMacSystemFont,Helvetica,Arial,sans-serif" font-size="15.5" font-weight="600" fill="#fff">Get DiskSlop for macOS</text>
+</svg>

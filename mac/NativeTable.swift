@@ -4,13 +4,18 @@ final class FittingTableScrollView: NSScrollView {
     private let table: NSTableView
     private let flexibleID: NSUserInterfaceItemIdentifier
     private var fitting = false
-    private var insets: (style: NSTableView.Style, leading: CGFloat, columns: CGFloat)?
+    private var insets: (style: NSTableView.Style, count: Int, leading: CGFloat, columns: CGFloat)?
     private var widthObservers: [NSKeyValueObservation] = []
-    private var pendingColumn: NSTableColumn?
+    private let widthsKey: String
+    private var preferredWidths: [String: Double]
+    private var pendingResize: (column: NSTableColumn, width: CGFloat)?
+    private var fitScheduled = false
     private(set) var minimumWidth: CGFloat = 0
     var minimumWidthChanged: ((CGFloat) -> Void)?
 
-    init(_ table: NSTableView, flexibleColumn: String) {
+    init(_ table: NSTableView, preferencesName: String, flexibleColumn: String) {
+        widthsKey = "DiskSlopColumnWidths." + preferencesName
+        preferredWidths = UserDefaults.standard.dictionary(forKey: widthsKey) as? [String: Double] ?? [:]
         self.table = table
         flexibleID = .init(flexibleColumn)
         super.init(frame: .zero)
@@ -33,18 +38,19 @@ final class FittingTableScrollView: NSScrollView {
     }
     private func scheduleFit(afterResizing column: NSTableColumn) {
         guard !fitting else { return }
-        let alreadyScheduled = pendingColumn != nil
-        pendingColumn = column
-        if !alreadyScheduled {
-            DispatchQueue.main.async { [weak self] in
-                guard let self, let column = self.pendingColumn else { return }
-                self.pendingColumn = nil
-                self.fitColumns(dragged: column)
-            }
+        if let index = table.headerView?.resizedColumn, table.tableColumns.indices.contains(index),
+           table.tableColumns[index] === column {
+            pendingResize = (column, column.width)
+        }
+        guard !fitScheduled else { return }
+        fitScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.fitScheduled = false
+            self?.fitColumns()
         }
     }
 
-    func fitColumns(dragged: NSTableColumn? = nil) {
+    func fitColumns() {
         let columns = table.tableColumns
         guard !fitting, window != nil, let flex = table.tableColumn(withIdentifier: flexibleID),
               contentView.bounds.width > 0, !columns.isEmpty else { return }
@@ -53,11 +59,11 @@ final class FittingTableScrollView: NSScrollView {
         let viewport = floor(contentView.bounds.width)
         if table.frame.width != viewport { table.frame.size.width = viewport }
         // Column rectangles can still reflect the preceding widths while AppKit is resizing.
-        if insets?.style != table.effectiveStyle {
+        if insets?.style != table.effectiveStyle || insets?.count != columns.count {
             table.tile()
             let end = table.rect(ofColumn: columns.count - 1).maxX
             let padding = max(0, end - columns.reduce(0) { $0 + $1.width })
-            insets = (table.effectiveStyle, max(2, table.rect(ofColumn: 0).minX), padding)
+            insets = (table.effectiveStyle, columns.count, max(2, table.rect(ofColumn: 0).minX), padding)
         }
         guard let insets else { return }
         let nativeInsets = insets.columns
@@ -78,6 +84,18 @@ final class FittingTableScrollView: NSScrollView {
             if col.maxWidth != ceiling { col.maxWidth = ceiling }
         }
         let others = columns.filter { $0 !== flex && $0.resizingMask.contains(.userResizingMask) }
+        let resize = pendingResize
+        pendingResize = nil
+        let dragged = resize?.column
+        for col in others {
+            let desired = preferredWidths[col.identifier.rawValue].map { CGFloat($0) } ?? col.width
+            let width = min(col.maxWidth, max(col.minWidth, desired))
+            if col.width != width { col.width = width }
+        }
+        let widthsBeforeDrag = others.map(\.width)
+        if let resize, columns.contains(resize.column) {
+            resize.column.width = min(resize.column.maxWidth, max(resize.column.minWidth, resize.width))
+        }
         let total = columns.reduce(CGFloat.zero) { $0 + $1.width }
         var adjustment = room - total
         if dragged !== flex { adjustment = min(0, adjustment + flex.width - flex.minWidth) }
@@ -89,14 +107,20 @@ final class FittingTableScrollView: NSScrollView {
         let remaining = room - columns.filter { $0 !== flex }.reduce(0) { $0 + $1.width }
         let next = max(flex.minWidth, remaining)
         if flex.width != next { flex.width = next }
+        if let dragged {
+            for (col, previous) in zip(others, widthsBeforeDrag) where col === dragged || col.width != previous {
+                preferredWidths[col.identifier.rawValue] = Double(col.width)
+            }
+            UserDefaults.standard.set(preferredWidths, forKey: widthsKey)
+        }
     }
 }
 
 final class NativeTableSurface: NSView {
     private let material: NSView
     let scroll: FittingTableScrollView
-    init(_ table: NSTableView, flexibleColumn: String = "name") {
-        scroll = FittingTableScrollView(table, flexibleColumn: flexibleColumn)
+    init(_ table: NSTableView, preferencesName: String, flexibleColumn: String = "name") {
+        scroll = FittingTableScrollView(table, preferencesName: preferencesName, flexibleColumn: flexibleColumn)
         if #available(macOS 26.0, *) {
             let glass = NSGlassEffectView()
             glass.style = .regular
@@ -135,6 +159,37 @@ final class NativeTableSurface: NSView {
 }
 
 final class TableTextCell: NSTableCellView {
+    private var pulse: CALayer?
+
+    func highlightChange(from previous: UInt64?, to current: UInt64) {
+        guard previous != current, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        wantsLayer = true
+        guard let layer else { return }
+        let tint: NSColor
+        if let previous { tint = current > previous ? .systemGreen : .systemOrange }
+        else { tint = .controlAccentColor }
+        pulse?.removeFromSuperlayer()
+        let glow = CALayer()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        glow.frame = layer.bounds.insetBy(dx: 0, dy: 2)
+        glow.cornerRadius = 4
+        glow.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        effectiveAppearance.performAsCurrentDrawingAppearance { glow.backgroundColor = tint.cgColor }
+        glow.opacity = 0
+        layer.insertSublayer(glow, at: 0)
+        pulse = glow
+        CATransaction.commit()
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.26; fade.toValue = 0; fade.duration = 0.48
+        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        glow.add(fade, forKey: "liveChange")
+        DispatchQueue.main.asyncAfter(deadline: .now() + fade.duration) { [weak self, weak glow] in
+            guard let self, let glow, self.pulse === glow else { return }
+            glow.removeFromSuperlayer()
+            self.pulse = nil
+        }
+    }
     static let sizeFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
     static let sizeColumnMinimum: CGFloat = {
         // Reserve the widest localized unit and precision before the first row is displayed.
@@ -158,7 +213,11 @@ final class TableTextCell: NSTableCellView {
     }
 
     static func make(in view: NSTableView, column: NSUserInterfaceItemIdentifier, icon: Bool, numeric: Bool) -> TableTextCell {
-        if let cell = view.makeView(withIdentifier: column, owner: view) as? TableTextCell { return cell }
+        if let cell = view.makeView(withIdentifier: column, owner: view) as? TableTextCell {
+            cell.pulse?.removeFromSuperlayer()
+            cell.pulse = nil
+            return cell
+        }
         let cell = TableTextCell()
         cell.identifier = column
         let label = NSTextField(labelWithString: "")
@@ -183,5 +242,20 @@ final class TableTextCell: NSTableCellView {
             ])
         }
         return cell
+    }
+}
+
+extension NSTableView {
+    var visibleRows: Range<Int> {
+        guard !isHiddenOrHasHiddenAncestor, window != nil else { return 0..<0 }
+        let range = rows(in: visibleRect)
+        guard range.length > 0, range.location < numberOfRows else { return 0..<0 }
+        return range.location..<min(NSMaxRange(range), numberOfRows)
+    }
+    func highlight(_ column: String, row: Int, previous: UInt64?, current: UInt64) {
+        guard previous != current else { return }
+        let index = self.column(withIdentifier: .init(column))
+        guard index >= 0 else { return }
+        (view(atColumn: index, row: row, makeIfNecessary: true) as? TableTextCell)?.highlightChange(from: previous, to: current)
     }
 }

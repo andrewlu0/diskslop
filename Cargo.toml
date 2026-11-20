@@ -10,6 +10,9 @@ crate-type = ["rlib", "staticlib"]
 [dependencies]
 libc = "0.2"
 rayon = "1.11"
+tempfile = "3"
+unicode-normalization = "0.1.26"
+zstd = { version = "0.13", default-features = false }
 
 [build-dependencies]
 cc = "1"

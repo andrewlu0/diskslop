@@ -83,6 +83,9 @@ impl Inventory {
     }
 
     pub(crate) fn review_trash(&self, keys: &[Key]) -> io::Result<Review> {
+        if self.provisional {
+            return Err(io::Error::other("Wait for the scan to finish."));
+        }
         if keys.is_empty() {
             return Err(io::Error::other("Select an item to move to Trash."));
         }

@@ -15,6 +15,7 @@ struct Parent {
 
 struct Bookmark {
     parents: Vec<Parent>,
+    selects_root: bool,
     device: u64,
     root: u64,
 }
@@ -41,12 +42,17 @@ extern "C" fn dt_directory_identity(m: &Model, folder: u32) -> Identity {
 unsafe extern "C" fn dt_bookmark_new(m: &Model, keys: *const u64, count: usize) -> *mut Bookmark {
     let scan = m.scan.read().unwrap();
     let mut parents = HashMap::new();
+    let mut selects_root = false;
     if !keys.is_null() {
         for &raw in unsafe { std::slice::from_raw_parts(keys, count) } {
             let key = Key {
                 folder: (raw >> 32) as u32,
                 slot: raw as u32,
             };
+            if key == SCAN_ROOT {
+                selects_root = true;
+                continue;
+            }
             if !scan.live(key) {
                 continue;
             }
@@ -66,6 +72,7 @@ unsafe extern "C" fn dt_bookmark_new(m: &Model, keys: *const u64, count: usize) 
     }
     Box::into_raw(Box::new(Bookmark {
         parents: parents.into_values().collect(),
+        selects_root,
         device: scan.device,
         root: scan.folders[0].inode,
     }))
@@ -105,6 +112,12 @@ unsafe extern "C" fn dt_bookmark_resolve(
     }
     let buffer = unsafe { std::slice::from_raw_parts_mut(out, capacity) };
     let mut n = 0;
+    if b.selects_root
+        && let Some(first) = buffer.first_mut()
+    {
+        *first = u64::from(SCAN_ROOT.slot);
+        n = 1;
+    }
     for p in &b.parents {
         let dir = if same_index {
             Some(p.folder)

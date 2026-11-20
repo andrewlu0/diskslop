@@ -8,13 +8,64 @@ private final class MapOverlay: FlippedCanvas {
     override func draw(_ dirtyRect: NSRect) { map?.drawOverlay(dirtyRect) }
 }
 
+struct MapRenderSettings: Equatable {
+    let viewport: CGRect, width: Int, height: Int, scale: CGFloat, dark: Bool, shine: Bool
+    func render(_ geometry: FileMap, colors: MapBreakdown?) -> RenderedFiles? {
+        geometry.render(viewport: viewport, width: width, height: height, scale: scale, dark: dark, shine: shine, coloring: colors)
+    }
+}
+
+struct MovingTile {
+    let key: UInt64, from: CGRect, to: CGRect, image: CGImage
+    func rect(at t: CGFloat) -> CGRect {
+        CGRect(x: from.minX + (to.minX - from.minX) * t, y: from.minY + (to.minY - from.minY) * t,
+            width: from.width + (to.width - from.width) * t, height: from.height + (to.height - from.height) * t)
+    }
+}
+
+struct LiveMapFrame {
+    let raster: RenderedFiles, moves: [MovingTile], changed: Bool, priorImage: CGImage?
+    init(_ raster: RenderedFiles, geometry: FileMap, settings: MapRenderSettings, source: (FileMap, RenderedFiles)?) {
+        self.raster = raster
+        guard let (previous, prior) = source, prior.viewport == raster.viewport else {
+            moves = []; changed = false; priorImage = nil; return
+        }
+        priorImage = prior.image
+        let before = previous.motionTiles(in: prior)
+        let after = geometry.motionTiles(in: raster)
+        let port = raster.viewport
+        let sx = CGFloat(raster.image.width) / port.width, sy = CGFloat(raster.image.height) / port.height
+        moves = after.compactMap { name, tile in
+            guard let from = before[name]?.rect, port.contains(from), port.contains(tile.rect) else { return nil }
+            let to = tile.rect
+            let delta = max(abs(from.minX-to.minX)*sx, abs(from.maxX-to.maxX)*sx, abs(from.minY-to.minY)*sy, abs(from.maxY-to.maxY)*sy)
+            guard delta >= 0.7 * settings.scale else { return nil }
+            let crop = CGRect(x: (to.minX-port.minX)*sx, y: (to.minY-port.minY)*sy, width: to.width*sx, height: to.height*sy)
+            guard let image = raster.image.cropping(to: crop) else { return nil }
+            return MovingTile(key: tile.key, from: from, to: to, image: image)
+        }
+        changed = !moves.isEmpty || before.keys != after.keys || previous.count != geometry.count
+    }
+}
+
 final class Treemap: NSView, NSViewToolTipOwner {
     var choose: (([[DiskItem]], SelectionMode) -> Void)?
     var menuForRoute: (([DiskItem]) -> NSMenu?)?
     var zoomChanged: (() -> Void)?
     var hovered: ((URL?, UInt32?) -> Void)?
+    var coloringDidDisplay: ((MapBreakdown?) -> Void)?
+    private(set) var displayedColors: MapBreakdown?
+    private var requestedColors: MapBreakdown?
     private var geometry: FileMap?
     private var rendered: RenderedFiles?
+    private var movingTiles: [MovingTile] = []
+    private let motion = ChartMotion()
+    private let tileSheet = FlippedCanvas()
+    var motionSource: (FileMap, RenderedFiles)? {
+        guard !isHidden, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, let geometry, let rendered else { return nil }
+        return (geometry, rendered)
+    }
+    var trackingSelection: Bool { down != nil }
     private var revision = 0, drawing = false
     private var reflow: DispatchWorkItem?
     private var lastSize: NSSize = .zero, lastScale: CGFloat = 0
@@ -42,6 +93,10 @@ final class Treemap: NSView, NSViewToolTipOwner {
         super.init(frame: frame)
         wantsLayer = true
         layer?.masksToBounds = true
+        tileSheet.wantsLayer = true
+        tileSheet.frame = bounds; tileSheet.autoresizingMask = [.width, .height]
+        tileSheet.setAccessibilityElement(false)
+        addSubview(tileSheet)
         overlay.map = self
         overlay.frame = bounds; overlay.autoresizingMask = [.width, .height]
         addSubview(overlay)
@@ -53,7 +108,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
         setAccessibilityHelp("Select a file to reveal its size in the outline. Command-scroll or pinch to zoom.")
     }
     required init?(coder: NSCoder) { nil }
-    @objc private func accessibilityChanged() { revision += 1; scheduleFrame(); overlay.needsDisplay = true }
+    @objc private func accessibilityChanged() { endMotion(); revision += 1; scheduleFrame(); overlay.needsDisplay = true }
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         accessibilityChanged()
@@ -73,7 +128,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
     override func mouseExited(with event: NSEvent) { hoverPoint = nil; updateHover() }
 
     private func updateHover(force: Bool = false) {
-        let key = hoverPoint.flatMap { p in bounds.contains(p) ? geometry?.hit(world(p)) : nil }
+        let key = hoverPoint.flatMap { p in bounds.contains(p) ? hit(world(p)) : nil }
         let packed = key.map { UInt64($0.folder) << 32 | UInt64($0.slot) }
         guard packed != hoverKey || (force && hoverPoint != nil) else { return }
         hoverKey = packed
@@ -86,15 +141,72 @@ final class Treemap: NSView, NSViewToolTipOwner {
             let area = screen(rect).intersection(bounds)
             if !area.isEmpty { hoverTip = addToolTip(area, owner: self, userData: nil) }
         }
-        hovered?(url, geometry.kind(at: key))
+        hovered?(url, colorGroup(for: key))
     }
     func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData: UnsafeMutableRawPointer?) -> String {
-        hoverPath ?? ""
+        guard let path = hoverPath else { return "" }
+        if let mode = displayedColors?.mode, [.created, .modified, .accessed].contains(mode), let hoverKey, let geometry {
+            var seconds: Int64 = 0
+            let known = dt_group_date(geometry.model.handle, DTKey(hoverKey), UInt8(mode.rawValue), &seconds)
+            let date = known ? Date(timeIntervalSince1970: Double(seconds)).formatted(date: .abbreviated, time: .shortened) : "Unknown date"
+            return "\(path)\n\(mode.title) · \(date)"
+        }
+        return path
+    }
+    func colorGroup(for key: DTKey, directory: Bool = false) -> UInt32? {
+        guard let geometry else { return nil }
+        guard let displayedColors else { return geometry.kind(at: key) }
+        if directory {
+            var row = DTRow()
+            guard dt_entry(geometry.model.handle, key.folder, key.slot, &row) else { return nil }
+            return displayedColors.group(forDirectory: row.child)
+        }
+        return displayedColors.group(at: key)
+    }
+    func trashRegions(for keys: Set<UInt64>) -> [TrashGlassRegion] {
+        guard let geometry, let rendered, let window else { return [] }
+        let painted = screen(rendered.viewport).intersection(visibleRect)
+        return keys.compactMap { key in
+            guard let worldRect = rootKeys.contains(key) ? Self.whole : geometry.bounds(of: key) else { return nil }
+            let local = screen(worldRect).intersection(painted)
+            guard !local.isEmpty else { return nil }
+            let rect = window.convertToScreen(convert(local, to: nil)), source = world(local)
+            guard !rect.isEmpty else { return nil }
+            return TrashGlassRegion(shape: .tile(rect)) { p in
+                rendered.rgb(at: CGPoint(x: source.minX + (p.x - rect.minX) / rect.width * source.width,
+                    y: source.minY + (rect.maxY - p.y) / rect.height * source.height))
+            }
+        }
+    }
+    func useColors(_ colors: MapBreakdown?) {
+        guard requestedColors !== colors else { return }
+        requestedColors = colors
+        revision += 1
+        scheduleFrame()
+    }
+    func setPresented(_ presented: Bool) {
+        let hidden = !presented
+        guard isHidden != hidden else { return }
+        isHidden = hidden
+        revision += 1
+        if presented { scheduleFrame(); scheduleReflow() } else { reflow?.cancel(); endMotion() }
+    }
+
+    func clear() {
+        reflow?.cancel(); endMotion(); revision += 1
+        geometry = nil; rendered = nil; requestedColors = nil; displayedColors = nil
+        rootKeys.removeAll(); selection.removeAll(); viewport = Self.whole
+        down = nil; marquee = nil; panOrigin = nil
+        updateSelection(); updateHover(force: true)
+        needsDisplay = true; overlay.needsDisplay = true
+        setAccessibilityValue("Waiting for files")
     }
 
     func show(_ listing: FolderListing, ancestors: Set<UInt64>) {
         reflow?.cancel()
+        endMotion()
         geometry = listing.geometry
+        requestedColors = nil; displayedColors = nil
         rootKeys = ancestors
         viewport = Self.whole
         rendered = nil; down = nil; marquee = nil; panOrigin = nil
@@ -108,10 +220,83 @@ final class Treemap: NSView, NSViewToolTipOwner {
         zoomChanged?()
     }
 
+    var renderSettings: MapRenderSettings? {
+        guard !isHidden, bounds.width >= 1, bounds.height >= 1 else { return nil }
+        let scale = min(window?.backingScaleFactor ?? 2, sqrt(24_000_000 / (bounds.width * bounds.height)))
+        return MapRenderSettings(viewport: viewport, width: max(1, Int((bounds.width * scale).rounded())),
+            height: max(1, Int((bounds.height * scale).rounded())), scale: scale, dark: effectiveAppearance.usesDarkColors,
+            shine: !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency)
+    }
+
+    func showLive(_ list: FolderListing, ancestors: Set<UInt64>, colors: MapBreakdown?,
+                  frame: LiveMapFrame?, settings: MapRenderSettings?, sameFolder: Bool) {
+        reflow?.cancel(); endMotion()
+        let prior = rendered
+        geometry = list.geometry; rootKeys = ancestors
+        requestedColors = colors; displayedColors = colors
+        if !sameFolder { viewport = Self.whole }
+        revision += 1
+        if let frame, settings == renderSettings {
+            rendered = frame.raster
+            if sameFolder, frame.changed, let prior, prior.image === frame.priorImage,
+               !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                animateTiles(frame.moves, over: prior)
+            }
+        } else {
+            rendered = isHidden ? nil : frame?.raster ?? prior
+            scheduleFrame()
+        }
+        updateSelection(); updateHover(force: true)
+        needsDisplay = true; overlay.needsDisplay = true
+        setAccessibilityValue("\(list.geometry.count.formatted()) file shapes · \(Int(zoom.rounded()))×")
+        scheduleReflow()
+    }
+
+    private func endMotion() {
+        motion.stop(); movingTiles.removeAll()
+        tileSheet.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
+    }
+    private func animateTiles(_ moves: [MovingTile], over previous: RenderedFiles) {
+        guard let sheet = tileSheet.layer else { return }
+        movingTiles = moves
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        func place(_ image: CGImage, in rect: CGRect) -> CALayer {
+            let layer = CALayer(); layer.contents = image; layer.contentsGravity = .resize
+            layer.frame = tileSheet.convertToLayer(screen(rect)); sheet.addSublayer(layer)
+            return layer
+        }
+        func animate(_ layer: CALayer, _ key: String, from: Any, to: Any) {
+            let animation = CABasicAnimation(keyPath: key)
+            animation.fromValue = from; animation.toValue = to; animation.duration = ChartMotion.duration
+            animation.timingFunction = CAMediaTimingFunction(controlPoints: 1/3, 1, 2/3, 1)
+            layer.add(animation, forKey: key)
+        }
+        let back = place(previous.image, in: previous.viewport)
+        back.opacity = 0; animate(back, "opacity", from: 1, to: 0)
+        for tile in moves {
+            let layer = place(tile.image, in: tile.from), position = layer.position, bounds = layer.bounds
+            layer.frame = tileSheet.convertToLayer(screen(tile.to))
+            animate(layer, "position", from: position, to: layer.position)
+            animate(layer, "bounds", from: bounds, to: layer.bounds)
+        }
+        CATransaction.commit()
+        motion.start { [weak self] in
+            guard let self else { return }
+            if self.motion.fraction == 1 { self.endMotion(); self.updateHover(force: true) }
+            self.overlay.needsDisplay = true
+        }
+    }
+    private func hit(_ point: CGPoint) -> DTKey? {
+        if let tile = movingTiles.last(where: { $0.rect(at: motion.fraction).contains(point) }) { return DTKey(tile.key) }
+        return geometry?.hit(point)
+    }
+
     override func layout() {
         super.layout()
         let scale = window?.backingScaleFactor ?? 2
         guard lastSize != bounds.size || scale != lastScale else { return }
+        discardTrashBacking()
+        endMotion()
         lastSize = bounds.size; lastScale = scale
         revision += 1
         scheduleFrame()
@@ -124,7 +309,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
     }
     private func scheduleReflow() {
         reflow?.cancel()
-        guard let current = geometry, abs(log(aspect / current.aspect)) > 0.2, viewport == Self.whole else { return }
+        guard !isHidden, let current = geometry, abs(log(aspect / current.aspect)) > 0.2, viewport == Self.whole else { return }
         let target = aspect
         let task = DispatchWorkItem { [weak self] in
             guard let self, self.geometry === current, self.viewport == Self.whole else { return }
@@ -144,18 +329,28 @@ final class Treemap: NSView, NSViewToolTipOwner {
     }
 
     private func scheduleFrame() {
-        guard !drawing, let current = geometry, bounds.width >= 1, bounds.height >= 1 else { return }
-        let scale = min(window?.backingScaleFactor ?? 2, sqrt(24_000_000 / (bounds.width * bounds.height)))
-        let w = max(1, Int((bounds.width * scale).rounded())), h = max(1, Int((bounds.height * scale).rounded()))
-        let port = viewport, token = revision, dark = effectiveAppearance.usesDarkColors
-        let shine = !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        if isHidden {
+            if displayedColors !== requestedColors {
+                displayedColors = requestedColors
+                coloringDidDisplay?(requestedColors)
+            }
+            return
+        }
+        guard !drawing, let current = geometry, let settings = renderSettings else { return }
+        let token = revision, dark = settings.dark
+        let colors = requestedColors
         drawing = true
         DispatchQueue.global(qos: .userInitiated).async {
-            let frame = current.render(viewport: port, width: w, height: h, scale: scale, dark: dark, shine: shine)
+            let frame = settings.render(current, colors: colors)
             DispatchQueue.main.async {
                 self.drawing = false
-                if self.geometry === current, let frame {
+                if !self.isHidden, self.geometry === current, self.requestedColors === colors, self.effectiveAppearance.usesDarkColors == dark, let frame {
                     self.rendered = frame
+                    if self.displayedColors !== colors {
+                        self.displayedColors = colors
+                        self.coloringDidDisplay?(colors)
+                        self.updateHover(force: true)
+                    }
                     self.needsDisplay = true; self.overlay.needsDisplay = true
                     self.setAccessibilityValue("\(current.count.formatted()) file shapes · \(Int(self.zoom.rounded()))×")
                 }
@@ -179,6 +374,8 @@ final class Treemap: NSView, NSViewToolTipOwner {
         let size = min(1, max(1 / CGFloat(1 << 30), rect.width))
         let next = CGRect(x: min(max(0,rect.minX),1 - size), y: min(max(0,rect.minY),1 - size), width: size, height: size)
         guard next != viewport else { return }
+        discardTrashBacking()
+        endMotion()
         viewport = next; revision += 1
         needsDisplay = true; overlay.needsDisplay = true
         updateHover(force: true); scheduleFrame(); zoomChanged?()
@@ -209,6 +406,14 @@ final class Treemap: NSView, NSViewToolTipOwner {
         let span = max(r.width, r.height) * 1.2
         move(to: CGRect(x: r.midX - span / 2, y: r.midY - span / 2, width: span, height: span))
     }
+    func revealSelection() {
+        guard let r = selectedBounds else { return }
+        let footprint = screen(r)
+        if max(footprint.width, footprint.height) < 3 { fitSelection(); return }
+        guard !viewport.contains(r) else { return }
+        let span = max(viewport.width, min(1, max(r.width, r.height) * 1.04))
+        move(to: CGRect(x: r.midX - span / 2, y: r.midY - span / 2, width: span, height: span))
+    }
     override func scrollWheel(with event: NSEvent) {
         let dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
         if event.modifierFlags.contains(.command) {
@@ -233,13 +438,17 @@ final class Treemap: NSView, NSViewToolTipOwner {
     override func draw(_ dirtyRect: NSRect) {
         NSColor.controlBackgroundColor.setFill(); dirtyRect.fill()
         guard let view = rendered, geometry?.count != 0, let cg = NSGraphicsContext.current?.cgContext else { return }
-        let area = screen(view.viewport)
-        cg.saveGState()
-        cg.translateBy(x: area.minX, y: area.maxY)
-        cg.scaleBy(x: 1, y: -1)
-        cg.interpolationQuality = .none
-        cg.draw(view.image, in: CGRect(origin: .zero, size: area.size))
-        cg.restoreGState()
+        func draw(_ image: CGImage, _ rect: CGRect) {
+            let area = screen(rect)
+            guard area.intersects(dirtyRect) else { return }
+            cg.saveGState()
+            cg.translateBy(x: area.minX, y: area.maxY)
+            cg.scaleBy(x: 1, y: -1)
+            cg.interpolationQuality = .none
+            cg.draw(image, in: CGRect(origin: .zero, size: area.size))
+            cg.restoreGState()
+        }
+        draw(view.image, view.viewport)
     }
     private func drawHairline(_ rect: CGRect, in context: CGContext) {
         let pixels = context.convertToDeviceSpace(rect).standardized
@@ -263,7 +472,8 @@ final class Treemap: NSView, NSViewToolTipOwner {
         }
         let para = NSMutableParagraphStyle(); para.lineBreakMode = .byTruncatingMiddle
         for label in rendered?.labels ?? [] {
-            let r = screen(label.rect).intersection(bounds)
+            let tile = movingTiles.first { $0.key == label.key }
+            let r = screen(tile?.rect(at: motion.fraction) ?? label.rect).intersection(bounds)
             guard r.intersects(dirty), r.width >= 44, r.height >= 21 else { continue }
             let ink = label.lightInk ? NSColor.white : NSColor.black
             let large = r.width >= 150 && r.height >= 74
@@ -278,6 +488,11 @@ final class Treemap: NSView, NSViewToolTipOwner {
         if !marked.isEmpty, let cg = NSGraphicsContext.current?.cgContext {
             cg.saveGState()
             cg.setShouldAntialias(false)
+            if rootKeys.isDisjoint(with: selection) {
+                let selected = CGMutablePath()
+                for region in marked where region.intersects(viewport) { selected.addRect(screen(region).intersection(bounds)) }
+                shadeUnselected(in: cg, chart: CGPath(rect: bounds, transform: nil), selected: selected)
+            }
             let outline = effectiveAppearance.usesDarkColors ? NSColor.black : NSColor.white
             cg.setFillColor(outline.withAlphaComponent(0.95).cgColor)
             for region in marked where region.intersects(viewport) { drawHairline(screen(region), in: cg) }
@@ -293,7 +508,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
         }
     }
     private func route(at event: NSEvent) -> [DiskItem]? {
-        guard let g = geometry, let key = g.hit(world(convert(event.locationInWindow, from: nil))) else { return nil }
+        guard let g = geometry, let key = hit(world(convert(event.locationInWindow, from: nil))) else { return nil }
         return g.model.route(to: key, from: g.folder)
     }
     override func menu(for event: NSEvent) -> NSMenu? {

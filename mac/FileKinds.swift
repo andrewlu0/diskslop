@@ -17,6 +17,12 @@ struct KindTone: Equatable {
     static let emerald = Self(0x009966, 0x33dfa3), neutral = Self(0x45556c, 0xacbbce)
     private static let spectrum: [Self] = [.red, .orange, .amber, .yellow, .lime, .green, .emerald, .teal, .cyan,
         .sky, .blue, .indigo, .violet, .purple, .fuchsia, .pink, .rose]
+    static let categories: [Self] = (0..<4).flatMap { step in
+        spectrum.indices.map { index in
+            let a = spectrum[index], b = spectrum[(index + 1) % spectrum.count], t = Double(step) / 4
+            return Self(mix(a.light, b.light, t), mix(a.dark, b.dark, t))
+        }
+    }
 
     private static func mix(_ a: UInt32, _ b: UInt32, _ fraction: Double) -> UInt32 {
         func channel(_ shift: UInt32) -> UInt32 {
@@ -62,12 +68,11 @@ struct FileKind {
 }
 struct KindUsage {
     let kind: FileKind, bytes: UInt64, files: UInt64
-    let formattedSize: String, formattedFiles: String
+    var formattedSize: String { formatBytes(bytes) }
+    var formattedFiles: String { formatCount(files) }
 
     init(kind: FileKind, bytes: UInt64, files: UInt64) {
         self.kind = kind; self.bytes = bytes; self.files = files
-        formattedSize = formatBytes(bytes)
-        formattedFiles = formatCount(files)
     }
 }
 

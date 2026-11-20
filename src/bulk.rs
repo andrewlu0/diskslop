@@ -15,9 +15,23 @@ const COMMON: u32 = libc::ATTR_CMN_RETURNED_ATTRS
     | libc::ATTR_CMN_OBJTYPE
     | libc::ATTR_CMN_FILEID;
 const FILE: u32 = libc::ATTR_FILE_LINKCOUNT | libc::ATTR_FILE_ALLOCSIZE;
+const DATE_ATTRS: [u32; 3] = [
+    libc::ATTR_CMN_CRTIME,
+    libc::ATTR_CMN_MODTIME,
+    libc::ATTR_CMN_ACCTIME,
+];
 thread_local! { static BUFFER: RefCell<Vec<u64>> = RefCell::new(vec![0; 8192]); }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct FileDates(pub [i32; 3]);
+impl FileDates {
+    pub const UNKNOWN: i32 = i32::MIN;
+    fn minute(seconds: i64) -> i32 {
+        i32::try_from(seconds.div_euclid(60)).unwrap_or(Self::UNKNOWN)
+    }
+}
 pub struct Facts {
+    pub dates: FileDates,
     pub inode: u64,
     pub bytes: u64,
     pub finder_type: u32,
@@ -69,6 +83,15 @@ fn fallback_entry(fd: &File, name: &CStr, device: u64, folder: &mut Folder) {
             folder.push(
                 name.to_bytes(),
                 Facts {
+                    dates: FileDates([
+                        if s.st_birthtime == 0 && s.st_birthtime_nsec == 0 {
+                            FileDates::UNKNOWN
+                        } else {
+                            FileDates::minute(s.st_birthtime)
+                        },
+                        FileDates::minute(s.st_mtime),
+                        FileDates::minute(s.st_atime),
+                    ]),
                     inode: s.st_ino,
                     bytes: s.st_blocks.max(0) as u64 * 512,
                     finder_type: 0,
@@ -93,7 +116,14 @@ impl Drop for Stream {
     }
 }
 
-fn fallback(fd: &File, device: u64, folder: &mut Folder, progress: &Progress) -> io::Result<()> {
+fn fallback(
+    fd: &File,
+    device: u64,
+    folder: &mut Folder,
+    progress: &Progress,
+    path: &Path,
+    mut batch: impl FnMut(&mut Folder),
+) -> io::Result<()> {
     let copy = unsafe {
         libc::openat(
             fd.as_raw_fd(),
@@ -111,6 +141,7 @@ fn fallback(fd: &File, device: u64, folder: &mut Folder, progress: &Progress) ->
         return Err(err);
     }
     let stream = Stream(stream);
+    let mut reported = 0;
     loop {
         progress.check()?;
         unsafe {
@@ -119,6 +150,7 @@ fn fallback(fd: &File, device: u64, folder: &mut Folder, progress: &Progress) ->
         let ent = unsafe { libc::readdir(stream.0) };
         if ent.is_null() {
             let err = io::Error::last_os_error();
+            report(progress, folder, reported, path);
             return if err.raw_os_error() == Some(0) {
                 Ok(())
             } else {
@@ -128,6 +160,11 @@ fn fallback(fd: &File, device: u64, folder: &mut Folder, progress: &Progress) ->
         let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) };
         if !matches!(name.to_bytes(), b"." | b"..") {
             fallback_entry(fd, name, device, folder);
+            if folder.entries.len() - reported >= 256 {
+                report(progress, folder, reported, path);
+                batch(folder);
+                reported = folder.entries.len();
+            }
         }
     }
 }
@@ -175,6 +212,14 @@ fn parse_record(r: &[u8], fd: &File, device: u64, folder: &mut Folder) -> Option
         _ => EntryKind::Other,
     };
     p += 4;
+    let mut dates = FileDates([FileDates::UNKNOWN; 3]);
+    for (i, attribute) in DATE_ATTRS.into_iter().enumerate() {
+        if common & attribute != 0 {
+            let seconds = wide(r, p)? as i64;
+            dates.0[i] = FileDates::minute(seconds);
+            p += std::mem::size_of::<libc::timespec>();
+        }
+    }
     let mut finder_type = 0;
     let mut bundle = false;
     if common & libc::ATTR_CMN_FNDRINFO != 0 {
@@ -204,6 +249,7 @@ fn parse_record(r: &[u8], fd: &File, device: u64, folder: &mut Folder) -> Option
             raw,
             Facts {
                 inode,
+                dates,
                 bytes: 0,
                 finder_type,
                 executable: false,
@@ -218,6 +264,7 @@ fn parse_record(r: &[u8], fd: &File, device: u64, folder: &mut Folder) -> Option
             raw,
             Facts {
                 inode,
+                dates,
                 bytes: bytes.max(0) as u64,
                 finder_type,
                 executable,
@@ -232,15 +279,27 @@ fn parse_record(r: &[u8], fd: &File, device: u64, folder: &mut Folder) -> Option
     Some(())
 }
 
+fn report(progress: &Progress, folder: &Folder, start: usize, path: &Path) {
+    progress.seen.fetch_add(
+        (folder.entries.len() - start) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    progress.largest.observe(folder, start, path);
+}
+
 pub fn enumerate(
     fd: &File,
     device: u64,
     folder: &mut Folder,
     progress: &Progress,
     file_kinds: bool,
+    path: &Path,
+    mut batch: impl FnMut(&mut Folder),
 ) -> io::Result<()> {
     let kind_attrs = if file_kinds {
-        libc::ATTR_CMN_FNDRINFO | libc::ATTR_CMN_ACCESSMASK
+        libc::ATTR_CMN_FNDRINFO
+            | libc::ATTR_CMN_ACCESSMASK
+            | DATE_ATTRS.iter().fold(0, |a, b| a | b)
     } else {
         0
     };
@@ -280,12 +339,13 @@ pub fn enumerate(
                         Some(libc::ENOTSUP | libc::EINVAL | libc::ENOSYS)
                     )
                 {
-                    return fallback(fd, device, folder, progress);
+                    return fallback(fd, device, folder, progress, path, batch);
                 }
                 return Err(err);
             }
             let mut rest =
                 unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), capacity) };
+            let start = folder.entries.len();
             for _ in 0..n {
                 let len = word(rest, 0).unwrap_or(0) as usize;
                 if len < 24 || len > rest.len() {
@@ -299,6 +359,8 @@ pub fn enumerate(
                 }
                 rest = &rest[len..];
             }
+            report(progress, folder, start, path);
+            batch(folder);
         }
     })
 }

@@ -1,4 +1,5 @@
 import AppKit
+import Sparkle
 
 final class AppearanceSettings: NSObject {
     private enum Choice: String, CaseIterable {
@@ -9,6 +10,8 @@ final class AppearanceSettings: NSObject {
     private let key = "DiskSlopAppearance"
     private var window: NSWindow?
     private var control: NSSegmentedControl?
+    private let updater: SPUUpdater
+    init(updater: SPUUpdater) { self.updater = updater }
     private var choice: Choice { UserDefaults.standard.string(forKey: key).flatMap(Choice.init(rawValue:)) ?? .system }
     func apply() {
         switch choice {
@@ -20,7 +23,7 @@ final class AppearanceSettings: NSObject {
     @objc func show(_ sender: Any?) {
         if window == nil {
             let w = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 375, height: 104), styleMask: [.titled, .closable],
+                contentRect: NSRect(x: 0, y: 0, width: 395, height: 148), styleMask: [.titled, .closable],
                 backing: .buffered, defer: false)
             w.title = "Settings"
             w.isReleasedWhenClosed = false
@@ -29,16 +32,29 @@ final class AppearanceSettings: NSObject {
             let modes = NSSegmentedControl(
                 labels: Choice.allCases.map(\.rawValue), trackingMode: .selectOne, target: self, action: #selector(changed))
             modes.setAccessibilityLabel("Appearance")
-            let row = NSStackView(views: [label, modes])
-            row.spacing = 15
-            row.alignment = .centerY
+            let checks = NSButton(checkboxWithTitle: "Check for updates automatically", target: nil, action: nil)
+            checks.bind(.value, to: updater, withKeyPath: #keyPath(SPUUpdater.automaticallyChecksForUpdates), options: nil)
+            let installs = NSButton(checkboxWithTitle: "Install updates automatically", target: nil, action: nil)
+            installs.bind(.value, to: updater, withKeyPath: #keyPath(SPUUpdater.automaticallyDownloadsUpdates), options: nil)
+            installs.bind(.enabled, to: updater, withKeyPath: #keyPath(SPUUpdater.allowsAutomaticUpdates), options: nil)
+            let grid = NSGridView(views: [
+                [label, modes],
+                [NSTextField(labelWithString: "Updates"), checks],
+                [NSGridCell.emptyContentView, installs]
+            ])
+            grid.column(at: 0).xPlacement = .trailing
+            grid.column(at: 1).xPlacement = .leading
+            grid.rowAlignment = .firstBaseline
+            grid.row(at: 0).bottomPadding = 8
+            grid.columnSpacing = 12
+            grid.rowSpacing = 4
             let content = NSView()
             w.contentView = content
-            content.addSubview(row)
-            row.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(grid)
+            grid.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
-                row.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-                row.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+                grid.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+                grid.centerYAnchor.constraint(equalTo: content.centerYAnchor),
             ])
             window = w
             control = modes

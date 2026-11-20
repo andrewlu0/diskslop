@@ -1,6 +1,7 @@
 import AppKit
 
 extension DiskItem {
+    static let scanRootKey = UInt64(UInt32.max)
     var key: UInt64 { UInt64(folder) << 32 | UInt64(slot) }
 }
 
@@ -14,26 +15,41 @@ extension DTRect {
     var rect: CGRect { CGRect(x: x, y: y, width: w, height: h) }
 }
 
+struct MapItemName: Hashable {
+    let parent: UInt64, name: String
+}
 struct FileLabel {
+    let key: UInt64, identity: MapItemName
     let rect: CGRect, title: String, size: String, lightInk: Bool
 }
 struct RenderedFiles {
     let image: CGImage, labels: [FileLabel], viewport: CGRect
+    fileprivate let pixels: UnsafePointer<UInt8>
+
+    func rgb(at point: CGPoint) -> UInt32 {
+        let x = min(image.width - 1, max(0, Int((point.x - viewport.minX) / viewport.width * CGFloat(image.width))))
+        let y = min(image.height - 1, max(0, Int((point.y - viewport.minY) / viewport.height * CGFloat(image.height))))
+        return withExtendedLifetime(image) {
+            let pixel = pixels + y * image.bytesPerRow + x * 4
+            return UInt32(pixel[0]) << 16 | UInt32(pixel[1]) << 8 | UInt32(pixel[2])
+        }
+    }
 }
 
 final class FileMap: @unchecked Sendable {
     let model: ScanModel
-    let folder: UInt32, count: Int, memoryBytes: UInt64
+    let folder: UInt32, count: Int
+    var memoryBytes: UInt64 { UInt64(dt_map_memory(handle)) }
     let kinds: [KindUsage]
     let aspect: CGFloat
     private let handle: OpaquePointer
-    init(model: ScanModel, folder: UInt32, aspect: CGFloat) {
+    init(model: ScanModel, folder: UInt32, aspect: CGFloat, previous: FileMap? = nil) {
         self.model = model
         self.folder = folder
         self.aspect = aspect
-        handle = dt_map_new(model.handle, folder, aspect, resolveFileKind)!
+        handle = previous.flatMap { dt_map_refresh($0.handle, $0.model.handle, model.handle, folder, aspect, resolveFileKind) }
+            ?? dt_map_new(model.handle, folder, aspect, resolveFileKind)!
         count = dt_map_count(handle)
-        memoryBytes = UInt64(dt_map_memory(handle))
         var length = 0
         let totals = dt_map_kinds(handle, &length)
         kinds = UnsafeBufferPointer(start:totals, count:length).map {
@@ -77,10 +93,28 @@ final class FileMap: @unchecked Sendable {
         }
     }
     func kind(at key: DTKey) -> UInt32 { dt_map_kind(handle, key) }
-    func render(viewport: CGRect, width: Int, height: Int, scale: CGFloat, dark: Bool = true, shine: Bool = true) -> RenderedFiles? {
-        let palette = FileKindCatalog.shared.palette(dark:dark)
+    func motionTiles(in frame: RenderedFiles) -> [MapItemName: (key: UInt64, rect: CGRect)] {
+        var tiles = Dictionary(frame.labels.map { ($0.identity, (key: $0.key, rect: $0.rect)) }, uniquingKeysWith: { first, _ in first })
+        guard tiles.count < count else { return tiles }
+        var seen = Set(tiles.values.map(\.key))
+        let port = frame.viewport
+        for y in 0..<6 {
+            for x in 0..<8 {
+                let point = CGPoint(x: port.minX + (CGFloat(x)+0.5)*port.width/8, y: port.minY + (CGFloat(y)+0.5)*port.height/6)
+                guard let key = hit(point) else { continue }
+                let packed = UInt64(key.folder) << 32 | UInt64(key.slot)
+                guard seen.insert(packed).inserted, let rect = bounds(of: packed) else { continue }
+                var row = DTRow()
+                guard dt_entry(model.handle, key.folder, key.slot, &row) else { continue }
+                tiles[MapItemName(parent: dt_directory_identity(model.handle, key.folder).inode, name: row.title)] = (packed, rect)
+            }
+        }
+        return tiles
+    }
+    func render(viewport: CGRect, width: Int, height: Int, scale: CGFloat, dark: Bool = true, shine: Bool = true, coloring: MapBreakdown? = nil) -> RenderedFiles? {
+        let palette = coloring?.palette(dark: dark) ?? FileKindCatalog.shared.palette(dark:dark)
         let frame = palette.withUnsafeBufferPointer {
-            dt_map_render(handle, DTRect(viewport), UInt32(width), UInt32(height), scale, $0.baseAddress, $0.count, shine)
+            dt_map_render_groups(handle, DTRect(viewport), UInt32(width), UInt32(height), scale, $0.baseAddress, $0.count, shine, coloring?.handle)
         }
         guard let frame else { return nil }
         var count = 0
@@ -88,9 +122,13 @@ final class FileMap: @unchecked Sendable {
         let labels: [FileLabel] = UnsafeBufferPointer(start: rawLabels, count: count).compactMap { raw in
             var item = DTRow()
             guard dt_entry(model.handle, raw.key.folder, raw.key.slot, &item) else { return nil }
-            return FileLabel(rect: raw.rect.rect, title: item.title, size: formatBytes(item.bytes), lightInk: raw.light_ink)
+            let title = item.title
+            let identity = MapItemName(parent: dt_directory_identity(model.handle, raw.key.folder).inode, name: title)
+            return FileLabel(key: UInt64(raw.key.folder) << 32 | UInt64(raw.key.slot), identity: identity,
+                rect: raw.rect.rect, title: title, size: formatBytes(item.bytes), lightInk: raw.light_ink)
         }
-        guard let provider = CGDataProvider(dataInfo: UnsafeMutableRawPointer(frame), data: dt_frame_pixels(frame),
+        let pixels = dt_frame_pixels(frame)!
+        guard let provider = CGDataProvider(dataInfo: UnsafeMutableRawPointer(frame), data: pixels,
             size: width * height * 4, releaseData: { p, _, _ in if let p { dt_frame_free(OpaquePointer(p)) } }) else {
             dt_frame_free(frame)
             return nil
@@ -99,6 +137,6 @@ final class FileMap: @unchecked Sendable {
         guard let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
             space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: info, provider: provider, decode: nil,
             shouldInterpolate: false, intent: .defaultIntent) else { return nil }
-        return RenderedFiles(image: image, labels: labels, viewport: viewport)
+        return RenderedFiles(image: image, labels: labels, viewport: viewport, pixels: pixels)
     }
 }

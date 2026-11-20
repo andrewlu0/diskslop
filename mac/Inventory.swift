@@ -17,21 +17,36 @@ struct DiskError: LocalizedError {
 }
 
 final class ScanModel: @unchecked Sendable {
+    let observedAt: Int64
+    let isScanPreview: Bool
     private struct Release: @unchecked Sendable {
         let pointer: OpaquePointer
         func run() { dt_model_free(pointer) }
     }
     let handle: OpaquePointer
-    private init(handle: OpaquePointer) { self.handle = handle }
-    func refreshed(paths: Set<String>, progress: ScanProgress) throws -> ScanModel {
+    init(handle: OpaquePointer, isScanPreview: Bool = false) {
+        self.handle = handle
+        self.isScanPreview = isScanPreview
+        observedAt = Int64(Date().timeIntervalSince1970)
+    }
+    private func encodePaths(_ paths: Set<String>) -> [UInt8] {
         var bytes: [UInt8] = []
         for path in paths {
             URL(fileURLWithPath: path).withUnsafeFileSystemRepresentation { p in
                 if let p { bytes.append(contentsOf: UnsafeRawBufferPointer(start: p, count: strlen(p) + 1)) }
             }
         }
+        return bytes
+    }
+    func refreshed(changes: ChangedDirectories, retryIssues: Bool = false, progress: ScanProgress) throws -> ScanModel {
         var error: UnsafeMutablePointer<CChar>?
-        let new = bytes.withUnsafeBufferPointer { dt_refresh_paths(handle, $0.baseAddress, $0.count, progress.handle, &error) }
+        var unchanged = false
+        let new = encodePaths(changes.shallow).withUnsafeBufferPointer { shallow in
+            encodePaths(changes.recursive).withUnsafeBufferPointer { recursive in
+                dt_revalidate_changes(handle, shallow.baseAddress, shallow.count, recursive.baseAddress, recursive.count, retryIssues, progress.handle, &unchanged, &error)
+            }
+        }
+        if unchanged { return self }
         guard let new else { throw DiskError(message: takeError(error)) }
         return ScanModel(handle: new)
     }
@@ -61,11 +76,13 @@ final class ScanModel: @unchecked Sendable {
             return item
         }
     }
-    init(url: URL, progress: ScanProgress) throws {
+    init(url: URL, progress: ScanProgress, preview: Bool = true) throws {
         var error: UnsafeMutablePointer<CChar>?
-        let model = url.withUnsafeFileSystemRepresentation { dt_scan($0, progress.handle, &error) }
+        let model = url.withUnsafeFileSystemRepresentation { dt_scan_with_preview($0, progress.handle, preview, &error) }
         guard let model else { throw DiskError(message: takeError(error)) }
         handle = model
+        isScanPreview = false
+        observedAt = Int64(Date().timeIntervalSince1970)
     }
     deinit {
         let release = Release(pointer: handle)
@@ -94,11 +111,11 @@ final class FolderListing: @unchecked Sendable {
     let folder: UInt32
     let summary: DTSummary
     let geometry: FileMap
-    init(_ model: ScanModel, folder: UInt32, aspect: CGFloat = 1.4) {
+    init(_ model: ScanModel, folder: UInt32, aspect: CGFloat = 1.4, previous: FileMap? = nil) {
         self.model = model
         self.folder = folder
         summary = dt_summary(model.handle, folder)
-        geometry = FileMap(model: model, folder: folder, aspect: aspect)
+        geometry = FileMap(model: model, folder: folder, aspect: aspect, previous: previous)
     }
 }
 

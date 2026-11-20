@@ -1,0 +1,33 @@
+name: macOS build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-26, macos-26-intel]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Build native app and CLI
+        env:
+          DISKSLOP_SIGN_IDENTITY: "-"
+        run: ./build-app.sh
+      - name: Verify the app and scan a folder
+        run: |
+          codesign --verify --deep --strict DiskSlop.app
+          target/release/diskslop --summary mac
+          ./scripts/third-party-notices.py | diff - THIRD-PARTY-NOTICES.txt

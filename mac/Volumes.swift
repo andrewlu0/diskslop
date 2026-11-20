@@ -1,9 +1,71 @@
 import AppKit
 import Darwin
 
+struct VolumeCapacity {
+    let available: UInt64?, total: UInt64?
+
+    init(_ stats: statfs) {
+        let blockSize = UInt64(stats.f_bsize)
+        func bytes(_ blocks: UInt64) -> UInt64? {
+            guard blockSize > 0, blocks != .max else { return nil }
+            let (value, overflow) = blocks.multipliedReportingOverflow(by: blockSize)
+            return overflow ? nil : value
+        }
+        total = stats.f_blocks > 0 ? bytes(stats.f_blocks) : nil
+        available = total == nil && stats.f_bavail == 0 ? nil : bytes(stats.f_bavail)
+    }
+
+    static func startup() -> Self? {
+        var stats = statfs()
+        guard statfs(MountedVolume.startupPath, &stats) == 0 else { return nil }
+        return Self(stats)
+    }
+
+    var availableFraction: Double? {
+        guard let available, let total else { return nil }
+        return min(1, Double(available) / Double(total))
+    }
+    var summary: String? {
+        guard let available else { return nil }
+        let free = "\(formatBytes(available)) available"
+        return total.map { "\(free) of \(formatBytes($0))" } ?? free
+    }
+    var detail: String {
+        guard let summary else { return "Available space unknown" }
+        guard let fraction = availableFraction else { return summary }
+        let percent = fraction.formatted(.percent.precision(.fractionLength(0...1)))
+        return "\(summary) (\(percent) free)"
+    }
+}
+
+final class FreeSpaceBar: NSLevelIndicator {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        levelIndicatorStyle = .continuousCapacity
+        controlSize = .mini
+        isEditable = false
+        minValue = 0; maxValue = 1
+        drawsTieredCapacityLevels = false
+        fillColor = .controlAccentColor
+        warningFillColor = fillColor; criticalFillColor = fillColor
+        setAccessibilityElement(false)
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 8).isActive = true
+    }
+    required init?(coder: NSCoder) { nil }
+
+    func show(_ capacity: VolumeCapacity?) {
+        let fraction = capacity?.availableFraction
+        doubleValue = fraction ?? 0
+        isHidden = fraction == nil
+    }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 private struct MountedVolume {
+    static let startupPath = FileManager.default.fileExists(atPath: "/System/Volumes/Data") ? "/System/Volumes/Data" : "/"
     let url: URL, name: String, symbol: String
-    let available: UInt64?, hidden: Bool, startup: Bool
+    let capacity: VolumeCapacity, hidden: Bool, startup: Bool
     static func all() -> [MountedVolume] {
         let count = getfsstat(nil, 0, MNT_NOWAIT)
         guard count >= 0 else { return [] }
@@ -12,26 +74,56 @@ private struct MountedVolume {
             getfsstat($0.baseAddress, Int32($0.count * MemoryLayout<statfs>.stride), MNT_NOWAIT)
         }
         guard actual >= 0 else { return [] }
-        let dataPath = "/System/Volumes/Data"
-        let startOnData = FileManager.default.fileExists(atPath: dataPath)
         return stores.prefix(Int(actual)).map { value in
             var m = value
             let url = withUnsafeBytes(of: &m.f_mntonname) { bytes in
                 URL(fileURLWithFileSystemRepresentation: bytes.baseAddress!.assumingMemoryBound(to: CChar.self), isDirectory: true, relativeTo: nil)
             }
             let path = url.path
-            let boot = startOnData ? path == dataPath : path == "/"
+            let boot = path == startupPath
             let local = m.f_flags & UInt32(MNT_LOCAL) != 0
             let ownName = path == "/" ? "System volume" : url.lastPathComponent
             let hidden = !boot && (path == "/" || m.f_flags & UInt32(MNT_DONTBROWSE) != 0 || path == "/dev" || path.hasPrefix("/System/Volumes/"))
             let symbol = boot || path == "/" ? "internaldrive.fill" : local ? "externaldrive.fill" : "network"
-            let capacity = UInt64(m.f_bavail).multipliedReportingOverflow(by: UInt64(m.f_bsize))
             return MountedVolume(url: url, name: boot ? "Startup disk · Data" : ownName, symbol: symbol,
-                available: capacity.overflow ? nil : capacity.partialValue, hidden: hidden, startup: boot)
+                capacity: VolumeCapacity(m), hidden: hidden, startup: boot)
         }.sorted {
             if $0.startup != $1.startup { return $0.startup }
             return $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
+    }
+}
+
+private final class AvailableSpaceCell: NSTableCellView {
+    static let minimumWidth = TableTextCell.sizeColumnMinimum + 58
+    private let bar = FreeSpaceBar()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        let amount = NSTextField(labelWithString: "")
+        amount.font = TableTextCell.sizeFont
+        amount.alignment = .right
+        amount.textColor = .secondaryLabelColor
+        amount.translatesAutoresizingMaskIntoConstraints = false
+        textField = amount
+        addSubview(bar); addSubview(amount)
+        NSLayoutConstraint.activate([
+            bar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 3),
+            bar.trailingAnchor.constraint(equalTo: amount.leadingAnchor, constant: -8),
+            bar.centerYAnchor.constraint(equalTo: centerYAnchor),
+            amount.widthAnchor.constraint(equalToConstant: TableTextCell.sizeColumnMinimum),
+            amount.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -3),
+            amount.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+    required init?(coder: NSCoder) { nil }
+
+    func show(_ capacity: VolumeCapacity) {
+        bar.show(capacity)
+        textField?.stringValue = capacity.available.map(formatBytes) ?? "—"
+        let detail = capacity.detail
+        textField?.setAccessibilityLabel(detail)
+        toolTip = detail
     }
 }
 
@@ -53,9 +145,9 @@ final class VolumePicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         scanButton.keyEquivalent = "\r"
         let cancel = NSButton(title: "Cancel", target: self, action: #selector(dismiss))
         cancel.keyEquivalent = "\u{1b}"
-        for (id, title, width) in [("name","Volume",190),("path","Mount point",245),("free","Available",110)] {
+        for (id, title, width) in [("name","Volume",170),("path","Mount point",220),("free","Available",174)] {
             let col = NSTableColumn(identifier: .init(id))
-            col.title = title; col.minWidth = id == "free" ? max(82, TableTextCell.sizeColumnMinimum) : 82
+            col.title = title; col.minWidth = id == "free" ? AvailableSpaceCell.minimumWidth : 82
             col.width = max(CGFloat(width), col.minWidth)
             col.headerCell.alignment = id == "free" ? .right : .left
             table.addTableColumn(col)
@@ -64,7 +156,7 @@ final class VolumePicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         table.allowsColumnReordering = false
         table.delegate = self; table.dataSource = self; table.target = self; table.doubleAction = #selector(choose)
         table.setAccessibilityLabel("Mounted volumes")
-        let surface = NativeTableSurface(table, flexibleColumn: "path")
+        let surface = NativeTableSurface(table, preferencesName: "Volumes", flexibleColumn: "path")
         let buttons = NSStackView(views: [cancel,scanButton]); buttons.spacing = 8
         scanButton.setContentHuggingPriority(.required, for: .vertical)
         for v in [surface,showAll!,buttons] as [NSView] { content.addSubview(v); v.translatesAutoresizingMaskIntoConstraints = false }
@@ -103,10 +195,15 @@ final class VolumePicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard visible.indices.contains(row), let tableColumn else { return nil }
         let id = tableColumn.identifier
         let volume = visible[row]
-        let text = id.rawValue == "name" ? volume.name : id.rawValue == "path" ? volume.url.path : (volume.available.map(formatBytes) ?? "—")
+        if id.rawValue == "free" {
+            let cell = table.makeView(withIdentifier: id, owner: self) as? AvailableSpaceCell ?? AvailableSpaceCell()
+            cell.identifier = id
+            cell.show(volume.capacity)
+            return cell
+        }
         let isName = id.rawValue == "name"
-        let cell = TableTextCell.make(in: table, column: id, icon: isName, numeric: id.rawValue == "free")
-        cell.setText(text)
+        let cell = TableTextCell.make(in: table, column: id, icon: isName, numeric: false)
+        cell.setText(isName ? volume.name : volume.url.path)
         cell.textField?.textColor = isName ? .labelColor : .secondaryLabelColor
         if isName {
             cell.imageView?.image = NSImage(systemSymbolName: volume.symbol, accessibilityDescription: nil)

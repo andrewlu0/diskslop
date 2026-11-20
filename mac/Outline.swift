@@ -39,6 +39,10 @@ final class FileOutlineView: NSOutlineView {
         let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
         updateHover(visibleRect.contains(point) ? row(at: point) : -1)
     }
+    func refreshHover() {
+        guard inside, !isHiddenOrHasHiddenAncestor else { return }
+        hoverIndex = -2; scrollDidMove()
+    }
     override func mouseMoved(with event: NSEvent) {
         inside = true; updateHover(row(at: convert(event.locationInWindow, from: nil)))
         super.mouseMoved(with: event)
@@ -102,20 +106,38 @@ final class FileOutlineView: NSOutlineView {
     }
 }
 
+private final class TreeSource {
+    var model: ScanModel
+    init(_ model: ScanModel) { self.model = model }
+}
 private final class TreeRow: NSObject {
-    let model: ScanModel
+    private let source: TreeSource
+    var model: ScanModel { source.model }
+    private weak var snapshot: ScanModel?
     weak var parent: TreeRow?
-    let folder: UInt32
-    var raw: DTRow
-    init(_ raw: DTRow, folder: UInt32, parent: TreeRow?, model: ScanModel) {
-        self.raw = raw; self.folder = folder; self.parent = parent; self.model = model
+    let folder: UInt32, slot: UInt32
+    private var cached: DTRow
+    var raw: DTRow {
+        get {
+            if snapshot !== model {
+                var next = DTRow()
+                _ = dt_entry(model.handle, folder, slot, &next)
+                cached = next; snapshot = model
+            }
+            return cached
+        }
+        set { cached = newValue; snapshot = model }
+    }
+    init(_ raw: DTRow, folder: UInt32, parent: TreeRow?, source: TreeSource) {
+        cached = raw; slot = raw.slot; self.folder = folder; self.parent = parent
+        self.source = source; snapshot = source.model
     }
     var item: DiskItem { DiskItem(raw, folder: folder) }
-    var key: UInt64 { UInt64(folder) << 32 | UInt64(raw.slot) }
+    var key: UInt64 { UInt64(folder) << 32 | UInt64(slot) }
     var route: [DiskItem] {
         var path: [DiskItem] = []
         var current: TreeRow? = self
-        while let node = current { path.append(node.item); current = node.parent }
+        while let node = current, node.key != DiskItem.scanRootKey { path.append(node.item); current = node.parent }
         return path.reversed()
     }
 }
@@ -125,8 +147,11 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
     var hovered: ((URL?, DTKey?) -> Void)?
     var selectionChanged: (() -> Void)?
     var openFolder: (([DiskItem]) -> Void)?
-    private var model: ScanModel?
+    private var source: TreeSource?
+    private var model: ScanModel? { source?.model }
+    private var materialized = Set<UInt32>()
     private var objects: [UInt64: TreeRow] = [:]
+    private var rootRow: TreeRow? { objects[DiskItem.scanRootKey] }
     private var expanded: [UInt64: TreeRow] = [:]
     private var anchor: TreeRow?
     private var applyingSelection = false
@@ -164,18 +189,27 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         }
     }
 
+    func clear() {
+        source = nil; anchor = nil
+        materialized.removeAll(); objects.removeAll(); expanded.removeAll(); icons.reset()
+        view.reloadData()
+    }
+
     func show(_ newModel: ScanModel, refresh: Bool) {
         if refresh || model !== newModel { icons.reset() }
         if model !== newModel {
-            model = newModel
+            source = TreeSource(newModel); materialized.removeAll()
             anchor = nil
             objects.removeAll(); expanded.removeAll()
+            updateRoot(in: newModel)
             view.reloadData()
+            if let rootRow { view.expandItem(rootRow) }
             view.deselectAll(nil)
             return
         }
         guard refresh else { return }
         let old = expanded.values.sorted { view.level(forItem: $0) < view.level(forItem: $1) }
+        updateRoot(in: newModel)
         view.reloadData()
         for node in old {
             var raw = DTRow()
@@ -187,23 +221,101 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         view.deselectAll(nil)
     }
 
-    private func object(_ raw: DTRow, folder: UInt32, parent: TreeRow?, model: ScanModel) -> TreeRow {
+    func showLive(_ next: ScanModel, keys: [UInt64], lead: UInt64?) {
+        guard let old = model else { show(next, refresh: false); return }
+        if old === next {
+            if selectedKeys() != Set(keys) { selectSaved(keys, lead: lead, scroll: false) }
+            return
+        }
+        let sameOrder = Array(materialized).withUnsafeBufferPointer {
+            dt_outline_order_unchanged(old.handle, next.handle, $0.baseAddress, $0.count)
+        }
+        if sameOrder {
+            var changed: [(Int, UInt64, TreeRow)] = []
+            view.enumerateAvailableRowViews { _, i in
+                if i >= 0, let node = self.view.item(atRow: i) as? TreeRow { changed.append((i, node.raw.bytes, node)) }
+            }
+            let expandabilityChanged = changed.compactMap { (_, _, node) -> TreeRow? in
+                let child = node.raw.child
+                guard child != .max, dt_child_count(old.handle, child) == 0,
+                      dt_child_count(next.handle, child) > 0 else { return nil }
+                return node
+            }
+            source?.model = next
+            for node in expandabilityChanged { view.reloadItem(node) }
+            let visible = view.visibleRows
+            for (i, before, node) in changed where node.raw.bytes != before {
+                let col = view.column(withIdentifier: .init("size"))
+                let cell = view.view(atColumn: col, row: i, makeIfNecessary: false) as? TableTextCell
+                cell?.setText(formatBytes(node.raw.bytes))
+                if visible.contains(i) { cell?.highlightChange(from: before, to: node.raw.bytes) }
+            }
+            if selectedKeys() != Set(keys) { selectSaved(keys, lead: lead, scroll: false) }
+            return
+        }
+        let open = expanded.values.compactMap { row -> URL? in
+            guard view.row(forItem: row) >= 0, view.isItemExpanded(row) else { return nil }
+            return old.url(folder: row.folder, slot: row.raw.slot, directory: true)
+        }
+        var origin = view.visibleRect.origin
+        let visible = view.visibleRows
+        let pin = visible.first(where: { view.isRowSelected($0) }) ?? visible.first
+        var scrollAnchor: (url: URL, offset: CGFloat)?
+        var previous = [URL: UInt64]()
+        for i in visible {
+            if let row = view.item(atRow: i) as? TreeRow, let url = old.url(folder: row.folder, slot: row.raw.slot, directory: row.raw.isFolder) {
+                previous[url] = row.raw.bytes
+                if i == pin { scrollAnchor = (url, view.rect(ofRow: i).minY - origin.y) }
+            }
+        }
+        applyingSelection = true
+        source = TreeSource(next); materialized.removeAll(keepingCapacity: true)
+        anchor = nil; objects.removeAll(keepingCapacity: true); expanded.removeAll(keepingCapacity: true)
+        updateRoot(in: next)
+        view.reloadData()
+        if old.isScanPreview, dt_child_count(old.handle, 0) == 0, let rootRow { view.expandItem(rootRow) }
+        for url in open { if let route = next.route(to: url), route.last?.isFolder != false { expand(route) } }
+        selectSaved(keys, lead: lead, scroll: false)
+        if let scrollAnchor, let route = next.route(to: scrollAnchor.url), let node = resolve(route) {
+            let row = view.row(forItem: node)
+            if row >= 0 { origin.y = view.rect(ofRow: row).minY - scrollAnchor.offset }
+        }
+        view.scroll(origin)
+        for i in view.visibleRows {
+            guard let row = view.item(atRow: i) as? TreeRow,
+                  let url = next.url(folder: row.folder, slot: row.raw.slot, directory: row.raw.isFolder) else { continue }
+            let prior = previous[url] ?? old.route(to: url)?.last?.bytes
+            let bytes = row.raw.bytes
+            if prior != bytes, let cell = view.view(atColumn: view.column(withIdentifier: .init("size")), row: i, makeIfNecessary: true) as? TableTextCell {
+                cell.setText(formatBytes(bytes)); cell.highlightChange(from: prior, to: bytes)
+            }
+        }
+    }
+
+    private func updateRoot(in model: ScanModel) {
+        var row = DTRow()
+        if dt_entry(model.handle, 0, .max, &row) { _ = object(row, folder: 0, parent: nil) }
+    }
+    private func object(_ raw: DTRow, folder: UInt32, parent: TreeRow?) -> TreeRow {
         let key = UInt64(folder) << 32 | UInt64(raw.slot)
         if let already = objects[key] { already.raw = raw; return already }
-        let node = TreeRow(raw, folder: folder, parent: parent, model: model)
+        materialized.insert(folder)
+        let node = TreeRow(raw, folder: folder, parent: parent, source: source!)
         objects[key] = node
         return node
     }
     private func resolve(_ route: [DiskItem]) -> TreeRow? {
-        guard let model, !route.isEmpty else { return nil }
-        var parent: TreeRow?
+        guard let model, let rootRow else { return nil }
+        if route.isEmpty { return rootRow }
+        if !view.isItemExpanded(rootRow) { view.expandItem(rootRow) }
+        var parent: TreeRow? = rootRow
         for (i, item) in route.enumerated() {
             let row: TreeRow
             if let found = objects[item.key] { row = found }
             else {
                 var raw = DTRow()
                 guard dt_entry(model.handle, item.folder, item.slot, &raw) else { return nil }
-                row = object(raw, folder: item.folder, parent: parent, model: model)
+                row = object(raw, folder: item.folder, parent: parent)
             }
             if i < route.count - 1 && !view.isItemExpanded(row) { view.expandItem(row) }
             parent = row
@@ -217,14 +329,15 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
     func selectAll(in route: [DiskItem]) {
         applyingSelection = true
         defer { applyingSelection = false }
-        var first = 0, end = view.numberOfRows
+        guard let node = resolve(route) else { return }
+        view.expandItem(node)
+        let parent = view.row(forItem: node)
+        guard parent >= 0 else { return }
+        let first = parent + 1, count = view.numberOfRows
+        var end = count
         if !route.isEmpty {
-            guard let node = resolve(route) else { return }
-            view.expandItem(node)
-            let parent = view.row(forItem: node)
-            guard parent >= 0 else { return }
-            let level = view.level(forRow: parent), count = view.numberOfRows
-            first = parent + 1; end = first
+            let level = view.level(forRow: parent)
+            end = first
             while end < count && view.level(forRow: end) > level { end += 1 }
         }
         view.selectRowIndexes(IndexSet(integersIn: first..<end), byExtendingSelection: false)
@@ -236,7 +349,7 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         return row.route
     }
     var leadKey: UInt64? { anchor?.key }
-    func selectSaved(_ keys: [UInt64], lead: UInt64?) {
+    func selectSaved(_ keys: [UInt64], lead: UInt64?, scroll: Bool = true) {
         guard let model else { return }
         applyingSelection = true
         defer { applyingSelection = false }
@@ -251,7 +364,7 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
             return row >= 0 && indexes.contains(row) ? node : nil
         }
             ?? indexes.first.flatMap { view.item(atRow: $0) as? TreeRow }
-        if let anchor { view.scrollRowToVisible(view.row(forItem: anchor)) }
+        if scroll, let anchor { view.scrollRowToVisible(view.row(forItem: anchor)) }
         selectionChanged?()
     }
     var expandedURLs: [URL] {
@@ -288,6 +401,10 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         return i >= 0 && view.selectedRowIndexes.contains(i)
     }
     var firstSelected: DiskItem? { (view.item(atRow: view.selectedRow) as? TreeRow)?.item }
+    var selectedChildKey: UInt64? {
+        guard view.numberOfSelectedRows == 1, let row = view.item(atRow: view.selectedRow) as? TreeRow, row.parent != nil else { return nil }
+        return row.key
+    }
     func selectedKeys() -> Set<UInt64> {
         Set(view.selectedRowIndexes.compactMap { (view.item(atRow: $0) as? TreeRow)?.key })
     }
@@ -318,7 +435,7 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
         guard let model else { return 0 }
         if let node = item as? TreeRow { return node.raw.isFolder ? dt_child_count(model.handle, node.raw.child) : 0 }
-        return dt_child_count(model.handle, 0)
+        return rootRow == nil ? 0 : 1
     }
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
         guard let node = item as? TreeRow, node.raw.isFolder, let model else { return false }
@@ -326,11 +443,12 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
     }
     func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
         guard let model else { return NSNull() }
-        let parent = item as? TreeRow
-        let folder = parent?.raw.child ?? 0
+        if item == nil, let rootRow { return rootRow }
+        guard let parent = item as? TreeRow else { return NSNull() }
+        let folder = parent.raw.child
         var raw = DTRow()
         guard dt_child(model.handle, folder, index, &raw) else { return NSNull() }
-        return object(raw, folder: folder, parent: parent, model: model)
+        return object(raw, folder: folder, parent: parent)
     }
     func outlineViewItemDidExpand(_ notification: Notification) {
         if let row = notification.userInfo?["NSObject"] as? TreeRow { expanded[row.key] = row }

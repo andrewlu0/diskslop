@@ -1,9 +1,14 @@
-use super::{Inventory, Key, Model, NONE};
+use super::{Folder, Inventory, Key, Model, NONE};
+#[path = "color_groups.rs"]
+mod color_groups;
+use color_groups::Groups;
 #[path = "file_kinds.rs"]
 mod file_kinds;
+use crate::pages::Pages;
 use file_kinds::{KindTotal, Resolve, Resolver};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
+use std::sync::{Arc, OnceLock};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -15,6 +20,20 @@ struct Rect {
 }
 
 impl Rect {
+    const UNIT: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+    fn inside(self, parent: Self) -> Self {
+        Self {
+            x: parent.x + self.x * parent.w,
+            y: parent.y + self.y * parent.h,
+            w: self.w * parent.w,
+            h: self.h * parent.h,
+        }
+    }
     fn intersects(self, b: Self) -> bool {
         self.x < b.x + b.w && self.y < b.y + b.h && self.x + self.w > b.x && self.y + self.h > b.y
     }
@@ -39,12 +58,24 @@ struct Mark {
     kind: u32,
 }
 #[derive(Default)]
-struct Sheet {
+struct Layout {
     bounds: Vec<Rect>,
     order: Vec<Mark>,
     bands: Vec<Rect>,
+}
+impl Layout {
+    fn storage(&self) -> usize {
+        size_of::<Self>()
+            + (self.bounds.capacity() + self.bands.capacity()) * size_of::<Rect>()
+            + self.order.capacity() * size_of::<Mark>()
+    }
+}
+#[derive(Default)]
+struct Sheet {
+    layout: OnceLock<Box<Layout>>,
     kinds: Vec<u32>,
     enclosing_kind: u32,
+    mass: u64,
 }
 impl Sheet {
     fn kind(&self, slot: u32) -> u32 {
@@ -55,8 +86,17 @@ impl Sheet {
         }
     }
 }
+#[derive(Clone, Default)]
+struct Placement {
+    parent: Option<Key>,
+    sheet: Option<Arc<Sheet>>,
+}
 struct Scene {
-    sheets: Vec<Sheet>,
+    folders: Pages<Folder>,
+    order: Pages<Arc<[u32]>>,
+    sheets: Pages<Placement>,
+    revision: Arc<()>,
+    aspect: f64,
     root: u32,
     files: usize,
     totals: Vec<KindTotal>,
@@ -141,145 +181,407 @@ fn squarify(items: &[Weighted], total: f64, mut rect: Rect, mut emit: impl FnMut
     }
 }
 
-impl Scene {
-    fn new(m: &Model, root: u32, aspect: f64, resolve: Resolve) -> Self {
-        let scan = m.scan.read().unwrap();
-        let aspect = aspect.clamp(0.05, 32.0);
-        let mut sheets: Vec<Sheet> = (0..scan.folders.len()).map(|_| Sheet::default()).collect();
-        let mut mass = vec![0u64; sheets.len()];
-        let mut folders = vec![root];
-        let mut resolver = Resolver::new(resolve);
-        let mut totals = HashMap::<u32, KindTotal>::new();
-        let mut index = 0;
-        let mut files = 0;
-        while index < folders.len() {
-            let id = folders[index] as usize;
-            let f = &scan.folders[id];
-            let enclosing = sheets[id].enclosing_kind;
-            if enclosing == 0 {
-                sheets[id].kinds.resize(f.entries.len(), 0);
+impl Sheet {
+    fn classify(
+        scan: &Inventory,
+        folder: u32,
+        enclosing_kind: u32,
+        resolver: &mut Resolver,
+    ) -> Self {
+        let id = folder as usize;
+        let mut sheet = Self {
+            enclosing_kind,
+            ..Default::default()
+        };
+        if enclosing_kind == 0 {
+            sheet.kinds.resize(scan.folders[id].entries.len(), 0);
+            for &slot in scan.order[id].iter() {
+                sheet.kinds[slot as usize] = resolver.kind(scan, Key { folder, slot });
             }
-            for &slot in &scan.order[id] {
-                let e = &f.entries[slot as usize];
-                let key = Key {
-                    folder: id as u32,
-                    slot,
-                };
-                let kind = if enclosing == 0 {
-                    resolver.kind(&scan, key)
-                } else {
-                    enclosing
-                };
-                if enclosing == 0 {
-                    sheets[id].kinds[slot as usize] = kind;
-                    if kind != 0 {
-                        let stat = totals.entry(kind).or_insert(KindTotal {
-                            kind,
-                            ..Default::default()
-                        });
-                        stat.files += 1;
-                        stat.bytes = stat.bytes.saturating_add(scan.size(key));
-                    }
-                }
-                if e.child == NONE {
-                    mass[id] = mass[id].saturating_add(e.bytes.max(1));
-                    files += 1;
-                } else {
-                    sheets[e.child as usize].enclosing_kind = kind;
-                    folders.push(e.child);
-                }
+        }
+        sheet
+    }
+
+    fn count_kinds(
+        &self,
+        scan: &Inventory,
+        folder: u32,
+        totals: &mut HashMap<u32, KindTotal>,
+        add: bool,
+    ) {
+        if self.enclosing_kind != 0 {
+            return;
+        }
+        for &slot in scan.order[folder as usize].iter() {
+            let kind = self.kind(slot);
+            if kind == 0 {
+                continue;
             }
-            index += 1;
+            let value = totals.entry(kind).or_insert(KindTotal {
+                kind,
+                ..Default::default()
+            });
+            let bytes = scan.size(Key { folder, slot });
+            if add {
+                value.files += 1;
+                value.bytes += bytes;
+            } else {
+                value.files -= 1;
+                value.bytes -= bytes;
+            }
         }
-        for &id in folders.iter().skip(1).rev() {
-            let parent = scan.folders[id as usize].parent.unwrap().folder as usize;
-            mass[parent] = mass[parent].saturating_add(mass[id as usize]);
-        }
-        let mut pending = vec![(
-            root,
-            Rect {
-                x: 0.0,
-                y: 0.0,
-                w: aspect,
-                h: 1.0,
-            },
-        )];
-        let mut weighted = Vec::new();
-        while let Some((dir, rect)) = pending.pop() {
-            let id = dir as usize;
-            let f = &scan.folders[id];
-            let sheet = &mut sheets[id];
-            weighted.clear();
-            for &slot in &scan.order[id] {
-                let e = &f.entries[slot as usize];
-                let weight = if e.child == NONE {
-                    e.bytes.max(1)
-                } else {
-                    mass[e.child as usize]
-                };
-                if weight == 0 {
-                    continue;
-                }
-                let kind = sheet.kind(slot);
+    }
+
+    fn build_layout(
+        &self,
+        folder: &Folder,
+        order: &[u32],
+        aspect: f64,
+        child_mass: impl Fn(u32) -> u64,
+        weighted: &mut Vec<Weighted>,
+    ) -> Box<Layout> {
+        let mut layout = Layout::default();
+        weighted.clear();
+        for &slot in order {
+            let entry = &folder.entries[slot as usize];
+            let weight = if entry.child == NONE {
+                entry.bytes.max(1)
+            } else {
+                child_mass(entry.child)
+            };
+            if weight > 0 {
                 weighted.push(Weighted {
                     mark: Mark {
                         slot,
-                        child: e.child,
-                        kind,
+                        child: entry.child,
+                        kind: self.kind(slot),
                     },
                     weight: weight as f64,
                 });
             }
-            if !weighted.windows(2).all(|w| w[0].weight >= w[1].weight) {
-                weighted.sort_by(|a, b| b.weight.total_cmp(&a.weight));
-            }
-            sheet.bounds.resize(f.entries.len(), Rect::default());
-            sheet.order.reserve_exact(weighted.len());
-            squarify(&weighted, mass[id] as f64, rect, |mark, cell| {
-                if mark.child != NONE {
-                    pending.push((mark.child, cell));
-                }
-                let normal = Rect {
+        }
+        if !weighted.windows(2).all(|w| w[0].weight >= w[1].weight) {
+            weighted.sort_by(|a, b| b.weight.total_cmp(&a.weight));
+        }
+        layout.bounds.resize(folder.entries.len(), Rect::default());
+        layout.order.reserve_exact(weighted.len());
+        let aspect = aspect.clamp(1e-12, 1e12);
+        squarify(
+            weighted,
+            self.mass as f64,
+            Rect {
+                w: aspect,
+                ..Rect::UNIT
+            },
+            |mark, cell| {
+                let local = Rect {
                     x: cell.x / aspect,
                     w: cell.w / aspect,
                     ..cell
                 };
-                sheet.bounds[mark.slot as usize] = normal;
-                if sheet.order.len().is_multiple_of(GROUP) {
-                    sheet.bands.push(normal);
-                } else if let Some(last) = sheet.bands.last_mut() {
-                    *last = last.union(normal);
+                layout.bounds[mark.slot as usize] = local;
+                if layout.order.len().is_multiple_of(GROUP) {
+                    layout.bands.push(local)
+                } else if let Some(last) = layout.bands.last_mut() {
+                    *last = last.union(local)
                 }
-                sheet.order.push(mark);
-            });
+                layout.order.push(mark);
+            },
+        );
+        Box::new(layout)
+    }
+}
+
+impl Scene {
+    fn new(m: &Model, root: u32, aspect: f64, resolve: Resolve) -> Self {
+        let scan = m.scan.read().unwrap();
+        Self::build(&scan, root, aspect, resolve, None)
+    }
+
+    fn build(
+        scan: &Inventory,
+        root: u32,
+        aspect: f64,
+        resolve: Resolve,
+        previous: Option<(&Self, &Inventory)>,
+    ) -> Self {
+        let aspect = aspect.clamp(0.05, 32.0);
+        let mut sheets: Vec<Option<Arc<Sheet>>> = vec![None; scan.folders.len()];
+        let mut mass = vec![0u64; sheets.len()];
+        let mut folders = vec![(root, 0)];
+        let mut resolver = Resolver::new(resolve);
+        let mut totals: HashMap<_, _> = previous
+            .map(|(scene, _)| scene.totals.iter().map(|t| (t.kind, *t)).collect())
+            .unwrap_or_default();
+        let mut kept = previous
+            .map(|(scene, _)| vec![false; scene.sheets.len()])
+            .unwrap_or_default();
+        let mut index = 0;
+        while index < folders.len() {
+            let (folder, enclosing) = folders[index];
+            let id = folder as usize;
+            if let Some((scene, old)) = previous
+                && let Some(prior) = scan.folders[id].shared_leaf(old)
+                && let Some(sheet) = scene.sheets[prior as usize].sheet.as_ref()
+                && sheet.enclosing_kind == enclosing
+            {
+                mass[id] = sheet.mass;
+                sheets[id] = Some(sheet.clone());
+                kept[prior as usize] = true;
+                index += 1;
+                continue;
+            }
+            let sheet = Sheet::classify(scan, folder, enclosing, &mut resolver);
+            sheet.count_kinds(scan, folder, &mut totals, true);
+            for &slot in scan.order[id].iter() {
+                let entry = &scan.folders[id].entries[slot as usize];
+                if entry.child == NONE {
+                    mass[id] = mass[id].saturating_add(entry.bytes.max(1))
+                } else {
+                    folders.push((entry.child, sheet.kind(slot)))
+                }
+            }
+            sheets[id] = Some(Arc::new(sheet));
+            index += 1;
         }
+        if let Some((scene, old)) = previous {
+            for (id, picked) in kept.into_iter().enumerate() {
+                if !picked && let Some(sheet) = scene.sheet(id as u32) {
+                    sheet.count_kinds(old, id as u32, &mut totals, false);
+                }
+            }
+        }
+        for &(folder, _) in folders.iter().skip(1).rev() {
+            let id = folder as usize;
+            let parent = scan.folders[id].parent.unwrap().folder as usize;
+            mass[parent] = mass[parent].saturating_add(mass[id]);
+        }
+        let placed: Vec<_> = sheets
+            .into_iter()
+            .enumerate()
+            .map(|(id, sheet)| {
+                if let Some(mut sheet) = sheet {
+                    if let Some(sheet) = Arc::get_mut(&mut sheet) {
+                        sheet.mass = mass[id]
+                    }
+                    Placement {
+                        parent: scan.folders[id].parent,
+                        sheet: Some(sheet),
+                    }
+                } else {
+                    Placement::default()
+                }
+            })
+            .collect();
         Self {
-            sheets,
+            folders: scan.folders.clone(),
+            order: scan.order.clone(),
+            sheets: placed.into(),
             root,
-            files,
-            totals: totals.into_values().collect(),
+            files: scan.folders[root as usize].files as usize,
+            aspect,
+            revision: scan.revision.clone(),
+            totals: totals.into_values().filter(|t| t.files != 0).collect(),
         }
+    }
+
+    fn sheet(&self, folder: u32) -> Option<&Sheet> {
+        self.sheets.get(folder as usize)?.sheet.as_deref()
+    }
+
+    fn layout(&self, folder: u32, parent: Rect, scratch: &mut Vec<Weighted>) -> Option<&Layout> {
+        if parent.w <= 0.0 || parent.h <= 0.0 {
+            return None;
+        }
+        let sheet = self.sheet(folder)?;
+        let id = folder as usize;
+        Some(sheet.layout.get_or_init(|| {
+            sheet.build_layout(
+                &self.folders[id],
+                &self.order[id],
+                self.aspect * parent.w / parent.h,
+                |child| self.sheet(child).map_or(0, |s| s.mass),
+                scratch,
+            )
+        }))
+    }
+
+    fn bounds(&self, mut key: Key) -> Option<Rect> {
+        let mut path = vec![key];
+        while key.folder != self.root {
+            key = self.sheets.get(key.folder as usize)?.parent?;
+            path.push(key);
+        }
+        let mut rect = Rect::UNIT;
+        let mut scratch = Vec::new();
+        for key in path.into_iter().rev() {
+            rect = self
+                .layout(key.folder, rect, &mut scratch)?
+                .bounds
+                .get(key.slot as usize)?
+                .inside(rect);
+            if rect.w <= 0.0 || rect.h <= 0.0 {
+                return None;
+            }
+        }
+        Some(rect)
+    }
+
+    fn refreshed(
+        &self,
+        prior: &Model,
+        next: &Model,
+        root: u32,
+        aspect: f64,
+        resolve: Resolve,
+    ) -> Option<Self> {
+        if std::ptr::eq(prior, next) || (aspect / self.aspect).ln().abs() > 0.20 {
+            return None;
+        }
+        let new = next.scan.read().unwrap();
+        let old = prior.scan.read().unwrap();
+        let completing = old.provisional
+            && !new.provisional
+            && root == self.root
+            && old
+                .scan_id
+                .as_ref()
+                .zip(new.scan_id.as_ref())
+                .is_some_and(|(a, b)| Arc::ptr_eq(a, b));
+        if (completing
+            || new
+                .rebuilt_from
+                .as_ref()
+                .is_some_and(|base| Arc::ptr_eq(base, &self.revision)))
+            && Arc::ptr_eq(&old.revision, &self.revision)
+            && old.folders[self.root as usize].inode == new.folders[root as usize].inode
+        {
+            return Some(Self::build(&new, root, aspect, resolve, Some((self, &old))));
+        }
+        if root != self.root {
+            return None;
+        }
+        let (base, dirty) = new.delta.as_ref()?;
+        if !Arc::ptr_eq(base, &self.revision) {
+            return None;
+        }
+        if !Arc::ptr_eq(&old.revision, base) {
+            return None;
+        }
+        let scope = &new.folders[root as usize];
+        let ordered = if new.provisional && root == 0 {
+            dirty.clone()
+        } else {
+            if new.provisional {
+                return None;
+            }
+            let mut affected = HashSet::new();
+            for &id in dirty {
+                if !(scope.pre..scope.end).contains(&new.folders[id as usize].pre) {
+                    continue;
+                }
+                let mut dir = id;
+                while affected.insert(dir) && dir != root {
+                    dir = new.folders[dir as usize].parent?.folder;
+                }
+            }
+            let mut ordered: Vec<_> = affected.into_iter().collect();
+            ordered.sort_unstable_by_key(|&id| new.folders[id as usize].pre);
+            ordered
+        };
+        let mut scene = Self {
+            folders: new.folders.clone(),
+            order: new.order.clone(),
+            sheets: self.sheets.clone(),
+            root,
+            files: scope.files as usize,
+            revision: new.revision.clone(),
+            aspect,
+            totals: Vec::new(),
+        };
+        scene.sheets.grow(new.folders.len(), Placement::default());
+        let mut totals: HashMap<_, _> = self.totals.iter().map(|t| (t.kind, *t)).collect();
+        let mut masses = HashMap::new();
+        let mut replacements = HashMap::<u32, Sheet>::new();
+        let mut resolver = Resolver::new(resolve);
+        for &folder in &ordered {
+            let id = folder as usize;
+            let parent = new.folders[id].parent;
+            let enclosing = if folder == root {
+                0
+            } else {
+                let p = parent?;
+                replacements
+                    .get(&p.folder)
+                    .or_else(|| self.sheet(p.folder))?
+                    .kind(p.slot)
+            };
+            if let Some(previous) = self.sheet(folder) {
+                previous.count_kinds(&old, folder, &mut totals, false);
+            }
+            if scene.sheets[id].parent != parent {
+                scene.sheets[id].parent = parent;
+            }
+            let sheet = Sheet::classify(&new, folder, enclosing, &mut resolver);
+            sheet.count_kinds(&new, folder, &mut totals, true);
+            replacements.insert(folder, sheet);
+        }
+        for &folder in ordered.iter().rev() {
+            let id = folder as usize;
+            let sheet = replacements.get_mut(&folder)?;
+            for &slot in new.order[id].iter() {
+                let entry = &new.folders[id].entries[slot as usize];
+                let weight = if entry.child == NONE {
+                    entry.bytes.max(1)
+                } else {
+                    let parent = Some(Key { folder, slot });
+                    if scene.sheets[entry.child as usize].parent != parent {
+                        scene.sheets[entry.child as usize].parent = parent;
+                    }
+                    if let Some(&mass) = masses.get(&entry.child) {
+                        mass
+                    } else {
+                        let child = self.sheet(entry.child)?;
+                        if child.enclosing_kind != sheet.kind(slot) {
+                            return None;
+                        }
+                        child.mass
+                    }
+                };
+                sheet.mass = sheet.mass.saturating_add(weight);
+            }
+            masses.insert(folder, sheet.mass);
+        }
+        for (folder, sheet) in replacements {
+            scene.sheets[folder as usize].sheet = Some(Arc::new(sheet));
+        }
+        scene.totals = totals.into_values().filter(|t| t.files != 0).collect();
+        Some(scene)
     }
 
     fn walk(
         &self,
         intersects: impl Fn(Rect) -> bool,
+        descend: impl Fn(Rect) -> bool,
         mut visit: impl FnMut(Key, Rect, u32) -> bool,
     ) {
-        let mut pending = vec![self.root];
-        while let Some(folder) = pending.pop() {
-            let sheet = &self.sheets[folder as usize];
+        let mut pending = vec![(self.root, Rect::UNIT)];
+        let mut scratch = Vec::new();
+        while let Some((folder, parent)) = pending.pop() {
+            let Some(sheet) = self.layout(folder, parent, &mut scratch) else {
+                continue;
+            };
             for (band, marks) in sheet.bands.iter().zip(sheet.order.chunks(GROUP)) {
-                if !intersects(*band) {
+                if !intersects(band.inside(parent)) {
                     continue;
                 }
                 for mark in marks {
-                    let r = sheet.bounds[mark.slot as usize];
+                    let r = sheet.bounds[mark.slot as usize].inside(parent);
                     if !intersects(r) {
                         continue;
                     }
-                    if mark.child != NONE {
-                        pending.push(mark.child);
+                    if mark.child != NONE && descend(r) {
+                        pending.push((mark.child, r));
                     } else if visit(
                         Key {
                             folder,
@@ -301,6 +603,19 @@ extern "C" fn dt_map_new(m: &Model, root: u32, aspect: f64, resolve: Resolve) ->
     Box::into_raw(Box::new(Scene::new(m, root, aspect, resolve)))
 }
 #[unsafe(no_mangle)]
+extern "C" fn dt_map_refresh(
+    scene: &Scene,
+    prior: &Model,
+    next: &Model,
+    root: u32,
+    aspect: f64,
+    resolve: Resolve,
+) -> *mut Scene {
+    scene
+        .refreshed(prior, next, root, aspect, resolve)
+        .map_or(std::ptr::null_mut(), |s| Box::into_raw(Box::new(s)))
+}
+#[unsafe(no_mangle)]
 unsafe extern "C" fn dt_map_free(s: *mut Scene) {
     unsafe {
         drop(Box::from_raw(s));
@@ -313,9 +628,7 @@ extern "C" fn dt_map_kinds(s: &Scene, count: &mut usize) -> *const KindTotal {
 }
 #[unsafe(no_mangle)]
 extern "C" fn dt_map_kind(s: &Scene, key: Key) -> u32 {
-    s.sheets
-        .get(key.folder as usize)
-        .map_or(0, |f| f.kind(key.slot))
+    s.sheet(key.folder).map_or(0, |sheet| sheet.kind(key.slot))
 }
 #[unsafe(no_mangle)]
 extern "C" fn dt_map_count(s: &Scene) -> usize {
@@ -323,35 +636,32 @@ extern "C" fn dt_map_count(s: &Scene) -> usize {
 }
 #[unsafe(no_mangle)]
 extern "C" fn dt_map_memory(s: &Scene) -> usize {
-    s.sheets.capacity() * size_of::<Sheet>()
+    s.sheets.len() * size_of::<Placement>()
         + s.sheets
             .iter()
-            .map(|f| {
-                (f.bounds.capacity() + f.bands.capacity()) * size_of::<Rect>()
-                    + f.order.capacity() * size_of::<Mark>()
-                    + f.kinds.capacity() * size_of::<u32>()
+            .filter_map(|p| p.sheet.as_ref())
+            .map(|sheet| {
+                size_of::<Sheet>()
+                    + sheet.kinds.capacity() * size_of::<u32>()
+                    + sheet.layout.get().map_or(0, |layout| layout.storage())
             })
             .sum::<usize>()
 }
 #[unsafe(no_mangle)]
 extern "C" fn dt_map_bounds(s: &Scene, key: Key, out: &mut Rect) -> bool {
-    if let Some(&r) = s
-        .sheets
-        .get(key.folder as usize)
-        .and_then(|f| f.bounds.get(key.slot as usize))
-        && r.w > 0.0
-        && r.h > 0.0
-    {
-        *out = r;
-        return true;
+    if let Some(rect) = s.bounds(key) {
+        *out = rect;
+        true
+    } else {
+        false
     }
-    false
 }
 #[unsafe(no_mangle)]
 extern "C" fn dt_map_hit(s: &Scene, x: f64, y: f64, out: &mut Key) -> bool {
     let mut hit = false;
     s.walk(
         |r| r.contains(x, y),
+        |_| true,
         |key, _, _| {
             *out = key;
             hit = true;
@@ -366,6 +676,7 @@ extern "C" fn dt_map_selection(s: &Scene, area: Rect) -> *mut Selection {
     let mut items = Vec::new();
     s.walk(
         |r| r.intersects(area),
+        |_| true,
         |key, _, _| {
             items.push(key);
             false
@@ -422,9 +733,10 @@ impl GlassTint {
     fn new(rgb: u32) -> Self {
         let surface = std::array::from_fn(|i| {
             let light = match i as i32 {
-                t @ 0..=64 => (64 - t) * (64 - t) * 39 / 4096,
-                t @ 65..=104 => -(t - 64) * 15 / 40,
-                t => -15 + (t - 104) * 23 / 24,
+                t @ 0..=54 => (54 - t) * (54 - t) * 54 / 2916,
+                55..=73 => 0,
+                t @ 74..=102 => -(t - 73) * 12 / 29,
+                t => -12 + (t - 102) * 29 / 26,
             };
             pixel(rgb, light)
         });
@@ -439,9 +751,9 @@ impl GlassTint {
         let luminance = 0.2126 * linear(0) + 0.7152 * linear(8) + 0.0722 * linear(16);
         Self {
             surface,
-            top: pixel(rgb, 76),
-            bottom: pixel(rgb, 35),
-            seam: pixel(rgb, -42),
+            top: pixel(rgb, 88),
+            bottom: pixel(rgb, 44),
+            seam: pixel(rgb, -38),
             light_ink: luminance < 0.179,
         }
     }
@@ -463,6 +775,31 @@ extern "C" fn dt_map_render(
     color_count: usize,
     shine: bool,
 ) -> *mut Frame {
+    dt_map_render_groups(
+        s,
+        port,
+        width,
+        height,
+        scale,
+        palette,
+        color_count,
+        shine,
+        None,
+    )
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn dt_map_render_groups(
+    s: &Scene,
+    port: Rect,
+    width: u32,
+    height: u32,
+    scale: f64,
+    palette: *const GlassTint,
+    color_count: usize,
+    shine: bool,
+    groups: Option<&Groups>,
+) -> *mut Frame {
     let (w, h) = (width as usize, height as usize);
     if w == 0 || h == 0 || w.saturating_mul(h) > 40_000_000 || port.w <= 0.0 || port.h <= 0.0 {
         return std::ptr::null_mut();
@@ -476,7 +813,18 @@ extern "C" fn dt_map_render(
     let sx = w as f64 / port.w;
     let sy = h as f64 / port.h;
     s.walk(
-        |r| r.intersects(port),
+        |r| {
+            if !r.intersects(port) {
+                return false;
+            }
+            let spans_pixel = |origin: f64, length: f64, offset: f64, scale: f64| {
+                let extent = length * scale;
+                let start = (origin - offset) * scale;
+                extent >= 1.0 || start.round() < (start + extent).round()
+            };
+            spans_pixel(r.x, r.w, port.x, sx) && spans_pixel(r.y, r.h, port.y, sy)
+        },
+        |r| (r.w * sx) * (r.h * sy) >= 1.0,
         |key, rect, kind| {
             let (x, y) = ((rect.x - port.x) * sx, (rect.y - port.y) * sy);
             let (dw, dh) = (rect.w * sx, rect.h * sy);
@@ -491,10 +839,14 @@ extern "C" fn dt_map_render(
             if x0 >= x1 || y0 >= y1 {
                 return false;
             }
-            let tint = colors.get(kind as usize).unwrap_or(&colors[0]);
-            let graded = shine && dw >= 4.0 && dh >= 4.0;
+            let tint = match groups {
+                Some(g) => &colors[g.color(key) as usize % color_count],
+                None => colors.get(kind as usize).unwrap_or(&colors[0]),
+            };
+            let graded = shine && dw >= 2.0 && dh >= 3.0;
+            let small_glint = shine && dw >= 2.0 && dh >= 2.0 && !graded;
             let grade_step = 128.0 / dh;
-            let right_divider = x1 < w && dw >= 3.0 && dh >= 2.0;
+            let right_divider = x1 < w && dw >= 3.0;
             let top_divider = y0 > 0 && y >= 0.5 && dh >= 3.0 && dw >= 2.0;
             let bottom = (y + dh).round();
             for row in y0..y1 {
@@ -505,6 +857,8 @@ extern "C" fn dt_map_render(
                 } else if graded {
                     let grade = ((row as f64 + 0.5 - y) * grade_step).clamp(0.0, 128.0) as usize;
                     tint.surface[grade]
+                } else if small_glint && y >= -0.49 && row == y0 {
+                    tint.surface[18]
                 } else if top_divider && row == y0 {
                     tint.seam
                 } else {
