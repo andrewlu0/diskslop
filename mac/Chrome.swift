@@ -152,7 +152,7 @@ final class LiveStatusDot: NSImageView {
 
 final class Welcome: NSView {
     let actions: [NSButton]
-    private let capacityBar = FreeSpaceBar()
+    private let capacityBar = VolumeUsageBar()
     private let capacityLabel = NSTextField(labelWithString: "")
     init(buttons: [NSButton]) {
         actions = buttons

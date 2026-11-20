@@ -21,33 +21,27 @@ struct VolumeCapacity {
         return Self(stats)
     }
 
-    var availableFraction: Double? {
-        guard let available, let total else { return nil }
-        return min(1, Double(available) / Double(total))
+    var usedFraction: Double? {
+        guard let available, let total, total > 0 else { return nil }
+        return Double(total - min(available, total)) / Double(total)
     }
     var summary: String? {
         guard let available else { return nil }
         let free = "\(formatBytes(available)) available"
-        return total.map { "\(free) of \(formatBytes($0))" } ?? free
+        guard let total, let usedFraction else { return free }
+        let percent = usedFraction.formatted(.percent.precision(.fractionLength(0...1)))
+        return "\(percent) used · \(free) of \(formatBytes(total))"
     }
     var detail: String {
-        guard let summary else { return "Available space unknown" }
-        guard let fraction = availableFraction else { return summary }
-        let percent = fraction.formatted(.percent.precision(.fractionLength(0...1)))
-        return "\(summary) (\(percent) free)"
+        summary ?? "Available space unknown"
     }
 }
 
-final class FreeSpaceBar: NSLevelIndicator {
+final class VolumeUsageBar: NSView {
+    private var fraction: CGFloat = 0
+
     override init(frame: NSRect) {
         super.init(frame: frame)
-        levelIndicatorStyle = .continuousCapacity
-        controlSize = .mini
-        isEditable = false
-        minValue = 0; maxValue = 1
-        drawsTieredCapacityLevels = false
-        fillColor = .controlAccentColor
-        warningFillColor = fillColor; criticalFillColor = fillColor
         setAccessibilityElement(false)
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: 8).isActive = true
@@ -55,10 +49,35 @@ final class FreeSpaceBar: NSLevelIndicator {
     required init?(coder: NSCoder) { nil }
 
     func show(_ capacity: VolumeCapacity?) {
-        let fraction = capacity?.availableFraction
-        doubleValue = fraction ?? 0
-        isHidden = fraction == nil
+        let used = capacity?.usedFraction
+        isHidden = used == nil
+        let next = CGFloat(used ?? 0)
+        if fraction != next {
+            fraction = next
+            needsDisplay = true
+        }
     }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard !bounds.isEmpty else { return }
+        let radius = min(bounds.height, bounds.width) / 2
+        NSColor.quaternaryLabelColor.setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: radius, yRadius: radius).fill()
+
+        let width = bounds.width * fraction
+        guard width > 0 else { return }
+        let height = min(bounds.height, width)
+        let x = userInterfaceLayoutDirection == .rightToLeft ? bounds.maxX - width : bounds.minX
+        let fill = NSRect(x: x, y: bounds.midY - height / 2, width: width, height: height)
+        NSColor.controlAccentColor.setFill()
+        NSBezierPath(roundedRect: fill, xRadius: height / 2, yRadius: height / 2).fill()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
@@ -96,7 +115,7 @@ private struct MountedVolume {
 
 private final class AvailableSpaceCell: NSTableCellView {
     static let minimumWidth = TableTextCell.sizeColumnMinimum + 58
-    private let bar = FreeSpaceBar()
+    private let bar = VolumeUsageBar()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -145,7 +164,7 @@ final class VolumePicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         scanButton.keyEquivalent = "\r"
         let cancel = NSButton(title: "Cancel", target: self, action: #selector(dismiss))
         cancel.keyEquivalent = "\u{1b}"
-        for (id, title, width) in [("name","Volume",170),("path","Mount point",220),("free","Available",174)] {
+        for (id, title, width) in [("name","Volume",170),("path","Mount point",220),("free","Usage / Available",174)] {
             let col = NSTableColumn(identifier: .init(id))
             col.title = title; col.minWidth = id == "free" ? AvailableSpaceCell.minimumWidth : 82
             col.width = max(CGFloat(width), col.minWidth)
