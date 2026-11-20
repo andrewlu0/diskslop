@@ -15,9 +15,12 @@ for name in DiskSlop.dmg DiskSlop.dmg.sha256 appcast.xml; do
     fi
 done
 
-if ! grep -Fq "href=\"$url\"" README.md; then
-    grep -Fq 'href="#install-on-macos"><img src="docs/download-macos.svg"' README.md
-    sed -i '' -e "s|href=\"#install-on-macos\"><img src=\"docs/download-macos.svg\"|href=\"$url\"><img src=\"docs/download-macos.svg\"|" \
-        -e 's/ While the first image is in preparation, you can build the app locally\.//' README.md
-fi
+button='><img src="docs/download-macos.svg"'
+grep -Fq "$button" README.md
+sed -i '' -E \
+    -e "s|href=\"[^\"]*\"(><img src=\"docs/download-macos\\.svg\")|href=\"$url\"\\1|" \
+    -e 's/alt="Download the DiskSlop preview for macOS"/alt="Download DiskSlop for macOS"/' \
+    -e '/^<p align="center"><strong>Public preview<\/strong>/d' \
+    -e 's/ While the first image is in preparation, you can build the app locally\.//' README.md
+grep -Fq "href=\"$url\"$button" README.md
 printf 'README download button: %s\n' "$url"
