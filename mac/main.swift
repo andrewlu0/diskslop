@@ -767,7 +767,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         controls()
     }
 
-    private func installScanCharts(_ request: ScanMapRequest, _ next: ScanMapFrame, continuing: Bool, animate: Bool = true) {
+    private func installScanCharts(_ request: ScanMapRequest, _ next: ScanMapFrame, continuing: Bool, afterTrash: Bool = false) {
         let list = next.list
         let scope = Set(locations.compactMap { $0.item?.key }).union([DiskItem.scanRootKey])
         let matches = colorMode == request.mode, colors = matches ? next.colors : nil
@@ -778,7 +778,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         sunburst.scopeKeys = scope
         if usingSunburst {
             if matches, let rings = next.rings, request.dimensions == sunburst.liveDimensions {
-                sunburst.showLive(list, colors: colors, layout: rings, sameFolder: continuing && animate)
+                sunburst.showLive(list, colors: colors, layout: rings, sameFolder: continuing, afterTrash: afterTrash)
             } else { sunburst.show(list, colors: colors, keepingLayout: continuing) }
         }
         if !matches { updateColors(for: list) }
@@ -1306,7 +1306,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         showHover(nil, kind: nil)
         if let (request, frame) = trashFrame ?? finishedScanFrame, frame.list === list {
             if let work = colorWork { dt_cancel(work.handle); colorWork = nil }
-            installScanCharts(request, frame, continuing: continuingScan || (trashFrame != nil && sameFolder), animate: trashFrame == nil)
+            installScanCharts(request, frame, continuing: continuingScan || (trashFrame != nil && sameFolder), afterTrash: trashFrame != nil)
         } else {
             legend.show(list.geometry.kinds)
             let scopeKeys = Set(locations.compactMap { $0.item?.key }).union([DiskItem.scanRootKey])
@@ -1685,7 +1685,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                 return plan.model.url(folder: item.folder, slot: item.slot, directory: true) != nil
             })
             let fresh = result.moved > 0 ? FolderListing(plan.model, folder: surviving.last?.id ?? 0, aspect: request.aspect) : nil
-            let frame = fresh.flatMap { request.prepare($0, progress: ScanProgress(), animate: false) }
+            let frame = fresh.flatMap { request.prepare($0, progress: ScanProgress(), afterTrash: true) }
             DispatchQueue.main.async {
                 defer {
                     self.movingToTrash = false

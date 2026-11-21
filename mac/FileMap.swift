@@ -72,6 +72,15 @@ final class FileMap: @unchecked Sendable {
         var key = DTKey()
         return dt_map_hit(handle, p.x, p.y, &key) ? key : nil
     }
+    func reflow(from previous: FileMap, in settings: MapRenderSettings) -> [ChartPatch] {
+        guard previous.model === model, previous.folder == folder else { return [] }
+        let scale = min(1, 192 / Double(max(settings.width, settings.height)))
+        let w = max(1, Int(Double(settings.width) * scale)), h = max(1, Int(Double(settings.height) * scale))
+        let tiles = [DTReflowTile](unsafeUninitializedCapacity: w * h) { buffer, count in
+            count = dt_map_reflow(previous.handle, handle, DTRect(settings.viewport), UInt32(w), UInt32(h), buffer.baseAddress, buffer.count)
+        }
+        return tiles.map { ChartPatch(from: $0.from.vector, to: $0.to.vector) }
+    }
     func kind(at key: DTKey) -> UInt32 { dt_map_kind(handle, key) }
     func motionTiles(in frame: RenderedFiles) -> [MapItemName: (key: UInt64, rect: CGRect)] {
         var tiles = Dictionary(frame.labels.map { ($0.identity, (key: $0.key, rect: $0.rect)) }, uniquingKeysWith: { first, _ in first })
@@ -120,4 +129,8 @@ final class FileMap: @unchecked Sendable {
             shouldInterpolate: false, intent: .defaultIntent) else { return nil }
         return RenderedFiles(image: image, labels: labels, viewport: viewport, pixels: pixels)
     }
+}
+
+private extension DTBox {
+    var vector: SIMD4<Float> { SIMD4(x0, y0, x1, y1) }
 }

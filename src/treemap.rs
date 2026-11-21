@@ -647,6 +647,64 @@ extern "C" fn dt_map_memory(s: &Scene) -> usize {
             })
             .sum::<usize>()
 }
+#[repr(C)]
+struct ReflowTile {
+    from: [f32; 4],
+    to: [f32; 4],
+}
+
+// A screen-space partition bounds the work even when the inventory contains millions of files.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn dt_map_reflow(
+    previous: &Scene,
+    next: &Scene,
+    port: Rect,
+    width: u32,
+    height: u32,
+    out: *mut ReflowTile,
+    capacity: usize,
+) -> usize {
+    if previous.root != next.root
+        || width == 0
+        || height == 0
+        || port.w <= 0.0
+        || port.h <= 0.0
+        || capacity == 0
+        || out.is_null()
+    {
+        return 0;
+    }
+    let (w, h) = (f64::from(width), f64::from(height));
+    let project = |r: Rect| {
+        let x = |v: f64| (((v - port.x) * w / port.w).round().clamp(0.0, w) / w) as f32;
+        let y = |v: f64| (((v - port.y) * h / port.h).round().clamp(0.0, h) / h) as f32;
+        [x(r.x), y(r.y), x(r.x + r.w), y(r.y + r.h)]
+    };
+    let mut count = 0;
+    let mut moved = false;
+    next.walk(
+        |r| {
+            let b = project(r);
+            b[2] > b[0] && b[3] > b[1]
+        },
+        |r| r.w * r.h * w * h > port.w * port.h,
+        |key, rect, _| {
+            let to = project(rect);
+            let from = previous.bounds(key).map(project).unwrap_or_else(|| {
+                let (x, y) = ((to[0] + to[2]) * 0.5, (to[1] + to[3]) * 0.5);
+                [x, y, x, y]
+            });
+            moved |= from != to;
+            unsafe {
+                out.add(count).write(ReflowTile { from, to });
+            }
+            count += 1;
+            count == capacity
+        },
+    );
+    if moved { count } else { 0 }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn dt_map_bounds(s: &Scene, key: Key, out: &mut Rect) -> bool {
     if let Some(rect) = s.bounds(key) {

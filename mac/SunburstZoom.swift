@@ -1,7 +1,9 @@
 import AppKit
 import MetalKit
 
-final class SunburstZoomRenderer {
+final class ChartRenderer {
+    static let shared = ChartRenderer()
+    let reflowPipeline: MTLRenderPipelineState
     let device: MTLDevice, queue: MTLCommandQueue, pipeline: MTLRenderPipelineState
 
     init?() {
@@ -12,19 +14,23 @@ final class SunburstZoomRenderer {
         descriptor.fragmentFunction = library.makeFunction(name: "zoom")
         descriptor.colorAttachments[0].pixelFormat = .bgra8Unorm
         guard let pipeline = try? device.makeRenderPipelineState(descriptor: descriptor) else { return nil }
+        descriptor.vertexFunction = library.makeFunction(name: "reflow")
+        descriptor.fragmentFunction = library.makeFunction(name: "surface")
+        guard let reflowPipeline = try? device.makeRenderPipelineState(descriptor: descriptor) else { return nil }
+        self.reflowPipeline = reflowPipeline
         self.device = device; self.queue = queue; self.pipeline = pipeline
     }
 
-    func snapshot(side: Int, draw: (CGContext) -> Void) -> MTLTexture? {
+    func snapshot(width: Int, height: Int, draw: (CGContext) -> Void) -> MTLTexture? {
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
         let info = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
-        guard let context = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8,
-            bytesPerRow: side * 4, space: space, bitmapInfo: info), let data = context.data else { return nil }
+        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: width * 4, space: space, bitmapInfo: info), let data = context.data else { return nil }
         draw(context)
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: side, height: side, mipmapped: false)
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
         descriptor.usage = .shaderRead
         guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
-        texture.replace(region: MTLRegionMake2D(0, 0, side, side), mipmapLevel: 0, withBytes: data, bytesPerRow: context.bytesPerRow)
+        texture.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: data, bytesPerRow: context.bytesPerRow)
         return texture
     }
 
@@ -39,6 +45,20 @@ final class SunburstZoomRenderer {
     float2 polar(float angle, float radius) {
         float radians = angle * 6.28318530718f;
         return 0.5f + 0.5f * radius * float2(sin(radians), -cos(radians));
+    }
+    struct Patch { float4 from, to; };
+    vertex Vertex reflow(uint corner [[vertex_id]], uint instance [[instance_id]],
+                         constant float4 &mode [[buffer(0)]], device const Patch *patches [[buffer(1)]]) {
+        Patch p = patches[instance];
+        float4 box = mix(p.from, p.to, mode.x);
+        float2 edge = float2(float(corner / 2) / mode.y, float(corner % 2));
+        float2 xy = mix(box.xy, box.zw, edge), uv = mix(p.to.xy, p.to.zw, edge);
+        if (mode.z > 0) { xy = polar(xy.x, xy.y); uv = polar(uv.x, uv.y); }
+        return {float4(2 * xy.x - 1, 1 - 2 * xy.y, 0, 1), uv};
+    }
+    fragment half4 surface(Vertex v [[stage_in]], texture2d<half> target [[texture(0)]]) {
+        constexpr sampler sample(coord::normalized, address::clamp_to_edge, filter::linear);
+        return target.sample(sample, v.uv);
     }
     fragment half4 zoom(Vertex v [[stage_in]], texture2d<half> parent [[texture(0)]],
                         texture2d<half> child [[texture(1)]], constant float4 &lens [[buffer(0)]],
@@ -74,14 +94,14 @@ final class SunburstZoomRenderer {
 
 final class SunburstZoomView: MTKView {
     let parentID: UInt32, childID: UInt32
-    private let renderer: SunburstZoomRenderer
+    private let renderer: ChartRenderer
     private let parent: MTLTexture, child: MTLTexture
     private let stops: [SIMD2<Float>]
     private var lens: SIMD4<Float>
     private var from: Double, to: Double, began: CFTimeInterval = 0
     var completed: (() -> Void)?
 
-    init(frame: CGRect, renderer: SunburstZoomRenderer, parent: MTLTexture, child: MTLTexture,
+    init(frame: CGRect, renderer: ChartRenderer, parent: MTLTexture, child: MTLTexture,
          parentID: UInt32, childID: UInt32, parentStops: [CGFloat], childStops: [CGFloat],
          anchor: Sector, level: Int, hub: CGFloat, inward: Bool) {
         self.renderer = renderer; self.parent = parent; self.child = child
@@ -107,16 +127,25 @@ final class SunburstZoomView: MTKView {
     override var isOpaque: Bool { false }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
+    private func beginLeg() {
+        began = CACurrentMediaTime()
+        let start = began
+        DispatchQueue.main.asyncAfter(deadline: .now() + legDuration) { [weak self] in
+            guard let self, self.began == start, !self.isPaused else { return }
+            self.isPaused = true; self.completed?()
+        }
+    }
+    private var legDuration: Double { max(0.08, 0.32 * abs(to - from)) }
     func start() {
         preferredFramesPerSecond = min(120, window?.screen?.maximumFramesPerSecond ?? 60)
-        began = CACurrentMediaTime()
+        beginLeg()
         isPaused = false
         draw()
     }
     func reverse(towardChild: Bool) {
         let destination: Double = towardChild ? 1 : 0
         guard to != destination else { return }
-        from = Double(lens.w); to = destination; began = CACurrentMediaTime()
+        from = Double(lens.w); to = destination; beginLeg()
     }
     func destination(angle: CGFloat, depth: CGFloat) -> (CGFloat, CGFloat)? {
         let t = lens.w, width = lens.y - lens.x, span = pow(width, t)
@@ -138,11 +167,11 @@ final class SunburstZoomView: MTKView {
     }
     override func draw(_ dirtyRect: NSRect) {
         guard began > 0, !isPaused else { return }
-        let time = min(1, (CACurrentMediaTime() - began) / max(0.08, 0.32 * abs(to - from)))
+        let time = min(1, (CACurrentMediaTime() - began) / legDuration)
         guard time < 1, let pass = currentRenderPassDescriptor, let drawable = currentDrawable,
               let command = renderer.queue.makeCommandBuffer(), let encoder = command.makeRenderCommandEncoder(descriptor: pass)
         else { isPaused = true; completed?(); return }
-        let ease = time * time * (3 - 2 * time)
+        let ease = ChartMotion.easeOut(time)
         lens.w = Float(from + (to - from) * ease)
         encoder.setRenderPipelineState(renderer.pipeline)
         encoder.setFragmentTexture(parent, index: 0); encoder.setFragmentTexture(child, index: 1)

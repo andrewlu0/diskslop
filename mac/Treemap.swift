@@ -36,13 +36,20 @@ struct MovingTile {
 struct LiveMapFrame {
     let raster: RenderedFiles, moves: [MovingTile], changed: Bool, priorImage: CGImage?
     let overview: CGImage?
-    init(_ raster: RenderedFiles, geometry: FileMap, settings: MapRenderSettings, colors: MapBreakdown?, source: (FileMap, RenderedFiles)?) {
+    let trashPatches: [ChartPatch]
+    init(_ raster: RenderedFiles, geometry: FileMap, settings: MapRenderSettings, colors: MapBreakdown?, source: (FileMap, RenderedFiles)?, afterTrash: Bool = false) {
         self.raster = raster
         overview = raster.viewport == MapRenderSettings.whole ? raster.image : settings.overview(geometry, colors: colors)
         guard let (previous, prior) = source, prior.viewport == raster.viewport else {
-            moves = []; changed = false; priorImage = nil; return
+            moves = []; changed = false; priorImage = nil; trashPatches = []; return
         }
         priorImage = prior.image
+        if afterTrash {
+            trashPatches = geometry.reflow(from: previous, in: settings)
+            moves = []; changed = !trashPatches.isEmpty
+            return
+        }
+        trashPatches = []
         let before = previous.motionTiles(in: prior)
         let after = geometry.motionTiles(in: raster)
         let port = raster.viewport
@@ -80,6 +87,8 @@ final class Treemap: NSView, NSViewToolTipOwner {
     private var overviewIsCurrent = false
     private var movingTiles: [MovingTile] = []
     private let motion = ChartMotion()
+    private var trashTransition: ChartReflow?
+    private var renderer: ChartRenderer?
     private let tileSheet = FlippedCanvas()
     var motionSource: (FileMap, RenderedFiles)? {
         guard !isHidden, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, let geometry, let rendered else { return nil }
@@ -113,6 +122,10 @@ final class Treemap: NSView, NSViewToolTipOwner {
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let renderer = ChartRenderer.shared
+            DispatchQueue.main.async { [weak self] in self?.renderer = renderer }
+        }
         layer?.masksToBounds = true
         tileSheet.wantsLayer = true
         tileSheet.frame = bounds; tileSheet.autoresizingMask = [.width, .height]
@@ -259,13 +272,16 @@ final class Treemap: NSView, NSViewToolTipOwner {
         overviewIsCurrent = false
         if !sameFolder { viewport = Self.whole; overview = nil }
         revision += 1
-        if let frame, settings == renderSettings {
+        if let frame, let settings, settings == renderSettings {
             rendered = frame.raster
             overview = frame.overview; overviewIsCurrent = overview != nil
             discardTrashBacking()
             if sameFolder, frame.changed, let prior, prior.image === frame.priorImage,
                !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-                animateTiles(frame.moves, over: prior)
+                if !frame.trashPatches.isEmpty {
+                    updateSelection()
+                    animateTrash(frame.trashPatches, settings: settings)
+                } else { animateTiles(frame.moves, over: prior) }
             }
         } else {
             let compatible = settings?.focus == legendFocus ? frame : nil
@@ -279,7 +295,28 @@ final class Treemap: NSView, NSViewToolTipOwner {
         scheduleReflow()
     }
 
+    private func animateTrash(_ patches: [ChartPatch], settings: MapRenderSettings) {
+        guard let renderer, window?.isVisible == true else { return }
+        let ratio = min(1, 2048 / Double(max(settings.width, settings.height)))
+        let w = max(1, Int(Double(settings.width) * ratio)), h = max(1, Int(Double(settings.height) * ratio))
+        guard let texture = renderer.snapshot(width: w, height: h, draw: { context in
+            context.translateBy(x: 0, y: CGFloat(h))
+            context.scaleBy(x: CGFloat(w) / bounds.width, y: -CGFloat(h) / bounds.height)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+            effectiveAppearance.performAsCurrentDrawingAppearance {
+                draw(bounds); drawOverlay(bounds)
+            }
+            NSGraphicsContext.restoreGraphicsState()
+        }), let view = ChartReflow(frame: bounds, renderer: renderer, texture: texture, patches: patches, radial: false) else { return }
+        trashTransition = view; addSubview(view)
+        view.completed = { [weak self] in self?.endMotion(); self?.updateHover(force: true) }
+        view.start()
+    }
     private func endMotion() {
+        if let view = trashTransition {
+            view.cancel(); trashTransition = nil; needsDisplay = true; overlay.needsDisplay = true
+        }
         motion.stop(); movingTiles.removeAll()
         tileSheet.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
     }
@@ -295,10 +332,10 @@ final class Treemap: NSView, NSViewToolTipOwner {
         func animate(_ layer: CALayer, _ key: String, from: Any, to: Any) {
             let animation = CABasicAnimation(keyPath: key)
             animation.fromValue = from; animation.toValue = to; animation.duration = ChartMotion.duration
-            animation.timingFunction = CAMediaTimingFunction(controlPoints: 1/3, 1, 2/3, 1)
+            animation.timingFunction = ChartMotion.timingFunction
             layer.add(animation, forKey: key)
         }
-        let back = place(previous.image, in: screen(previous.viewport))
+        let back = place(previous.image, in: previous.viewport)
         back.opacity = 0; animate(back, "opacity", from: 1, to: 0)
         for tile in moves {
             let layer = place(tile.image, in: tile.from), position = layer.position, bounds = layer.bounds
@@ -314,6 +351,11 @@ final class Treemap: NSView, NSViewToolTipOwner {
         }
     }
     private func hit(_ point: CGPoint) -> DTKey? {
+        if let view = trashTransition {
+            guard let p = view.destination(x: (point.x - viewport.minX) / viewport.width,
+                y: (point.y - viewport.minY) / viewport.height) else { return nil }
+            return geometry?.hit(CGPoint(x: viewport.minX + p.x * viewport.width, y: viewport.minY + p.y * viewport.height))
+        }
         if let tile = movingTiles.last(where: { $0.rect(at: motion.fraction).contains(point) }) { return DTKey(tile.key) }
         return geometry?.hit(point)
     }
@@ -470,7 +512,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
     }
     override func draw(_ dirtyRect: NSRect) {
         NSColor.controlBackgroundColor.setFill(); dirtyRect.fill()
-        guard let view = rendered, geometry?.count != 0, let cg = NSGraphicsContext.current?.cgContext else { return }
+        guard trashTransition == nil, let view = rendered, geometry?.count != 0, let cg = NSGraphicsContext.current?.cgContext else { return }
         func draw(_ image: CGImage, _ rect: CGRect) {
             let visible = rect.intersection(viewport)
             guard !visible.isNull, !visible.isEmpty else { return }
@@ -508,6 +550,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
         context.drawPath(using: .eoFill)
     }
     fileprivate func drawOverlay(_ dirty: NSRect) {
+        guard trashTransition == nil else { return }
         if rendered == nil || geometry?.count == 0 {
             let title = geometry?.count == 0 ? "No files in this folder" : "Drawing file map…"
             let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.secondaryLabelColor]

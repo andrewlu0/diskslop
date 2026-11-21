@@ -147,13 +147,15 @@ struct TrashSpark {
             let before = max(0, i-1), after = min(steps, i+1)
             let dx = points[after].x - points[before].x, dy = points[after].y - points[before].y
             let velocity = hypot(dx, dy) * CGFloat(steps) / (CGFloat(after-before) * duration)
-            let exposure = min(49, max(0.12, velocity * 0.029))
+            let playbackSpeed = 3 * pow(1 - CGFloat(i) / CGFloat(steps), 2.0 / 3.0)
+            let exposure = min(49, max(0.12, velocity * playbackSpeed * 0.029))
             let rotation = CATransform3DMakeRotation(atan2(dy, dx), 0, 0, 1)
             return NSValue(caTransform3D: CATransform3DScale(rotation, exposure/length, 1, 1))
         }
         func animation(_ key: String, _ values: [Any], at times: [Double]? = nil) -> CAKeyframeAnimation {
             let effect = CAKeyframeAnimation(keyPath: key)
             effect.values = values; effect.keyTimes = times?.map { NSNumber(value: $0) }; effect.duration = duration
+            effect.timingFunction = ChartMotion.timingFunction
             return effect
         }
         let flight = CAAnimationGroup()

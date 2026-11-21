@@ -168,10 +168,10 @@ final class LiveStatusDot: NSImageView {
             else { removeAllSymbolEffects(animated: false) }
         } else if pulsing {
             wantsLayer = true
-            let pulse = CABasicAnimation(keyPath: "opacity")
-            pulse.fromValue = 1; pulse.toValue = 0.45
-            pulse.duration = 1; pulse.autoreverses = true; pulse.repeatCount = .infinity
-            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            let pulse = CAKeyframeAnimation(keyPath: "opacity")
+            pulse.values = [1, 0.45, 1]; pulse.keyTimes = [0, 0.5, 1]
+            pulse.duration = 2; pulse.repeatCount = .infinity
+            pulse.timingFunctions = [ChartMotion.timingFunction, ChartMotion.timingFunction]
             layer?.add(pulse, forKey: "pulse")
         } else { layer?.removeAnimation(forKey: "pulse") }
     }

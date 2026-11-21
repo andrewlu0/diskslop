@@ -1,0 +1,95 @@
+import AppKit
+import MetalKit
+
+struct ChartPatch {
+    let from: SIMD4<Float>, to: SIMD4<Float>
+}
+
+final class ChartReflow: MTKView {
+    private let renderer: ChartRenderer, texture: MTLTexture, buffer: MTLBuffer
+    private let patches: [ChartPatch]
+    private let batches: [(offset: Int, count: Int, segments: Int)]
+    private let radial: Bool
+    private static let duration: CFTimeInterval = 0.36
+    private var began: CFTimeInterval = 0
+    private var fraction: Float = 0
+    var completed: (() -> Void)?
+
+    init?(frame: CGRect, renderer: ChartRenderer, texture: MTLTexture, patches: [ChartPatch], radial: Bool) {
+        guard !patches.isEmpty else { return nil }
+        self.renderer = renderer; self.texture = texture; self.radial = radial
+        if radial {
+            let groups = Dictionary(grouping: patches) { patch -> Int in
+                let span = max(patch.from.z - patch.from.x, patch.to.z - patch.to.x)
+                if span <= 1 / 256 { return 1 }
+                if span <= 1 / 32 { return 8 }
+                if span <= 1 / 4 { return 64 }
+                return 256
+            }
+            var ordered = [ChartPatch](), batches = [(Int, Int, Int)]()
+            ordered.reserveCapacity(patches.count)
+            for segments in groups.keys.sorted() {
+                guard let group = groups[segments] else { continue }
+                batches.append((ordered.count, group.count, segments))
+                ordered.append(contentsOf: group)
+            }
+            self.patches = ordered; self.batches = batches
+        } else {
+            self.patches = patches; batches = [(0, patches.count, 1)]
+        }
+        guard let storage = self.patches.withUnsafeBytes({ bytes in
+            renderer.device.makeBuffer(bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared)
+        }) else { return nil }
+        buffer = storage
+        super.init(frame: frame, device: renderer.device)
+        isPaused = true; enableSetNeedsDisplay = false; autoResizeDrawable = false
+        drawableSize = CGSize(width: texture.width, height: texture.height)
+        colorPixelFormat = .bgra8Unorm
+        colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+        layer?.isOpaque = false; clearColor = MTLClearColorMake(0, 0, 0, 0)
+        setAccessibilityElement(false)
+    }
+    required init(coder: NSCoder) { fatalError() }
+    override var isOpaque: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func start() {
+        preferredFramesPerSecond = min(120, window?.screen?.maximumFramesPerSecond ?? 60)
+        began = CACurrentMediaTime(); isPaused = false; draw()
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.duration) { [weak self] in
+            guard let self, !self.isPaused else { return }
+            self.isPaused = true; self.completed?()
+        }
+    }
+    func cancel() {
+        isPaused = true; completed = nil; removeFromSuperview()
+    }
+    func destination(x: CGFloat, y: CGFloat) -> CGPoint? {
+        let x = Float(x), y = Float(y)
+        for patch in patches.reversed() {
+            let box = patch.from + (patch.to - patch.from) * fraction
+            guard x >= box.x, x < box.z, y >= box.y, y < box.w else { continue }
+            let u = (x - box.x) / (box.z - box.x), v = (y - box.y) / (box.w - box.y)
+            return CGPoint(x: CGFloat(patch.to.x + (patch.to.z - patch.to.x) * u),
+                y: CGFloat(patch.to.y + (patch.to.w - patch.to.y) * v))
+        }
+        return nil
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        guard !isPaused, began > 0 else { return }
+        let t = min(1, (CACurrentMediaTime() - began) / Self.duration)
+        guard t < 1, let pass = currentRenderPassDescriptor, let drawable = currentDrawable,
+              let command = renderer.queue.makeCommandBuffer(), let encoder = command.makeRenderCommandEncoder(descriptor: pass)
+        else { isPaused = true; completed?(); return }
+        fraction = Float(ChartMotion.easeOut(t))
+        encoder.setRenderPipelineState(renderer.reflowPipeline)
+        encoder.setFragmentTexture(texture, index: 0)
+        for batch in batches {
+            var mode = SIMD4<Float>(fraction, Float(batch.segments), radial ? 1 : 0, 0)
+            encoder.setVertexBytes(&mode, length: MemoryLayout.size(ofValue: mode), index: 0)
+            encoder.setVertexBuffer(buffer, offset: batch.offset * MemoryLayout<ChartPatch>.stride, index: 1)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 2 * (batch.segments + 1), instanceCount: batch.count)
+        }
+        encoder.endEncoding(); command.present(drawable); command.commit()
+    }
+}

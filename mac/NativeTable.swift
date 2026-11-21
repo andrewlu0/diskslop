@@ -182,7 +182,7 @@ final class TableTextCell: NSTableCellView {
         CATransaction.commit()
         let fade = CABasicAnimation(keyPath: "opacity")
         fade.fromValue = 0.26; fade.toValue = 0; fade.duration = 0.48
-        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        fade.timingFunction = ChartMotion.timingFunction
         glow.add(fade, forKey: "liveChange")
         DispatchQueue.main.asyncAfter(deadline: .now() + fade.duration) { [weak self, weak glow] in
             guard let self, let glow, self.pulse === glow else { return }

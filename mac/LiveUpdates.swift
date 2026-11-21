@@ -79,6 +79,11 @@ final class LiveCheckpointWriter {
 /// Runs only while geometry is moving. Hit testing and drawing use the same presentation values.
 final class ChartMotion {
     static let duration: TimeInterval = 0.22
+    static let timingFunction = CAMediaTimingFunction(controlPoints: 1/3, 1, 2/3, 1)
+    static func easeOut(_ time: Double) -> Double {
+        let remaining = 1 - time
+        return 1 - remaining * remaining * remaining
+    }
     private var timer: Timer?
     private(set) var fraction: CGFloat = 1
     func stop() { timer?.invalidate(); timer = nil; fraction = 1 }
@@ -91,7 +96,7 @@ final class ChartMotion {
         let clock = Timer(timeInterval: 1 / 60, repeats: true) { [weak self] timer in
             guard let self else { timer.invalidate(); return }
             let time = min(1, (CACurrentMediaTime() - start) / Self.duration)
-            self.fraction = 1 - pow(1 - time, 3)
+            self.fraction = Self.easeOut(time)
             if time == 1 { self.stop() }
             update()
         }

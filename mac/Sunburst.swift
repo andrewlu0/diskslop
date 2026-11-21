@@ -133,7 +133,8 @@ final class Sunburst: NSView {
     private weak var focusColors: MapBreakdown?
     private var ringColors: MapBreakdown?
     private var ringList: FolderListing?
-    private var zoomRenderer: SunburstZoomRenderer?
+    private var zoomRenderer: ChartRenderer?
+    private var trashTransition: ChartReflow?
     private var zoomView: SunburstZoomView?
     private struct Departure {
         let source: FolderListing, target: FolderListing, rings: Rings, texture: MTLTexture?
@@ -172,7 +173,7 @@ final class Sunburst: NSView {
         super.init(frame: frame)
         wantsLayer = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let renderer = SunburstZoomRenderer()
+            let renderer = ChartRenderer.shared
             DispatchQueue.main.async { [weak self] in self?.zoomRenderer = renderer }
         }
         overlay.frame = bounds; overlay.autoresizingMask = [.width, .height]; overlay.map = self; addSubview(overlay)
@@ -184,10 +185,10 @@ final class Sunburst: NSView {
         setAccessibilityHelp("Select a wedge to reveal its item in the folder list. Double-click a folder to explore it.")
     }
     required init?(coder: NSCoder) { nil }
-    private func snapshot(using renderer: SunburstZoomRenderer) -> MTLTexture? {
+    private func snapshot(using renderer: ChartRenderer) -> MTLTexture? {
         let frame = chartFrame
         let side = min(2048, max(1, Int(ceil(frame.width * (window?.backingScaleFactor ?? 1)))))
-        return renderer.snapshot(side: side) { context in
+        return renderer.snapshot(width: side, height: side) { context in
             let scale = CGFloat(side) / frame.width
             context.scaleBy(x: scale, y: scale)
             context.translateBy(x: -frame.minX, y: -frame.minY)
@@ -201,6 +202,7 @@ final class Sunburst: NSView {
         }
     }
     func prepareZoom(to target: FolderListing) {
+        endTrashReflow()
         departure = nil
         guard let source = ringList, source.model === target.model, source.folder != target.folder,
               !isHiddenOrHasHiddenAncestor, window?.isVisible == true, radius > hub,
@@ -238,7 +240,7 @@ final class Sunburst: NSView {
         guard let (level, wedge) = entering ?? anchor(in: result, folder: trip.source.folder),
               Float(wedge.end) > Float(wedge.start), let zoomRenderer, let previous = trip.texture,
               let image = snapshot(using: zoomRenderer) else {
-            let fade = CATransition(); fade.type = .fade; fade.duration = 0.16
+            let fade = CATransition(); fade.type = .fade; fade.duration = 0.16; fade.timingFunction = ChartMotion.timingFunction
             layer?.add(fade, forKey: "folderChange")
             return
         }
@@ -255,6 +257,7 @@ final class Sunburst: NSView {
     func show(_ next: FolderListing?, colors nextColors: MapBreakdown?, keepingLayout: Bool = false) {
         guard list !== next || colors !== nextColors else { return }
         let same = list === next
+        endTrashReflow()
         motion.stop()
         list = next; colors = nextColors
         if !same {
@@ -267,14 +270,55 @@ final class Sunburst: NSView {
         }
         rebuild()
     }
-    func showLive(_ next: FolderListing, colors: MapBreakdown?, layout: Rings, sameFolder: Bool) {
+    private func endTrashReflow() {
+        guard let view = trashTransition else { return }
+        view.cancel(); trashTransition = nil; needsDisplay = true; overlay.needsDisplay = true
+    }
+    private func animateTrash(from previous: Rings, to layout: Rings) -> Bool {
+        guard !layout.bands.isEmpty, let zoomRenderer, window?.isVisible == true else { return false }
+        let hubRatio = Float(hub / radius)
+        func radiusAt(_ stop: CGFloat) -> Float { hubRatio + (1 - hubRatio) * Float(stop) }
+        var patches = [ChartPatch]()
+        for (level, band) in layout.bands.enumerated() {
+            let oldBand = level < previous.bands.count ? previous.bands[level] : []
+            let old = Dictionary(uniqueKeysWithValues: oldBand.map { ($0.item.key, $0) })
+            let inside = radiusAt(layout.stops[level]), outside = radiusAt(layout.stops[level + 1])
+            let oldInside = radiusAt(previous.stops[min(level, previous.stops.count - 1)])
+            let oldOutside = radiusAt(previous.stops[min(level + 1, previous.stops.count - 1)])
+            var cursor: Float = 0
+            for sector in band {
+                let to = SIMD4(Float(sector.start), inside, Float(sector.end), outside)
+                let prior = old[sector.item.key]
+                let from = SIMD4(prior.map { Float($0.start) } ?? cursor, oldInside,
+                    prior.map { Float($0.end) } ?? cursor, oldOutside)
+                cursor = from.z
+                patches.append(ChartPatch(from: from, to: to))
+            }
+        }
+        guard patches.contains(where: { $0.from != $0.to }) else { return true }
+        let hubBox = SIMD4<Float>(0, 0, 1, hubRatio)
+        patches.append(ChartPatch(from: hubBox, to: hubBox))
+        guard let texture = snapshot(using: zoomRenderer),
+              let view = ChartReflow(frame: chartFrame, renderer: zoomRenderer, texture: texture, patches: patches, radial: true) else { return false }
+        trashTransition = view; addSubview(view)
+        view.completed = { [weak self] in self?.endTrashReflow(); self?.refreshHover() }
+        view.start()
+        return true
+    }
+    func showLive(_ next: FolderListing, colors: MapBreakdown?, layout: Rings, sameFolder: Bool, afterTrash: Bool = false) {
+        endTrashReflow()
+        if afterTrash { departure = nil; endZoom() }
         task?.cancel(); task = nil; motion.stop(); discardTrashBacking()
         list = next; self.colors = colors; lastRadius = radius
         let previous = rings
         install(layout, for: next, colors: colors, sameFolder: sameFolder)
         setAccessibilityValue("\(layout.bands.count) rings · \(formatBytes(next.summary.bytes))")
         if sameFolder, zoomView == nil, let previous, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            if layout.bands.reduce(0, { $0 + $1.count }) <= 256 {
+            if afterTrash && animateTrash(from: previous, to: layout) {
+                refreshHover()
+                return
+            }
+            if afterTrash || layout.bands.reduce(0, { $0 + $1.count }) <= 256 {
                 if let start = layout.starting(at: previous) {
                     motion.start { [weak self] in
                         guard let self else { return }
@@ -284,7 +328,7 @@ final class Sunburst: NSView {
                     }
                 }
             } else {
-                let fade = CATransition(); fade.type = .fade; fade.duration = 0.16
+                let fade = CATransition(); fade.type = .fade; fade.duration = 0.16; fade.timingFunction = ChartMotion.timingFunction
                 layer?.add(fade, forKey: "liveReflow")
             }
         }
@@ -298,12 +342,14 @@ final class Sunburst: NSView {
     }
     override func layout() {
         super.layout()
+        if let view = trashTransition, view.frame != chartFrame { endTrashReflow() }
         if let zoomView, zoomView.frame != chartFrame { endZoom() }
         if abs(radius - lastRadius) > 2 { departure = nil; discardTrashBacking(); rebuild() }
     }
-    override func viewDidChangeBackingProperties() { super.viewDidChangeBackingProperties(); departure = nil; endZoom(); rebuild() }
+    override func viewDidHide() { super.viewDidHide(); endTrashReflow(); endZoom() }
+    override func viewDidChangeBackingProperties() { super.viewDidChangeBackingProperties(); departure = nil; endTrashReflow(); endZoom(); rebuild() }
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); appearanceChanged() }
-    @objc private func appearanceChanged() { departure = nil; endZoom() }
+    @objc private func appearanceChanged() { endTrashReflow(); departure = nil; endZoom() }
     private func rebuild() {
         motion.stop()
         task?.cancel()
@@ -340,7 +386,7 @@ final class Sunburst: NSView {
         return path
     }
     override func draw(_ dirtyRect: NSRect) {
-        guard zoomView == nil, let context = NSGraphicsContext.current?.cgContext else { return }
+        guard trashTransition == nil, zoomView == nil, let context = NSGraphicsContext.current?.cgContext else { return }
         drawChart(in: context)
     }
     private func drawChart(in context: CGContext) {
@@ -411,7 +457,7 @@ final class Sunburst: NSView {
         (formatBytes(list.summary.bytes) as NSString).draw(in: textRect.offsetBy(dx: 0, dy: -18), withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: style])
     }
     fileprivate func drawSelection() {
-        guard zoomView == nil, let context = NSGraphicsContext.current?.cgContext else { return }
+        guard trashTransition == nil, zoomView == nil, let context = NSGraphicsContext.current?.cgContext else { return }
         drawSelection(in: context)
     }
     private func drawSelection(in context: CGContext) {
@@ -445,6 +491,7 @@ final class Sunburst: NSView {
         for (i, band) in rings.bands.enumerated() {
             for sector in band where selection.contains(sector.item.key) { selected.addPath(path(sector, i, through: sector.lastRing)) }
         }
+        guard !selected.isEmpty else { return }
         let chart = CGMutablePath()
         for r in [hub, radius] { chart.addEllipse(in: CGRect(x: center.x-r, y: center.y-r, width: 2*r, height: 2*r)) }
         shadeUnselected(in: context, chart: chart, selected: selected)
@@ -491,6 +538,10 @@ final class Sunburst: NSView {
         var angle = (.pi / 2 - atan2(dy, dx)) / (2 * .pi)
         if angle < 0 { angle += 1 }
         var depth = (distance - hub) / (radius - hub)
+        if let view = trashTransition {
+            guard let mapped = view.destination(x: angle, y: distance / radius) else { return nil }
+            angle = mapped.x; depth = (mapped.y * radius - hub) / (radius - hub)
+        }
         if let zoomView {
             guard let mapped = zoomView.destination(angle: angle, depth: depth) else { return nil }
             (angle, depth) = mapped

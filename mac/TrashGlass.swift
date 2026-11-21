@@ -131,6 +131,7 @@ final class TrashGlass {
                 rim.opacity = 0
                 let pulse = CAKeyframeAnimation(keyPath: "opacity")
                 pulse.keyTimes = [0, 0.28, 1]; pulse.values = reduced ? [0.8, 0.55, 0] : [0.87, 0.96, 0]
+                pulse.timingFunction = ChartMotion.timingFunction
                 pulse.duration = reduced ? 0.24 : 0.31
                 stage.addSublayer(rim); rim.add(pulse, forKey: "glow")
             }
