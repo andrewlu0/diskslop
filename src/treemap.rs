@@ -800,6 +800,33 @@ extern "C" fn dt_map_render_groups(
     shine: bool,
     groups: Option<&Groups>,
 ) -> *mut Frame {
+    dt_map_render_focused(
+        s,
+        port,
+        width,
+        height,
+        scale,
+        palette,
+        color_count,
+        shine,
+        groups,
+        NONE,
+    )
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn dt_map_render_focused(
+    s: &Scene,
+    port: Rect,
+    width: u32,
+    height: u32,
+    scale: f64,
+    palette: *const GlassTint,
+    color_count: usize,
+    shine: bool,
+    groups: Option<&Groups>,
+    focus: u32,
+) -> *mut Frame {
     let (w, h) = (width as usize, height as usize);
     if w == 0 || h == 0 || w.saturating_mul(h) > 40_000_000 || port.w <= 0.0 || port.h <= 0.0 {
         return std::ptr::null_mut();
@@ -839,9 +866,28 @@ extern "C" fn dt_map_render_groups(
             if x0 >= x1 || y0 >= y1 {
                 return false;
             }
-            let tint = match groups {
-                Some(g) => &colors[g.color(key) as usize % color_count],
-                None => colors.get(kind as usize).unwrap_or(&colors[0]),
+            let (group, tint) = match groups {
+                Some(g) => {
+                    let (id, color) = g.group_color(key);
+                    (id, &colors[color as usize % color_count])
+                }
+                None => (kind, colors.get(kind as usize).unwrap_or(&colors[0])),
+            };
+            let dim = focus != NONE && group != focus;
+            let shade = |color: u32| {
+                if dim {
+                    let [r, g, b, a] = color.to_le_bytes();
+                    let reduce = |v: u8| v - v / 4;
+                    u32::from_le_bytes([reduce(r), reduce(g), reduce(b), a])
+                } else {
+                    color
+                }
+            };
+            let outline = group == focus && focus != NONE && dw.min(dh) >= 5.0 * scale;
+            let ink = if tint.light_ink {
+                0xfff0f0f0
+            } else {
+                0xff343434
             };
             let graded = shine && dw >= 2.0 && dh >= 3.0;
             let small_glint = shine && dw >= 2.0 && dh >= 2.0 && !graded;
@@ -865,12 +911,24 @@ extern "C" fn dt_map_render_groups(
                     tint.surface[64]
                 };
                 let line = &mut pixels[row * w + x0..row * w + x1];
-                line.fill(color);
-                if right_divider {
-                    *line.last_mut().unwrap() = tint.seam;
+                if outline && ((row == y0 && y >= -0.49) || (row + 1 == y1 && bottom <= h as f64)) {
+                    line.fill(ink);
+                } else {
+                    line.fill(shade(color));
+                    if right_divider {
+                        *line.last_mut().unwrap() = shade(tint.seam);
+                    }
+                    if outline {
+                        if x >= -0.49 {
+                            line[0] = ink;
+                        }
+                        if (x + dw).round() <= w as f64 {
+                            *line.last_mut().unwrap() = ink;
+                        }
+                    }
                 }
             }
-            if (x1 - x0) as f64 >= 44.0 * scale && (y1 - y0) as f64 >= 21.0 * scale {
+            if !dim && (x1 - x0) as f64 >= 44.0 * scale && (y1 - y0) as f64 >= 21.0 * scale {
                 labels.push((
                     (x1 - x0) * (y1 - y0),
                     Label {

@@ -91,10 +91,11 @@ final class FileMap: @unchecked Sendable {
         }
         return tiles
     }
-    func render(viewport: CGRect, width: Int, height: Int, scale: CGFloat, dark: Bool = true, shine: Bool = true, coloring: MapBreakdown? = nil) -> RenderedFiles? {
+    func render(viewport: CGRect, width: Int, height: Int, scale: CGFloat, dark: Bool = true, shine: Bool = true, coloring: MapBreakdown? = nil, focus: LegendFocus? = nil) -> RenderedFiles? {
         let palette = coloring?.palette(dark: dark) ?? FileKindCatalog.shared.palette(dark:dark)
         let frame = palette.withUnsafeBufferPointer {
-            dt_map_render_groups(handle, DTRect(viewport), UInt32(width), UInt32(height), scale, $0.baseAddress, $0.count, shine, coloring?.handle)
+            dt_map_render_focused(handle, DTRect(viewport), UInt32(width), UInt32(height), scale, $0.baseAddress, $0.count,
+                shine, coloring?.handle, focus?.resolve(in: coloring) ?? .max)
         }
         guard let frame else { return nil }
         var count = 0

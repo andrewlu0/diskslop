@@ -75,6 +75,10 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private let picker = NSPopUpButton()
     private let activity = NSProgressIndicator()
     var modeChanged: ((MapColorMode) -> Void)?
+    var focusChanged: ((LegendFocus?, UInt32?, MapBreakdown?) -> Void)?
+    private(set) var focus: LegendFocus?
+    private var focusedID: UInt32?
+    private var updatingSelection = false
     private let table = NSTableView()
     private lazy var scroll = FittingTableScrollView(table, preferencesName: "Legend", flexibleColumn: "kind")
     private let numberFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
@@ -123,6 +127,7 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
         table.intercellSpacing = .init(width: 2, height: 0)
         table.backgroundColor = .clear
         table.allowsEmptySelection = true
+        table.setAccessibilityHelp("Select a row to highlight matching regions in the map. Press Escape to clear.")
         table.allowsColumnReordering = false
         table.usesAutomaticRowHeights = false
         table.delegate = self
@@ -201,6 +206,7 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
         sortQueue.cancelAllOperations()
         if groups != nil { setHeader(.kind) }
         sortRequest += 1
+        if let focus, focus.mode != .kind { clearFocus() }
         groups = nil; order = nil; visibleGroups.removeAll()
         followed = nil
         rows = kinds
@@ -217,11 +223,14 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
         sortQueue.cancelAllOperations()
         sortRequest += 1
         let sameMode = groups?.mode == breakdown.mode
+        if let focus, focus.mode != breakdown.mode { clearFocus() }
+        if groups !== breakdown { focusedID = nil }
         groups = breakdown; order = sorted ?? breakdown.defaultOrder
         visibleGroups.removeAll(); rows.removeAll(); indices.removeAll(); followed = nil
         if !preservingSort || !sameMode { setHeader(breakdown.mode) }
         fitNumbers(byteWidth: TableTextCell.sizeColumnMinimum, largestCount: formatCount(breakdown.maximumCount))
-        table.reloadData()
+        syncTableSelection(reload: true)
+        restoreFocus(in: breakdown)
         if sorted == nil && sort != (breakdown.mode.ordered ? "kind" : "bytes", breakdown.mode.ordered) { orderRows() }
         if !preservingSort && breakdown.count > 0 { table.scrollRowToVisible(0) }
     }
@@ -253,6 +262,7 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
                     table.highlight("files", row: i, previous: before?.files, current: item.files)
                 }
             }
+            restoreKindFocus()
             if let largest = kinds.max(by: { $0.files < $1.files }) {
                 fitNumbers(byteWidth: TableTextCell.sizeColumnMinimum, largestCount: largest.formattedFiles)
             }
@@ -303,7 +313,7 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
                 let sorted = MapGroupOrder(groups.handle, key: key, ascending: ascending)
                 DispatchQueue.main.async {
                     guard self.sortRequest == ticket, self.groups === groups else { return }
-                    self.order = sorted; self.table.reloadData()
+                    self.order = sorted; self.syncTableSelection(reload: true)
                     if let id = self.followed, let i = sorted.row(for: id) { self.table.scrollRowToVisible(i) }
                 }
             }
@@ -320,7 +330,8 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
     private func reloadRows() {
         indices = Dictionary(uniqueKeysWithValues: rows.enumerated().map { ($1.kind.id, $0) })
-        table.reloadData()
+        syncTableSelection(reload: true)
+        restoreKindFocus()
         if let followed, let i = indices[followed] { table.scrollRowToVisible(i) }
     }
     func highlight(_ kind: UInt32?) {
@@ -332,7 +343,7 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
             (table.rowView(atRow: i, makeIfNecessary: false) as? LegendRow)?.followed = false
         }
         if let next, let i = index(of: next) {
-            if !table.rows(in: table.visibleRect).contains(i) { table.scrollRowToVisible(i) }
+            if focus == nil && !table.rows(in: table.visibleRect).contains(i) { table.scrollRowToVisible(i) }
             (table.rowView(atRow: i, makeIfNecessary: false) as? LegendRow)?.followed = true
         }
     }
@@ -348,7 +359,53 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
         return item
     }
     func numberOfRows(in tableView: NSTableView) -> Int { groups?.count ?? rows.count }
-    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { false }
+    private func syncTableSelection(reload: Bool = false) {
+        updatingSelection = true
+        defer { updatingSelection = false }
+        if reload { table.reloadData() }
+        let row = focusedID.flatMap(index(of:)) ?? -1
+        guard row != table.selectedRow else { return }
+        if row < 0 { table.deselectAll(nil) }
+        else { table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
+    }
+    private func setFocus(_ next: LegendFocus?, id: UInt32?) {
+        focus = next; focusedID = id
+        syncTableSelection()
+        focusChanged?(next, id, groups)
+    }
+    func clearFocus() {
+        if focus != nil { setFocus(nil, id: nil) }
+    }
+    var focusedUsage: KindUsage? {
+        focusedID.flatMap(index(of:)).flatMap(usage(at:))
+    }
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard !updatingSelection else { return }
+        let row = table.selectedRow
+        guard row >= 0, let id = id(at: row) else { clearFocus(); return }
+        let next = groups?.focus(for: id) ?? LegendFocus(mode: .kind, id: id)
+        setFocus(next, id: id)
+    }
+    private func restoreKindFocus() {
+        guard let focus, focus.mode == .kind else { return }
+        if indices[focus.id] == nil { clearFocus() }
+        else { setFocus(focus, id: focus.id) }
+    }
+    private func restoreFocus(in breakdown: MapBreakdown) {
+        guard let focus else { return }
+        if breakdown.focus(for: focus.id) == focus {
+            setFocus(focus, id: focus.id)
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let id = focus.resolve(in: breakdown)
+            DispatchQueue.main.async {
+                guard self.focus == focus, self.groups === breakdown else { return }
+                guard let id, let next = breakdown.focus(for: id) else { self.clearFocus(); return }
+                self.setFocus(next, id: id)
+            }
+        }
+    }
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
         guard !settingSort, let descriptor = tableView.sortDescriptors.first, let key = descriptor.key else { return }
         UserDefaults.standard.set(["key": key, "ascending": descriptor.ascending], forKey: sortPreferenceKey(groups?.mode ?? .kind))

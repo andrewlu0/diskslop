@@ -50,6 +50,8 @@ const DTKey *dt_selection_keys(const DTSelection *, size_t *count);
 void dt_selection_free(DTSelection *);
 DTFrame *dt_map_render(const DTScene *, DTRect viewport, uint32_t width, uint32_t height, double scale, const DTGlassTint *colors, size_t colorCount, bool shine);
 DTFrame *dt_map_render_groups(const DTScene *, DTRect viewport, uint32_t width, uint32_t height, double scale, const DTGlassTint *colors, size_t colorCount, bool shine, const DTGroups *);
+DTFrame *dt_map_render_focused(const DTScene *, DTRect viewport, uint32_t width, uint32_t height, double scale, const DTGlassTint *colors, size_t colorCount, bool shine, const DTGroups *, uint32_t selectedGroup);
+uint32_t dt_group_find(const DTGroups *, uint32_t hint, uint32_t tag, uint32_t color, const uint8_t *label, size_t length);
 DTGroups *dt_groups_new(const DTModel *, uint32_t root, uint8_t mode, int64_t as_of, const DTProgress *);
 void dt_groups_free(DTGroups *);
 size_t dt_groups_count(const DTGroups *);

@@ -266,7 +266,8 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         case #selector(trash):
             menuItem.title = tree.view.numberOfSelectedRows > 1 ? "Move to Trash…" : "Move to Trash"
             return hasSelection && !tree.isSelected(DiskItem.scanRootKey)
-        case #selector(copy(_:)), #selector(deselectAll), #selector(reveal),
+        case #selector(deselectAll): return hasSelection || legend.focus != nil
+        case #selector(copy(_:)), #selector(reveal),
              #selector(openSelection), #selector(refreshSelection), #selector(fitSelection):
             return hasSelection
         case #selector(selectAll(_:)): return (listing?.summary.entries ?? 0) > 0
@@ -288,12 +289,16 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     @objc private func deselectAll() { _ = clearSelection() }
     private func clearSelection() -> Bool {
         guard browserIsKey, !busy || scanning != nil,
-              hasSelection || tree.view.numberOfSelectedRows > 0 || (showingLargest && pendingRankSelection?.isEmpty == false) else { return false }
+              legend.focus != nil || hasSelection || tree.view.numberOfSelectedRows > 0 || (showingLargest && pendingRankSelection?.isEmpty == false) else { return false }
+        legend.clearFocus()
+        clearFileSelection()
+        return true
+    }
+    private func clearFileSelection() {
         pendingParentFile = nil
         pendingRankSelection = rankingWork == nil ? nil : []
         if largest.table.numberOfSelectedRows > 0 { largest.table.deselectAll(nil) }
         if tree.view.numberOfSelectedRows > 0 { tree.selectSaved([], lead: nil) }
-        return true
     }
     @objc func copy(_ sender: Any?) { copySelection(pathsOnly: false) }
     @objc private func copyPaths() { copySelection(pathsOnly: true) }
@@ -390,6 +395,13 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         pathLabel.setAccessibilityLabel("Path")
         map.hovered = { [weak self] url, kind in self?.showHover(url, kind: kind) }
         legend.choosing(colorMode, loading: false)
+        legend.focusChanged = { [weak self] focus, group, colors in
+            guard let self else { return }
+            if focus != nil, self.map.legendFocus == nil { self.clearFileSelection() }
+            self.map.legendFocus = focus
+            self.sunburst.highlight(group: group, colors: colors)
+            if self.shelf != nil { self.controls() }
+        }
         legend.modeChanged = { [weak self] mode in self?.selectColorMode(mode) }
         map.coloringDidDisplay = { [weak self] colors in
             guard let self, let list = self.listing else { return }
@@ -419,6 +431,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             guard let self, self.shelf != nil, !self.publishingLive else { return }
             if self.scanWorkspace != nil, !self.applyingNavigation { self.browsedDuringScan = true }
             self.map.selection = self.tree.selectedKeys()
+            if !self.map.selection.isEmpty { self.legend.clearFocus() }
             self.sunburst.selection = self.map.selection
             self.window.selectionDidChange { self.selectedURLs() }
             if !self.tree.view.trackingSelection { self.recordVisit() }
@@ -623,6 +636,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         }
     }
     private func rankedSelectionChanged() {
+        if largest.table.numberOfSelectedRows > 0 { legend.clearFocus() }
         if scanWorkspace != nil, pendingParentFile != largest.singleSelection?.url { pendingParentFile = nil }
         syncRankedSelection()
         if let selected = largest.selected.first { showHover(selected.url, kind: rankedColorGroup(selected)) }
@@ -658,6 +672,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
 
     private func clearWorkspace() {
+        legend.clearFocus()
         if let work = colorWork { dt_cancel(work.handle); colorWork = nil }
         rankingWork = nil; rankedScope = nil; pendingRankSelection = nil
         model = nil; listing = nil; locations = []; recentColors.removeAll()
@@ -785,6 +800,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
     private func selectColorMode(_ mode: MapColorMode) {
         guard mode != colorMode else { return }
+        legend.clearFocus()
         colorMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: "DiskSlopColorMode")
         if let listing { updateColors(for: listing) }
@@ -850,7 +866,9 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         for b in welcome.actions { b.isEnabled = !busy }
         let count = showingLargest ? largest.table.numberOfSelectedRows : tree.view.numberOfSelectedRows
         shelf.isHidden = model == nil && scanWorkspace == nil
-        if showingLargest && count == 1, let file = largest.selected.first { selectionLabel.stringValue = "\(file.url.lastPathComponent)  ·  \(formatBytes(file.bytes))" }
+        if let group = legend.focusedUsage {
+            selectionLabel.stringValue = "\(group.kind.title)  ·  \(group.formattedFiles) \(group.files == 1 ? "file" : "files")  ·  \(group.formattedSize)"
+        } else if showingLargest && count == 1, let file = largest.selected.first { selectionLabel.stringValue = "\(file.url.lastPathComponent)  ·  \(formatBytes(file.bytes))" }
         else if count == 1, let item = tree.firstSelected { selectionLabel.stringValue = "\(item.title)  ·  \(formatBytes(item.bytes))" }
         else { selectionLabel.stringValue = count > 1 ? "\(count.formatted()) selected" : "" }
         revealButton.isEnabled = (!busy || scanWorkspace != nil) && count > 0
@@ -1000,6 +1018,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         }
         updates.finish(progress)
         publishingLive = true; applyingNavigation = true
+        if !sameFolder { legend.clearFocus() }
         if let work = colorWork { dt_cancel(work.handle); colorWork = nil }
         recentColors = next.colors.map { $0.memoryBytes <= 64 * 1024 * 1024 ? [$0] : [] } ?? []
         rankingWork = nil; pendingRankSelection = nil
@@ -1268,6 +1287,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         applyingNavigation = true
         defer { applyingNavigation = previous }
         let sameFolder = listing?.folder == list.folder && listing?.model === list.model
+        if !sameFolder && !continuingScan { legend.clearFocus() }
         if listing !== list { recentColors.removeAll() }
         listing = list
         if continuingScan { tree.showLive(list.model, keys: Array(tree.selectedKeys()), lead: tree.leadKey) }

@@ -141,6 +141,17 @@ final class MapGroupOrder: @unchecked Sendable {
     deinit { dt_order_free(handle) }
 }
 
+struct LegendFocus: Equatable {
+    let mode: MapColorMode, id: UInt32
+    var tag: UInt32 = 0, color: UInt32 = 0, name = Data()
+
+    func resolve(in colors: MapBreakdown?) -> UInt32? {
+        if mode == .kind { return colors == nil ? id : nil }
+        guard let colors, colors.mode == mode else { return nil }
+        return colors.resolve(self)
+    }
+}
+
 final class MapBreakdown: @unchecked Sendable {
     let handle: OpaquePointer, mode: MapColorMode, defaultOrder: MapGroupOrder
     let count: Int, memoryBytes: Int, maximumCount: UInt64
@@ -152,6 +163,23 @@ final class MapBreakdown: @unchecked Sendable {
         maximumCount = dt_groups_max_files(result)
         defaultOrder = MapGroupOrder(result, key: mode.ordered ? "kind" : "bytes", ascending: mode.ordered)
         memoryBytes = dt_groups_memory(result) + count * 2 * MemoryLayout<UInt32>.size
+    }
+    private let focusLock = NSLock()
+    private var lastFocus: (key: LegendFocus, id: UInt32?)?
+
+    func focus(for id: UInt32) -> LegendFocus? {
+        var info = DTGroupInfo(), length = 0
+        guard let name = dt_group_read(handle, id, &info, &length) else { return nil }
+        return LegendFocus(mode: mode, id: id, tag: info.tag, color: info.color, name: Data(bytes: name, count: length))
+    }
+    fileprivate func resolve(_ focus: LegendFocus) -> UInt32? {
+        if let cached = focusLock.withLock({ lastFocus }), cached.key == focus { return cached.id }
+        let id = focus.name.withUnsafeBytes {
+            dt_group_find(handle, focus.id, focus.tag, focus.color, $0.bindMemory(to: UInt8.self).baseAddress, $0.count)
+        }
+        let resolved: UInt32? = id == .max ? nil : id
+        focusLock.withLock { lastFocus = (focus, resolved) }
+        return resolved
     }
     func usage(_ id: UInt32) -> KindUsage? {
         var info = DTGroupInfo(), length = 0

@@ -206,9 +206,9 @@ impl Groups {
                 .filter(|&id| id != NONE),
         }
     }
-    pub(super) fn color(&self, key: Key) -> u32 {
+    pub(super) fn group_color(&self, key: Key) -> (u32, u32) {
         self.group(key)
-            .map_or(0, |g| self.rows[g as usize].info.color)
+            .map_or((NONE, 0), |id| (id, self.rows[id as usize].info.color))
     }
     fn build(
         scan: &Inventory,
@@ -388,6 +388,27 @@ extern "C" fn dt_groups_memory(g: &Groups) -> usize {
 #[unsafe(no_mangle)]
 extern "C" fn dt_group_at(g: &Groups, key: Key) -> u32 {
     g.group(key).unwrap_or(NONE)
+}
+#[unsafe(no_mangle)]
+unsafe extern "C" fn dt_group_find(
+    g: &Groups,
+    hint: u32,
+    tag: u32,
+    color: u32,
+    label: *const u8,
+    length: usize,
+) -> u32 {
+    let name = if length == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(label, length) }
+    };
+    let matches =
+        |row: &Row| row.info.tag == tag && row.info.color == color && g.label(row) == name;
+    if g.rows.get(hint as usize).is_some_and(matches) {
+        return hint;
+    }
+    g.rows.iter().position(matches).map_or(NONE, |id| id as u32)
 }
 #[unsafe(no_mangle)]
 extern "C" fn dt_group_directory(g: &Groups, dir: u32) -> u32 {

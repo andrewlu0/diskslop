@@ -10,17 +10,18 @@ private final class MapOverlay: FlippedCanvas {
 
 struct MapRenderSettings: Equatable {
     let viewport: CGRect, width: Int, height: Int, scale: CGFloat, dark: Bool, shine: Bool
+    var focus: LegendFocus?
     static let whole = CGRect(x: 0, y: 0, width: 1, height: 1)
 
     func overview(_ geometry: FileMap, colors: MapBreakdown?) -> CGImage? {
         let ratio = min(1, 1024 / CGFloat(max(width, height)))
         return geometry.render(viewport: Self.whole, width: max(1, Int(CGFloat(width) * ratio)),
             height: max(1, Int(CGFloat(height) * ratio)), scale: scale * ratio,
-            dark: dark, shine: shine, coloring: colors)?.image
+            dark: dark, shine: shine, coloring: colors, focus: focus)?.image
     }
 
     func render(_ geometry: FileMap, colors: MapBreakdown?) -> RenderedFiles? {
-        geometry.render(viewport: viewport, width: width, height: height, scale: scale, dark: dark, shine: shine, coloring: colors)
+        geometry.render(viewport: viewport, width: width, height: height, scale: scale, dark: dark, shine: shine, coloring: colors, focus: focus)
     }
 }
 
@@ -66,6 +67,12 @@ final class Treemap: NSView, NSViewToolTipOwner {
     var hovered: ((URL?, UInt32?) -> Void)?
     var coloringDidDisplay: ((MapBreakdown?) -> Void)?
     private(set) var displayedColors: MapBreakdown?
+    var legendFocus: LegendFocus? {
+        didSet {
+            guard legendFocus != oldValue else { return }
+            endMotion(); overviewIsCurrent = false; revision += 1; scheduleFrame()
+        }
+    }
     private var requestedColors: MapBreakdown?
     private var geometry: FileMap?
     private var rendered: RenderedFiles?
@@ -240,7 +247,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
         let scale = min(window?.backingScaleFactor ?? 2, sqrt(24_000_000 / (bounds.width * bounds.height)))
         return MapRenderSettings(viewport: viewport, width: max(1, Int((bounds.width * scale).rounded())),
             height: max(1, Int((bounds.height * scale).rounded())), scale: scale, dark: effectiveAppearance.usesDarkColors,
-            shine: !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency)
+            shine: !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency, focus: legendFocus)
     }
 
     func showLive(_ list: FolderListing, ancestors: Set<UInt64>, colors: MapBreakdown?,
@@ -261,8 +268,9 @@ final class Treemap: NSView, NSViewToolTipOwner {
                 animateTiles(frame.moves, over: prior)
             }
         } else {
-            if let frame { overview = frame.overview }
-            rendered = isHidden ? nil : frame?.raster ?? (sameFolder ? prior : nil)
+            let compatible = settings?.focus == legendFocus ? frame : nil
+            if let compatible { overview = compatible.overview }
+            rendered = isHidden ? nil : compatible?.raster ?? (sameFolder ? prior : nil)
             scheduleFrame()
         }
         updateSelection(); updateHover(force: true)
@@ -367,7 +375,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
                 (needsOverview ? settings.overview(current, colors: colors) : nil)
             DispatchQueue.main.async {
                 self.drawing = false
-                if !self.isHidden, self.geometry === current, self.requestedColors === colors, self.effectiveAppearance.usesDarkColors == dark, self.renderSettings?.shine == settings.shine, let frame {
+                if !self.isHidden, self.geometry === current, self.requestedColors === colors, self.effectiveAppearance.usesDarkColors == dark, self.renderSettings?.shine == settings.shine, self.legendFocus == settings.focus, let frame {
                     self.rendered = frame
                     if let base { self.overview = base; self.overviewIsCurrent = true }
                     self.discardTrashBacking()

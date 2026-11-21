@@ -128,6 +128,14 @@ final class Sunburst: NSView {
     var up: (() -> Void)?
     var hovered: ((URL?, UInt32?) -> Void)?
     var open: (() -> Void)?
+    private var focusedGroup: UInt32?
+    private weak var focusColors: MapBreakdown?
+    private var ringColors: MapBreakdown?
+    func highlight(group: UInt32?, colors: MapBreakdown?) {
+        focusedGroup = group
+        focusColors = colors
+        overlay.needsDisplay = true
+    }
     var selection = Set<UInt64>() { didSet { if oldValue != selection { overlay.needsDisplay = true } } }
     var scopeKeys = Set<UInt64>() { didSet { if oldValue != scopeKeys { overlay.needsDisplay = true } } }
     func containsWedge(for key: UInt64) -> Bool { rings?.bands.contains { $0.contains { $0.item.key == key } } == true }
@@ -167,7 +175,7 @@ final class Sunburst: NSView {
         motion.stop()
         list = next; colors = nextColors
         if !same {
-            if !keepingLayout { rings = nil; discardTrashBacking() }
+            if !keepingLayout { rings = nil; ringColors = nil; discardTrashBacking() }
             hoverKey = nil; toolTip = nil; needsDisplay = true; overlay.needsDisplay = true
         }
         rebuild()
@@ -176,7 +184,7 @@ final class Sunburst: NSView {
         task?.cancel(); task = nil; motion.stop(); discardTrashBacking()
         list = next; self.colors = colors; lastRadius = radius
         let previous = rings
-        rings = layout
+        rings = layout; ringColors = colors
         setAccessibilityValue("\(layout.bands.count) rings · \(formatBytes(next.summary.bytes))")
         if sameFolder, let previous, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
             if layout.bands.reduce(0, { $0 + $1.count }) <= 256 {
@@ -218,7 +226,7 @@ final class Sunburst: NSView {
             DispatchQueue.main.async {
                 guard let self, self.task === work, !work.isCancelled else { return }
                 self.discardTrashBacking()
-                self.rings = result; self.needsDisplay = true; self.overlay.needsDisplay = true
+                self.rings = result; self.ringColors = colors; self.needsDisplay = true; self.overlay.needsDisplay = true
                 self.setAccessibilityValue("\(result.bands.count) rings · \(formatBytes(list.summary.bytes))")
                 if let window = self.window { self.hover(self.convert(window.mouseLocationOutsideOfEventStream, from: nil), force: true) }
             }
@@ -308,7 +316,24 @@ final class Sunburst: NSView {
         (formatBytes(list.summary.bytes) as NSString).draw(in: textRect.offsetBy(dx: 0, dy: -18), withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: style])
     }
     fileprivate func drawSelection() {
-        guard !selection.isEmpty, let rings, let context = NSGraphicsContext.current?.cgContext else { return }
+        guard let rings, let context = NSGraphicsContext.current?.cgContext else { return }
+        if let focusedGroup, focusColors === ringColors {
+            let matches = CGMutablePath(), others = CGMutablePath()
+            for (level, band) in rings.bands.enumerated() {
+                for sector in band {
+                    (sector.group == focusedGroup ? matches : others).addPath(path(sector, level))
+                }
+            }
+            context.addPath(others)
+            context.setFillColor(CGColor(gray: 0, alpha: 0.25))
+            context.fillPath()
+            context.addPath(matches)
+            context.setLineWidth(1 / (window?.backingScaleFactor ?? 2))
+            context.setStrokeColor(NSColor.labelColor.cgColor)
+            context.strokePath()
+            return
+        }
+        guard !selection.isEmpty else { return }
         context.setLineWidth(1 / (window?.backingScaleFactor ?? 2))
         context.setStrokeColor(NSColor.labelColor.cgColor)
         if !selection.isDisjoint(with: scopeKeys) {
