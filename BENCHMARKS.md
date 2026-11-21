@@ -15,7 +15,13 @@ An M4 Pro reopened the same frozen APFS inventory with **3,714,774 file shapes**
 
 The treemap stayed within the 8.33 ms CPU budget for 120 Hz on all 384 measured moves in 0.1.9. Expanding 25,342 children in the native outline still took a median **15–19 ms**, with the first expansion taking **69–86 ms**. Selecting a sunburst folder and starting navigation now schedules the highlighted artwork on a worker. The previous version painted the outgoing chart on the main thread for a median **285–290 ms**.
 
-The display was locked. These measurements cover main-thread work and GPU execution with offscreen drawables. Physical presentation cadence requires an active display. Separate native interaction checks covered zoom reversal, Reduce Motion, selection through 25 folder levels, live refresh, and Trash reflow in both charts.
+The display was locked during these timings. Separate native interaction checks covered zoom reversal, Reduce Motion, selection through 25 folder levels, live refresh, and Trash reflow in both charts.
+
+### Visible frame rate on the 120 Hz display
+
+With the same inventory and the chart window in the foreground, two runs of continuous treemap pan and zoom averaged **108.2 and 109.1 distinct frames per second** in 0.1.9. One comparison run on 0.1.8 averaged **108.1 FPS**. ScreenCaptureKit sampled the chart window at up to 120 Hz. The measurement counted changes in treemap pixels over roughly six seconds per run. Main-thread work fell substantially, while the average visible frame rate in this workload was similar.
+
+During 12 sunburst zoom transitions in 0.1.9, Metal reported **8.33 ms** at both the median and the 95th percentile across 412 intervals between presented frames. Ten intervals exceeded 12.5 ms, and the longest was 50 ms.
 
 ## Opening a document
 
