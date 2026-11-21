@@ -1,11 +1,13 @@
 import AppKit
 
+let selectionDimOpacity: CGFloat = 0.4375
+
 func shadeUnselected(in context: CGContext, chart: CGPath, selected: CGPath) {
     guard !selected.isEmpty else { return }
     context.saveGState()
     context.beginTransparencyLayer(auxiliaryInfo: nil)
     context.addPath(chart)
-    context.setFillColor(CGColor(gray: 0, alpha: 0.12))
+    context.setFillColor(CGColor(gray: 0, alpha: selectionDimOpacity))
     context.drawPath(using: .eoFill)
     context.setBlendMode(.clear)
     context.addPath(selected)

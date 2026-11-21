@@ -877,7 +877,7 @@ extern "C" fn dt_map_render_focused(
             let shade = |color: u32| {
                 if dim {
                     let [r, g, b, a] = color.to_le_bytes();
-                    let reduce = |v: u8| v - v / 4;
+                    let reduce = |v: u8| ((u16::from(v) * 9 + 8) / 16) as u8;
                     u32::from_le_bytes([reduce(r), reduce(g), reduce(b), a])
                 } else {
                     color

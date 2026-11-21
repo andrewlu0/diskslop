@@ -811,7 +811,10 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         map.useColors(map.displayedColors)
         let matches = (map.displayedColors?.mode ?? .kind) == mode
         legend.choosing(mode, loading: !matches)
-        guard !matches else { return }
+        if matches {
+            if usingSunburst { sunburst.show(list, colors: map.displayedColors) }
+            return
+        }
         guard mode != .kind else { map.useColors(nil); return }
         if let i = recentColors.firstIndex(where: { $0.mode == mode }) {
             let cached = recentColors.remove(at: i); recentColors.append(cached)
@@ -825,7 +828,11 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             DispatchQueue.main.async {
                 guard self.colorWork === work, self.listing === list else { return }
                 self.colorWork = nil
-                guard let result else { self.legend.choosing(mode, loading: false); return }
+                guard let result else {
+                    self.legend.choosing(mode, loading: false)
+                    if self.usingSunburst { self.sunburst.show(list, colors: self.map.displayedColors) }
+                    return
+                }
                 if result.memoryBytes <= 64 * 1024 * 1024 {
                     self.recentColors.append(result)
                     while self.recentColors.count > 3 || self.recentColors.reduce(0, { $0 + $1.memoryBytes }) > 64 * 1024 * 1024 {
@@ -1287,7 +1294,10 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         applyingNavigation = true
         defer { applyingNavigation = previous }
         let sameFolder = listing?.folder == list.folder && listing?.model === list.model
-        if !sameFolder && !continuingScan { legend.clearFocus() }
+        if !sameFolder && !continuingScan {
+            if usingSunburst && trashFrame == nil { sunburst.prepareZoom(to: list) }
+            legend.clearFocus()
+        }
         if listing !== list { recentColors.removeAll() }
         listing = list
         if continuingScan { tree.showLive(list.model, keys: Array(tree.selectedKeys()), lead: tree.leadKey) }
@@ -1303,7 +1313,9 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             if continuingScan { map.showLive(list, ancestors: scopeKeys, colors: nil, frame: nil, settings: nil, sameFolder: true) }
             else { map.show(list, ancestors: scopeKeys) }
             sunburst.scopeKeys = scopeKeys
-            if usingSunburst { sunburst.show(list, colors: nil, keepingLayout: continuingScan) }
+            if usingSunburst && (!sunburst.preparingZoom || colorMode == .kind) {
+                sunburst.show(list, colors: nil, keepingLayout: continuingScan)
+            }
             updateColors(for: list)
         }
         if showingLargest { loadLargest(list, keepingRows: continuingScan) }
