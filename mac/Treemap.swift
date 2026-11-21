@@ -8,6 +8,14 @@ private final class MapOverlay: FlippedCanvas {
     override func draw(_ dirtyRect: NSRect) { map?.drawOverlay(dirtyRect) }
 }
 
+private final class MapSelectionOverlay: FlippedCanvas {
+    weak var map: Treemap?
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        map?.drawSelection(in: context)
+    }
+}
+
 struct MapRenderSettings: Equatable {
     let viewport: CGRect, width: Int, height: Int, scale: CGFloat, dark: Bool, shine: Bool
     var focus: LegendFocus?
@@ -34,19 +42,19 @@ struct MovingTile {
 }
 
 struct LiveMapFrame {
-    let raster: RenderedFiles, moves: [MovingTile], changed: Bool, priorImage: CGImage?
+    let raster: RenderedFiles, moves: [MovingTile], priorImage: CGImage?
     let overview: CGImage?
     let trashPatches: [ChartPatch]
     init(_ raster: RenderedFiles, geometry: FileMap, settings: MapRenderSettings, colors: MapBreakdown?, source: (FileMap, RenderedFiles)?, afterTrash: Bool = false) {
         self.raster = raster
         overview = raster.viewport == MapRenderSettings.whole ? raster.image : settings.overview(geometry, colors: colors)
         guard let (previous, prior) = source, prior.viewport == raster.viewport else {
-            moves = []; changed = false; priorImage = nil; trashPatches = []; return
+            moves = []; priorImage = nil; trashPatches = []; return
         }
         priorImage = prior.image
         if afterTrash {
             trashPatches = geometry.reflow(from: previous, in: settings)
-            moves = []; changed = !trashPatches.isEmpty
+            moves = []
             return
         }
         trashPatches = []
@@ -63,7 +71,6 @@ struct LiveMapFrame {
             guard let image = raster.image.cropping(to: crop) else { return nil }
             return MovingTile(key: tile.key, from: from, to: to, image: image)
         }
-        changed = !moves.isEmpty || before.keys != after.keys || previous.count != geometry.count
     }
 }
 
@@ -82,12 +89,16 @@ final class Treemap: NSView, NSViewToolTipOwner {
     }
     private var requestedColors: MapBreakdown?
     private var geometry: FileMap?
-    private var rendered: RenderedFiles?
+    private var rendered: RenderedFiles? {
+        didSet { selectionOverlay.needsDisplay = true }
+    }
     private var overview: CGImage?
     private var overviewIsCurrent = false
     private var movingTiles: [MovingTile] = []
     private let motion = ChartMotion()
-    private var trashTransition: ChartReflow?
+    private var trashTransition: ChartReflow? {
+        didSet { selectionOverlay.isHidden = trashTransition != nil }
+    }
     private var renderer: ChartRenderer?
     private let tileSheet = FlippedCanvas()
     var motionSource: (FileMap, RenderedFiles)? {
@@ -99,16 +110,20 @@ final class Treemap: NSView, NSViewToolTipOwner {
     private var reflow: DispatchWorkItem?
     private var lastSize: NSSize = .zero, lastScale: CGFloat = 0
     private static let whole = MapRenderSettings.whole
-    private(set) var viewport = whole
+    private(set) var viewport = whole {
+        didSet { selectionOverlay.needsDisplay = true }
+    }
     var zoom: CGFloat { 1 / viewport.width }
     var aspect: CGFloat { bounds.width > 1 && bounds.height > 1 ? bounds.width / bounds.height : 1.4 }
     private var down: NSPoint?, panOrigin: NSRect?
     private var dragged = false
+    private var firstClickKey: UInt64?
     private var rootKeys = Set<UInt64>()
     private var marked: [CGRect] = []
     private var selectedBounds: CGRect?
     var selection = Set<UInt64>() { didSet { if selection != oldValue { updateSelection() } } }
     private let overlay = MapOverlay()
+    private let selectionOverlay = MapSelectionOverlay()
     private var hoverTracking: NSTrackingArea?
     private var hoverPoint: CGPoint?
     private var hoverKey: UInt64?
@@ -134,6 +149,11 @@ final class Treemap: NSView, NSViewToolTipOwner {
         overlay.map = self
         overlay.frame = bounds; overlay.autoresizingMask = [.width, .height]
         addSubview(overlay)
+        selectionOverlay.map = self
+        selectionOverlay.frame = bounds; selectionOverlay.autoresizingMask = [.width, .height]
+        selectionOverlay.wantsLayer = true
+        selectionOverlay.setAccessibilityElement(false)
+        addSubview(selectionOverlay)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(accessibilityChanged),
             name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
         setAccessibilityElement(true)
@@ -142,7 +162,10 @@ final class Treemap: NSView, NSViewToolTipOwner {
         setAccessibilityHelp("Select a file to reveal its size in the outline. Command-scroll or pinch to zoom.")
     }
     required init?(coder: NSCoder) { nil }
-    @objc private func accessibilityChanged() { overviewIsCurrent = false; endMotion(); revision += 1; scheduleFrame(); overlay.needsDisplay = true }
+    @objc private func accessibilityChanged() {
+        overviewIsCurrent = false; endMotion(); revision += 1; scheduleFrame()
+        overlay.needsDisplay = true; selectionOverlay.needsDisplay = true
+    }
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         accessibilityChanged()
@@ -229,6 +252,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
 
     func clear() {
         reflow?.cancel(); endMotion(); revision += 1
+        firstClickKey = nil
         geometry = nil; rendered = nil; requestedColors = nil; displayedColors = nil
         rootKeys.removeAll(); selection.removeAll(); viewport = Self.whole
         down = nil; panOrigin = nil; overview = nil; overviewIsCurrent = false
@@ -240,6 +264,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
     func show(_ listing: FolderListing, ancestors: Set<UInt64>) {
         reflow?.cancel()
         endMotion()
+        firstClickKey = nil
         geometry = listing.geometry
         requestedColors = nil; displayedColors = nil
         rootKeys = ancestors
@@ -267,6 +292,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
                   frame: LiveMapFrame?, settings: MapRenderSettings?, sameFolder: Bool) {
         reflow?.cancel(); endMotion()
         let prior = rendered
+        if geometry?.model !== list.model || geometry?.folder != list.folder { firstClickKey = nil }
         geometry = list.geometry; rootKeys = ancestors
         requestedColors = colors; displayedColors = colors
         overviewIsCurrent = false
@@ -276,12 +302,12 @@ final class Treemap: NSView, NSViewToolTipOwner {
             rendered = frame.raster
             overview = frame.overview; overviewIsCurrent = overview != nil
             discardTrashBacking()
-            if sameFolder, frame.changed, let prior, prior.image === frame.priorImage,
+            if sameFolder, let prior, prior.image === frame.priorImage, prior.focus == frame.raster.focus,
                !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
                 if !frame.trashPatches.isEmpty {
                     updateSelection()
                     animateTrash(frame.trashPatches, settings: settings)
-                } else { animateTiles(frame.moves, over: prior) }
+                } else if !frame.moves.isEmpty { animateTiles(frame.moves, over: prior) }
             }
         } else {
             let compatible = settings?.focus == legendFocus ? frame : nil
@@ -305,7 +331,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
             NSGraphicsContext.saveGraphicsState()
             NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
             effectiveAppearance.performAsCurrentDrawingAppearance {
-                draw(bounds); drawOverlay(bounds)
+                draw(bounds); drawOverlay(bounds); drawSelection(in: context)
             }
             NSGraphicsContext.restoreGraphicsState()
         }), let view = ChartReflow(frame: bounds, renderer: renderer, texture: texture, patches: patches, radial: false) else { return }
@@ -336,6 +362,15 @@ final class Treemap: NSView, NSViewToolTipOwner {
             layer.add(animation, forKey: key)
         }
         let back = place(previous.image, in: previous.viewport)
+        let footprint = CGMutablePath()
+        for tile in moves {
+            for rect in [tile.from, tile.to] {
+                footprint.addRect(back.convert(tileSheet.convertToLayer(screen(rect)), from: sheet))
+            }
+        }
+        let mask = CAShapeLayer()
+        mask.frame = back.bounds; mask.path = footprint
+        back.mask = mask
         back.opacity = 0; animate(back, "opacity", from: 1, to: 0)
         for tile in moves {
             let layer = place(tile.image, in: tile.from), position = layer.position, bounds = layer.bounds
@@ -366,6 +401,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
         guard lastSize != bounds.size || scale != lastScale else { return }
         discardTrashBacking()
         endMotion()
+        selectionOverlay.needsDisplay = true
         lastSize = bounds.size; lastScale = scale
         revision += 1
         scheduleFrame()
@@ -407,7 +443,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
             return
         }
         guard !drawing, let current = geometry, let settings = renderSettings else { return }
-        let token = revision, dark = settings.dark
+        let token = revision
         let colors = requestedColors
         let needsOverview = !overviewIsCurrent
         drawing = true
@@ -417,7 +453,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
                 (needsOverview ? settings.overview(current, colors: colors) : nil)
             DispatchQueue.main.async {
                 self.drawing = false
-                if !self.isHidden, self.geometry === current, self.requestedColors === colors, self.effectiveAppearance.usesDarkColors == dark, self.renderSettings?.shine == settings.shine, self.legendFocus == settings.focus, let frame {
+                if !self.isHidden, self.geometry === current, self.requestedColors === colors, self.renderSettings == settings, let frame {
                     self.rendered = frame
                     if let base { self.overview = base; self.overviewIsCurrent = true }
                     self.discardTrashBacking()
@@ -505,10 +541,19 @@ final class Treemap: NSView, NSViewToolTipOwner {
     }
 
     private func updateSelection() {
+        let previous = marked
         if !rootKeys.isDisjoint(with: selection) { marked = [Self.whole] }
         else { marked = selection.compactMap { geometry?.bounds(of: $0) } }
         selectedBounds = marked.reduce(nil as CGRect?) { $0?.union($1) ?? $1 }
-        overlay.needsDisplay = true
+        if previous.count == 1, marked.count == 1, let old = previous.first, let new = marked.first,
+           old != Self.whole, new != Self.whole, old.intersects(viewport), new.intersects(viewport) {
+            for rect in [old, new] {
+                let visible = screen(rect).intersection(bounds)
+                selectionOverlay.setNeedsDisplay(visible.insetBy(dx: -1, dy: -1))
+            }
+        } else {
+            selectionOverlay.needsDisplay = true
+        }
     }
     override func draw(_ dirtyRect: NSRect) {
         NSColor.controlBackgroundColor.setFill(); dirtyRect.fill()
@@ -573,19 +618,27 @@ final class Treemap: NSView, NSViewToolTipOwner {
                     .font: NSFont.monospacedDigitSystemFont(ofSize: large ? 12 : 10, weight: .regular), .foregroundColor: ink, .paragraphStyle: para])
             }
         }
-        if !marked.isEmpty, let cg = NSGraphicsContext.current?.cgContext {
-            cg.saveGState()
-            cg.setShouldAntialias(false)
-            if rootKeys.isDisjoint(with: selection) {
+    }
+    fileprivate func drawSelection(in context: CGContext) {
+        guard !marked.isEmpty, let rendered, rendered.focus == nil else { return }
+        context.saveGState()
+        context.setShouldAntialias(false)
+        if rootKeys.isDisjoint(with: selection) {
+            if marked.count == 1, let rect = marked.first, rect.intersects(viewport) {
+                context.addRect(bounds)
+                context.addRect(screen(rect).intersection(bounds))
+                context.setFillColor(CGColor(gray: 0, alpha: selectionDimOpacity))
+                context.drawPath(using: .eoFill)
+            } else {
                 let selected = CGMutablePath()
                 for region in marked where region.intersects(viewport) { selected.addRect(screen(region).intersection(bounds)) }
-                shadeUnselected(in: cg, chart: CGPath(rect: bounds, transform: nil), selected: selected)
+                shadeUnselected(in: context, chart: CGPath(rect: bounds, transform: nil), selected: selected)
             }
-            let outline = effectiveAppearance.usesDarkColors ? NSColor.black : NSColor.white
-            cg.setFillColor(outline.withAlphaComponent(0.95).cgColor)
-            for region in marked where region.intersects(viewport) { drawHairline(screen(region), in: cg) }
-            cg.restoreGState()
         }
+        let outline = effectiveAppearance.usesDarkColors ? NSColor.black : NSColor.white
+        context.setFillColor(outline.withAlphaComponent(0.95).cgColor)
+        for region in marked where region.intersects(viewport) { drawHairline(screen(region), in: context) }
+        context.restoreGState()
     }
     private func route(at event: NSEvent) -> [DiskItem]? {
         guard let g = geometry, let key = hit(world(convert(event.locationInWindow, from: nil))) else { return nil }
@@ -618,11 +671,12 @@ final class Treemap: NSView, NSViewToolTipOwner {
     override func mouseUp(with event: NSEvent) {
         guard down != nil else { return }
         down = nil; panOrigin = nil
-        guard !dragged else { return }
+        guard !dragged else { firstClickKey = nil; return }
         let mode = SelectionMode(event.modifierFlags)
-        if let path = route(at: event) {
-            choose?([path],mode)
-            if event.clickCount == 2 && mode == .replace { fitSelection() }
-        }
+        guard let path = route(at: event), let key = path.last?.key else { firstClickKey = nil; return }
+        let zoomToFile = mode == .replace && event.clickCount == 2 && firstClickKey == key
+        firstClickKey = mode == .replace && event.clickCount == 1 ? key : nil
+        choose?([path], mode)
+        if zoomToFile { fitSelection() }
     }
 }

@@ -352,6 +352,14 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
     var expandedURLs: [URL] {
         expanded.values.compactMap { $0.model.url(folder: $0.folder, slot: $0.raw.slot, directory: true) }
     }
+    func selectFromChart(_ routes: [[DiskItem]], mode: SelectionMode) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            context.allowsImplicitAnimation = false
+            select(routes, mode: mode)
+        }
+    }
+
     func select(_ routes: [[DiskItem]], mode: SelectionMode) {
         applyingSelection = true
         defer { applyingSelection = false }
@@ -368,7 +376,7 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
             let range = IndexSet(integersIn: min(start, last)...max(start, last))
             if mode == .range { result = range } else { result.formUnion(range) }
         }
-        view.selectRowIndexes(result, byExtendingSelection: false)
+        if result != view.selectedRowIndexes { view.selectRowIndexes(result, byExtendingSelection: false) }
         if mode != .range && mode != .addRange { anchor = nodes.last }
         if let node = nodes.last {
             let i = view.row(forItem: node)

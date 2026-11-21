@@ -23,7 +23,7 @@ struct FileLabel {
     let rect: CGRect, title: String, size: String, lightInk: Bool
 }
 struct RenderedFiles {
-    let image: CGImage, labels: [FileLabel], viewport: CGRect
+    let image: CGImage, labels: [FileLabel], viewport: CGRect, focus: LegendFocus?
     fileprivate let pixels: UnsafePointer<UInt8>
 
     func rgb(at point: CGPoint) -> UInt32 {
@@ -127,7 +127,7 @@ final class FileMap: @unchecked Sendable {
         guard let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
             space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: info, provider: provider, decode: nil,
             shouldInterpolate: false, intent: .defaultIntent) else { return nil }
-        return RenderedFiles(image: image, labels: labels, viewport: viewport, pixels: pixels)
+        return RenderedFiles(image: image, labels: labels, viewport: viewport, focus: focus, pixels: pixels)
     }
 }
 

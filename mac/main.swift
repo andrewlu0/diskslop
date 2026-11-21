@@ -501,7 +501,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             guard let self, !self.busy || self.scanning != nil else { return }
             self.showFolders()
             let prefix = self.locations.compactMap(\.item)
-            self.tree.select(routes.map { prefix + $0 }, mode: mode)
+            self.tree.selectFromChart(routes.map { prefix + $0 }, mode: mode)
             self.window.makeFirstResponder(self.tree.view)
         }
         map.menuForRoute = { [weak self] route in
