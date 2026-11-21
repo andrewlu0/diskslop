@@ -60,6 +60,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private let status = NSTextField(labelWithString: "")
     private let spinner = NSProgressIndicator()
     private let scanBadge = ScanBadge()
+    private let scanDuration = NSTextField(labelWithString: "")
     private var toolbar: WindowToolbar!
     private var welcome: Welcome!
     private var shelf: NSView!
@@ -78,7 +79,6 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private var scanning: ScanProgress?
     private var timer: Timer?
     private var busy = false
-    private var scanTime: Double = 0
     private var pendingURL: URL?
     private var movingToTrash = false
     private var waitingToQuit = false
@@ -532,7 +532,13 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         status.font = .systemFont(ofSize: 12)
         status.textColor = .secondaryLabelColor
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let footer = row([scanBadge, spinner, status, spacer(), selectionLabel])
+        scanDuration.isHidden = true
+        scanDuration.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        scanDuration.textColor = .secondaryLabelColor
+        scanDuration.setContentCompressionResistancePriority(.required, for: .horizontal)
+        scanDuration.setAccessibilityLabel("Scan duration")
+        scanDuration.toolTip = "Time spent scanning or validating the last scan."
+        let footer = row([scanBadge, scanDuration, spinner, status, spacer(), selectionLabel])
         for v in [heading, pathLabel, split, footer, welcome!] as [NSView] {
             content.addSubview(v)
             v.translatesAutoresizingMaskIntoConstraints = false
@@ -1073,7 +1079,6 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         if preserve { recordVisit() }
         let previous = preserve ? history.current : nil
         let priorExpansions = preserve ? tree.expandedURLs : []
-        let began = ProcessInfo.processInfo.systemUptime
         var previewed: ScanModel?
         obtainRoot(url, force: force, keeping: preserve ? model : nil, preview: { entry in
             guard !preserve else { return }
@@ -1084,13 +1089,12 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             case .success(let entry):
                 if self.showPendingParent(in: entry) { return }
                 if preserve, self.model === entry.model {
-                    let ms = (ProcessInfo.processInfo.systemUptime - began) * 1000
                     let result = entry.summary.issues == 0 ? "Up to date" : "Checked readable items"
-                    self.setScanStatus([result, "\(formatCount(entry.summary.entries)) entries", String(format: "%.0f ms", ms)], summary: entry.summary)
+                    self.setScanStatus([result, "\(formatCount(entry.summary.entries)) entries"], summary: entry.summary)
                     self.controls()
                 } else if let previous, !(self.browsedDuringScan && self.model?.isScanPreview == true) {
                     let expanded = Set(priorExpansions + self.tree.expandedURLs)
-                    self.restoreVisit(previous, in: entry.model, root: entry.root, rootList: entry.listing, elapsed: entry.elapsed) { restored in
+                    self.restoreVisit(previous, in: entry.model, root: entry.root, rootList: entry.listing) { restored in
                         if !restored { self.showRoot(entry) }
                         for url in expanded { if let route = entry.model.route(to: url) { self.tree.expand(route) } }
                         self.recordVisit(replace: true); self.controls()
@@ -1112,7 +1116,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         guard let list = entry.listing else { return }
         let continuing = (model?.isScanPreview == true || (model === entry.model && listing == nil))
             && locations.first?.url == entry.root
-        model = entry.model; scanTime = entry.elapsed
+        model = entry.model
         locations = [Location(id: 0, url: entry.root)]
         applyingNavigation = true
         display(list, message: message, continuingScan: continuing)
@@ -1124,14 +1128,22 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         scanning = progress
         busy = true
         cancelledScan = false
+        scanDuration.isHidden = true
         scanBadge.show(.scanning)
         return progress
     }
 
-    private func endScan(completed: Bool) {
+    private func endScan(elapsed: TimeInterval?) {
         scanning = nil
         busy = false
-        scanBadge.show(completed && !cancelledScan ? .complete : .idle)
+        if let elapsed, !cancelledScan {
+            scanDuration.stringValue = formatScanDuration(elapsed)
+            scanDuration.isHidden = false
+            scanBadge.show(.complete)
+        } else {
+            scanDuration.isHidden = true
+            scanBadge.show(.idle)
+        }
     }
 
     private func obtainRoot(_ url: URL, force: Bool = false, keeping current: ScanModel? = nil, preview: ((RecentScan) -> Void)? = nil,
@@ -1167,7 +1179,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         let pulse = Timer(timeInterval: 0.15, repeats: true) { _ in update() }
         RunLoop.main.add(pulse, forMode: .common); timer = pulse
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = Result<RecentScan, Error> {
+            let measured = Result<(entry: RecentScan, elapsed: TimeInterval), Error> {
                 let identity = RootIdentity(url)
                 var previousWatch: ChangeWatch?
                 if let cached, let identity, cached.identity == identity {
@@ -1176,9 +1188,11 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                     }
                     if let watch = cached.watcher {
                         if cached.summary.issues == 0, case .clean = watch.changes() {
-                            if cached.listing != nil || cached.model === current { return cached }
-                            return RecentScan(model: cached.model, listing: FolderListing(cached.model, folder: 0, aspect: mapAspect),
+                            let elapsed = ProcessInfo.processInfo.systemUptime - began
+                            if cached.listing != nil || cached.model === current { return (cached, elapsed) }
+                            let entry = RecentScan(model: cached.model, listing: FolderListing(cached.model, folder: 0, aspect: mapAspect),
                                 root: cached.root, identity: identity, watcher: watch, elapsed: cached.elapsed, startupSnapshot: cached.startupSnapshot)
+                            return (entry, elapsed)
                         }
                         previousWatch = watch
                     }
@@ -1206,6 +1220,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                     shouldSave = true
                     if !force { replacingInode = observedInode }
                 }
+                let elapsed = ProcessInfo.processInfo.systemUptime - began
                 let priorGeometry = workspace?.finishEnumeration()
                 if let workspace {
                     let root = scanned.url(folder: 0, directory: true) ?? url
@@ -1230,9 +1245,11 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                 } else {
                     list = FolderListing(scanned, folder: 0, aspect: mapAspect, previous: priorGeometry ?? cached?.listing?.geometry)
                 }
-                return RecentScan(model: scanned, listing: list, root: scanned.url(folder: 0, directory: true) ?? url,
+                let entry = RecentScan(model: scanned, listing: list, root: scanned.url(folder: 0, directory: true) ?? url,
                     identity: identity, watcher: watcher, elapsed: ProcessInfo.processInfo.systemUptime - began, startupSnapshot: snapshot)
+                return (entry, elapsed)
             }
+            let result = measured.map(\.entry)
             if case .failure = result { _ = workspace?.finishEnumeration() }
             let finished: (ScanMapRequest, ScanMapFrame)?
             if workspace != nil, case .success(let entry) = result, let list = entry.listing, !dt_is_cancelled(progress.handle) {
@@ -1241,7 +1258,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             } else { finished = nil }
             DispatchQueue.main.async {
                 self.timer?.invalidate(); self.timer = nil
-                self.endScan(completed: (try? result.get()) != nil)
+                self.endScan(elapsed: try? measured.get().elapsed)
                 if workspace != nil {
                     self.pendingRankSelection = Set(self.largest.selected.map(\.url))
                     self.scanWorkspace = nil
@@ -1325,7 +1342,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             setHeading(here.url)
         }
         sizeLabel.stringValue = formatBytes(list.summary.bytes)
-        let parts = [message, "\(formatCount(list.summary.entries)) \(list.summary.entries == 1 ? "entry" : "entries")", String(format: "Scan %.2f s", scanTime)].compactMap { $0 }
+        let parts = [message, "\(formatCount(list.summary.entries)) \(list.summary.entries == 1 ? "entry" : "entries")"].compactMap { $0 }
         setScanStatus(parts, summary: list.summary)
         controls()
     }
@@ -1355,11 +1372,11 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         return trail
     }
     private func restoreVisit(_ visit: NavigationVisit, in source: ScanModel, root: URL,
-                              rootList: FolderListing?, elapsed: Double, completion: @escaping (Bool) -> Void) {
+                              rootList: FolderListing?, completion: @escaping (Bool) -> Void) {
         let aspect = map.aspect, current = listing
         let apply = { (trail: [Location], list: FolderListing, keys: [UInt64], lead: UInt64?) in
             self.busy = false; self.applyingNavigation = true
-            self.model = source; self.scanTime = elapsed; self.locations = trail
+            self.model = source; self.locations = trail
             if current !== list {
                 self.display(list)
                 self.tree.expand(trail.compactMap(\.item))
@@ -1402,13 +1419,13 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             self.controls()
         }
         if visit.root == locations.first?.url, let model {
-            restoreVisit(visit, in: model, root: visit.root, rootList: cache.read(visit.root)?.listing, elapsed: scanTime, completion: finish)
+            restoreVisit(visit, in: model, root: visit.root, rootList: cache.read(visit.root)?.listing, completion: finish)
         } else {
             obtainRoot(visit.root) { result in
                 switch result {
                 case .success(let entry):
                     if self.showPendingParent(in: entry) { return }
-                    self.restoreVisit(visit, in: entry.model, root: entry.root, rootList: entry.listing, elapsed: entry.elapsed, completion: finish)
+                    self.restoreVisit(visit, in: entry.model, root: entry.root, rootList: entry.listing, completion: finish)
                 case .failure(let error):
                     self.status.stringValue = error.localizedDescription
                     if self.cancelledScan { self.controls() } else { finish(false) }
@@ -1583,6 +1600,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let updated = try old.refreshed(items, progress: progress)
+                let scanElapsed = ProcessInfo.processInfo.systemUptime - start
                 let trail = focus.reversed().compactMap { updated.route(to: $0.url) }.first ?? []
                 var locations = [root]
                 for item in trail {
@@ -1596,7 +1614,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                 let selected = previous?.liveKeys(in: updated) ?? []
                 let elapsed = ProcessInfo.processInfo.systemUptime - start
                 DispatchQueue.main.async {
-                    self.endScan(completed: true)
+                    self.endScan(elapsed: scanElapsed)
                     guard !self.cancelledScan else {
                         self.status.stringValue = "Scan cancelled."
                         self.controls()
@@ -1607,7 +1625,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                             identity: prior.identity, watcher: prior.watcher, elapsed: elapsed, startupSnapshot: prior.startupSnapshot), for: root.url)
                     }
                     self.model = updated; self.locations = restored
-                    self.display(list, message: String(format: "Refreshed in %.2f s", elapsed))
+                    self.display(list, message: "Selection refreshed")
                     self.applyingNavigation = true
                     for route in opened { self.tree.expand(route) }
                     self.tree.selectSaved(selected, lead: nil)
@@ -1618,7 +1636,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self.endScan(completed: false)
+                    self.endScan(elapsed: nil)
                     self.status.stringValue = error.localizedDescription
                     self.controls()
                 }

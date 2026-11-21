@@ -85,3 +85,13 @@ final class ScanBadge: NSView {
         }
     }
 }
+
+func formatScanDuration(_ seconds: TimeInterval) -> String {
+    let duration = Duration.seconds(seconds)
+    if seconds < 0.001 { return "<1 ms" }
+    if seconds < 1 { return duration.formatted(.units(allowed: [.milliseconds], width: .narrow)) }
+    if seconds < 60 {
+        return duration.formatted(.units(allowed: [.seconds], width: .narrow, fractionalPart: .show(length: 2)))
+    }
+    return duration.formatted(.units(allowed: [.hours, .minutes, .seconds], width: .narrow))
+}
