@@ -521,6 +521,21 @@ extern "C" fn dt_child_count(m: &Model, folder: u32) -> usize {
         .map_or(0, |rows| rows.len())
 }
 #[unsafe(no_mangle)]
+extern "C" fn dt_child_rank(m: &Model, folder: u32, slot: u32) -> isize {
+    let scan = m.scan.read().unwrap();
+    let Some(order) = scan.order.get(folder as usize) else {
+        return -1;
+    };
+    if slot as usize >= scan.folders[folder as usize].entries.len() {
+        return -1;
+    }
+    order
+        .binary_search_by(|&other| scan.compare_children(folder, other, slot))
+        .ok()
+        .filter(|&rank| order[rank] == slot)
+        .map_or(-1, |rank| rank as isize)
+}
+#[unsafe(no_mangle)]
 extern "C" fn dt_child(m: &Model, folder: u32, index: usize, out: &mut Row) -> bool {
     let scan = m.scan.read().unwrap();
     let Some(&slot) = scan.order.get(folder as usize).and_then(|s| s.get(index)) else {

@@ -1,4 +1,5 @@
 import AppKit
+import Metal
 
 extension DiskItem {
     static let scanRootKey = UInt64(UInt32.max)
@@ -24,6 +25,8 @@ struct FileLabel {
 }
 struct RenderedFiles {
     let image: CGImage, labels: [FileLabel], viewport: CGRect, focus: LegendFocus?
+    let texture: MTLTexture?
+    let gestureLabels: MapGestureLabels?
     fileprivate let pixels: UnsafePointer<UInt8>
 
     func rgb(at point: CGPoint) -> UInt32 {
@@ -127,7 +130,15 @@ final class FileMap: @unchecked Sendable {
         guard let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
             space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: info, provider: provider, decode: nil,
             shouldInterpolate: false, intent: .defaultIntent) else { return nil }
-        return RenderedFiles(image: image, labels: labels, viewport: viewport, focus: focus, pixels: pixels)
+        var texture: MTLTexture?
+        if #available(macOS 14.0, *), let renderer = ChartRenderer.shared, renderer.viewportPipeline != nil {
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
+            descriptor.usage = .shaderRead
+            texture = renderer.device.makeTexture(descriptor: descriptor)
+            texture?.replace(region: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0, withBytes: pixels, bytesPerRow: width * 4)
+        }
+        let glyphs = texture.flatMap { MapGestureLabels(labels: labels, device: $0.device) }
+        return RenderedFiles(image: image, labels: labels, viewport: viewport, focus: focus, texture: texture, gestureLabels: glyphs, pixels: pixels)
     }
 }
 

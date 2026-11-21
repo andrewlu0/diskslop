@@ -142,13 +142,21 @@ struct MapRenderSettings: Equatable {
     var focus: LegendFocus?
     static let whole = CGRect(x: 0, y: 0, width: 1, height: 1)
 
-    func overview(_ geometry: FileMap, colors: MapBreakdown?) -> CGImage? {
+    func overview(_ geometry: FileMap, colors: MapBreakdown?) -> RenderedFiles? {
         let ratio = min(1, 1024 / CGFloat(max(width, height)))
         return geometry.render(viewport: Self.whole, width: max(1, Int(CGFloat(width) * ratio)),
             height: max(1, Int(CGFloat(height) * ratio)), scale: scale * ratio,
-            dark: dark, shine: shine, coloring: colors, focus: focus)?.image
+            dark: dark, shine: shine, coloring: colors, focus: focus)
     }
 
+    var gestureDetail: Self {
+        let span = min(1, viewport.width * 1.5)
+        let region = CGRect(x: max(0, min(1 - span, viewport.midX - span / 2)),
+            y: max(0, min(1 - span, viewport.midY - span / 2)), width: span, height: span)
+        let ratio = min(1, sqrt(1_400_000 / Double(width * height)))
+        return Self(viewport: region, width: max(1, Int(Double(width) * ratio)), height: max(1, Int(Double(height) * ratio)),
+            scale: scale * ratio * viewport.width / span, dark: dark, shine: shine, focus: focus)
+    }
     func render(_ geometry: FileMap, colors: MapBreakdown?) -> RenderedFiles? {
         geometry.render(viewport: viewport, width: width, height: height, scale: scale, dark: dark, shine: shine, coloring: colors, focus: focus)
     }
@@ -164,11 +172,11 @@ struct MovingTile {
 
 struct LiveMapFrame {
     let raster: RenderedFiles, moves: [MovingTile], priorImage: CGImage?
-    let overview: CGImage?
+    let overview: RenderedFiles?
     let trashPatches: [ChartPatch]
     init(_ raster: RenderedFiles, geometry: FileMap, settings: MapRenderSettings, colors: MapBreakdown?, source: (FileMap, RenderedFiles)?, afterTrash: Bool = false) {
         self.raster = raster
-        overview = raster.viewport == MapRenderSettings.whole ? raster.image : settings.overview(geometry, colors: colors)
+        overview = raster.viewport == MapRenderSettings.whole ? raster : settings.overview(geometry, colors: colors)
         guard let (previous, prior) = source, prior.viewport == raster.viewport else {
             moves = []; priorImage = nil; trashPatches = []; return
         }
@@ -216,7 +224,8 @@ final class Treemap: NSView, NSViewToolTipOwner {
             presentRaster()
         }
     }
-    private var overview: CGImage? { didSet { presentRaster() } }
+    private var overview: RenderedFiles? { didSet { presentRaster() } }
+    private var gestureSurface: MapGestureSurface?
     private let rasterHost = FlippedCanvas()
     private let basePlane = RasterPlane(), detailPlane = RasterPlane()
     private var overviewIsCurrent = false
@@ -238,10 +247,8 @@ final class Treemap: NSView, NSViewToolTipOwner {
     var trackingSelection: Bool { down != nil }
     private var revision = 0, drawing = false
     private var reflow: DispatchWorkItem?
-    private let viewportClock = ChartFrameClock()
     private var settle: DispatchWorkItem?
-    private var lastMove: CFTimeInterval = 0, lastRefinement: CFTimeInterval = 0
-    private var hoverMoved = false
+    private var lastMove: CFTimeInterval = 0, lastRefinement: CFTimeInterval = 0, lastHoverSample: CFTimeInterval = 0
     private var installedRevision = -1
     private var lastSize: NSSize = .zero, lastScale: CGFloat = 0
     private static let whole = MapRenderSettings.whole
@@ -309,6 +316,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
     }
     required init?(coder: NSCoder) { nil }
     @objc private func accessibilityChanged() {
+        finishViewportWork()
         overviewIsCurrent = false; endMotion(); revision += 1; scheduleFrame()
         overlay.needsDisplay = true; presentSelection()
     }
@@ -331,7 +339,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
     override func mouseExited(with event: NSEvent) { hoverPoint = nil; updateHover() }
 
     private func updateHover(force: Bool = false) {
-        let point = hoverPoint.flatMap { bounds.contains($0) ? world($0) : nil }
+        let point = hoverPoint.flatMap { bounds.contains($0) ? world($0, in: gestureSurface?.visibleViewport) : nil }
         let key: DTKey?
         if !force, movingTiles.isEmpty, trashTransition == nil, let point, let hoverKey, hoverWorldRect?.contains(point) == true {
             key = DTKey(hoverKey)
@@ -447,6 +455,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
     func showLive(_ list: FolderListing, ancestors: Set<UInt64>, colors: MapBreakdown?,
                   frame: LiveMapFrame?, settings: MapRenderSettings?, sameFolder: Bool) {
         reflow?.cancel(); endMotion()
+        if !sameFolder || frame?.trashPatches.isEmpty == false || frame?.moves.isEmpty == false { finishViewportWork() }
         let prior = rendered
         if geometry?.model !== list.model || geometry?.folder != list.folder { firstClickKey = nil }
         geometry = list.geometry; rootKeys = ancestors
@@ -558,6 +567,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
         super.layout()
         let scale = window?.backingScaleFactor ?? 2
         guard lastSize != bounds.size || scale != lastScale else { return }
+        finishViewportWork()
         discardTrashBacking()
         endMotion()
         presentSelection()
@@ -571,6 +581,10 @@ final class Treemap: NSView, NSViewToolTipOwner {
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         needsLayout = true
+    }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { finishViewportWork() }
     }
     private func scheduleReflow() {
         reflow?.cancel()
@@ -594,7 +608,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: task)
     }
 
-    private func scheduleFrame() {
+    private func scheduleFrame(interactive: Bool = false) {
         if isHidden {
             if displayedColors !== requestedColors {
                 displayedColors = requestedColors
@@ -602,15 +616,17 @@ final class Treemap: NSView, NSViewToolTipOwner {
             }
             return
         }
-        guard !drawing, let current = geometry, let settings = renderSettings else { return }
-        if installedRevision == revision, rendered?.viewport == settings.viewport { return }
+        guard !drawing, let current = geometry, let exactSettings = renderSettings else { return }
+        let settings = interactive ? exactSettings.gestureDetail : exactSettings
+        if installedRevision == revision, rendered?.viewport == settings.viewport,
+           let image = rendered?.image, image.width >= settings.width, image.height >= settings.height { return }
         let token = revision
         let colors = requestedColors
         let needsOverview = !overviewIsCurrent
         drawing = true
         DispatchQueue.global(qos: .userInitiated).async {
             let frame = settings.render(current, colors: colors)
-            let base = settings.viewport == Self.whole ? frame?.image :
+            let base = settings.viewport == Self.whole && (!interactive || needsOverview) ? frame :
                 (needsOverview ? settings.overview(current, colors: colors) : nil)
             DispatchQueue.main.async {
                 self.drawing = false
@@ -630,15 +646,16 @@ final class Treemap: NSView, NSViewToolTipOwner {
                     self.overlay.needsDisplay = true
                     self.setAccessibilityValue("\(current.count.formatted()) file shapes · \(Int(self.zoom.rounded()))×")
                 }
-                if self.revision != token || (self.settle == nil && settings.viewport != self.viewport) {
+                if self.revision != token || (self.settle == nil && (interactive || settings.viewport != self.viewport)) {
                     self.scheduleFrame()
                 }
             }
         }
     }
-    private func world(_ point: CGPoint) -> CGPoint {
-        CGPoint(x: viewport.minX + point.x * viewport.width / max(1, bounds.width),
-                y: viewport.minY + point.y * viewport.height / max(1, bounds.height))
+    private func world(_ point: CGPoint, in displayed: CGRect? = nil) -> CGPoint {
+        let rect = displayed ?? viewport
+        return CGPoint(x: rect.minX + point.x * rect.width / max(1, bounds.width),
+                y: rect.minY + point.y * rect.height / max(1, bounds.height))
     }
     private func screen(_ r: CGRect) -> CGRect {
         let sx = bounds.width / viewport.width, sy = bounds.height / viewport.height
@@ -655,32 +672,37 @@ final class Treemap: NSView, NSViewToolTipOwner {
         return (overlap.width / viewport.width) * (overlap.height / viewport.height) * min(1, viewport.width / rect.width)
     }
     private func finishViewportWork() {
-        viewportClock.stop(); settle?.cancel(); settle = nil; hoverMoved = false
+        settle?.cancel(); settle = nil
+        if let surface = gestureSurface {
+            gestureSurface = nil
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            presentRaster(); surface.stop()
+            overlay.isHidden = false; overlay.needsDisplay = true
+            presentSelection()
+            CATransaction.commit()
+        }
     }
     private func scheduleSettle() {
         let delay = max(0, lastMove + 0.075 - CACurrentMediaTime())
         let task = DispatchWorkItem { [weak self] in
             guard let self else { return }
             if CACurrentMediaTime() - self.lastMove < 0.074 { self.scheduleSettle(); return }
-            if self.hoverMoved { self.updateHover() }
             self.finishViewportWork()
+            self.updateHover()
             self.scheduleFrame()
         }
         settle = task
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: task)
     }
     private func scheduleViewportWork() {
-        lastMove = CACurrentMediaTime(); hoverMoved = true
+        let now = CACurrentMediaTime()
+        lastMove = now
         if settle == nil { scheduleSettle() }
-        viewportClock.start(on: self) { [weak self] in
-            guard let self, self.hoverMoved else { return }
-            self.hoverMoved = false
-            self.updateHover()
-            let now = CACurrentMediaTime()
-            if !self.drawing, now - self.lastRefinement >= 0.075,
-               self.rendered.map({ self.detailScore($0.viewport) < 0.68 }) ?? true {
-                self.lastRefinement = now; self.scheduleFrame()
-            }
+        if hoverPoint != nil, now - lastHoverSample >= 1.0 / 60 {
+            lastHoverSample = now; updateHover()
+        }
+        if !drawing, now - lastRefinement >= 0.1, rendered.map({ detailScore($0.viewport) < 0.46 }) ?? true {
+            lastRefinement = now; scheduleFrame(interactive: true)
         }
     }
     private func move(to rect: CGRect) {
@@ -689,8 +711,17 @@ final class Treemap: NSView, NSViewToolTipOwner {
         guard next != viewport else { return }
         discardTrashBacking()
         endMotion()
+        if #available(macOS 14.0, *), settle != nil, gestureSurface == nil,
+           let renderer, let overview, let rendered, overview.texture != nil, rendered.texture != nil {
+            gestureSurface = MapGestureSurface(host: rasterHost, renderer: renderer, base: overview, detail: rendered, viewport: viewport) { [weak self] surface in
+                guard let self, self.gestureSurface === surface else { return }
+                surface.setDisplaying(true)
+                self.overlay.isHidden = true
+                self.presentSelection()
+            }
+        }
         viewport = next
-        overlay.needsDisplay = true
+        if !overlay.isHidden { overlay.needsDisplay = true }
         scheduleViewportWork()
         zoomChanged?()
         if next == Self.whole { scheduleReflow() }
@@ -751,14 +782,33 @@ final class Treemap: NSView, NSViewToolTipOwner {
     }
     private func presentSelection() {
         let show = rendered != nil && rendered?.focus == nil
+        if let surface = gestureSurface {
+            let highlight = show && marked.count == 1 ? MapGestureLabels.Highlight(rect: marked[0],
+                dim: rootKeys.isDisjoint(with: selection), dark: effectiveAppearance.usesDarkColors) : nil
+            surface.select(highlight)
+        }
+        selectionOverlay.isHidden = trashTransition != nil || (gestureSurface?.isDisplaying == true && marked.count <= 1)
+        if selectionOverlay.isHidden { return }
         selectionOverlay.present(show && marked.count == 1 ? screen(marked[0]) : nil,
             dim: rootKeys.isDisjoint(with: selection), range: show && marked.count > 1, dark: effectiveAppearance.usesDarkColors)
     }
     private func presentRaster() {
         let detail = geometry?.count == 0 ? nil : rendered
+        if let surface = gestureSurface {
+            if let overview, let detail, overview.texture != nil, detail.texture != nil, detail.labels.isEmpty || detail.gestureLabels != nil {
+                surface.update(base: overview, detail: detail, viewport: viewport)
+                if surface.isDisplaying { return }
+                if overlay.isHidden {
+                    overlay.isHidden = false; overlay.needsDisplay = true; presentSelection()
+                }
+            } else {
+                gestureSurface = nil; surface.stop(); overlay.isHidden = false; overlay.needsDisplay = true
+                presentSelection()
+            }
+        }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        basePlane.present(overview, from: Self.whole, in: viewport, host: rasterHost,
+        basePlane.present(overview?.image, from: Self.whole, in: viewport, host: rasterHost,
             visible: detail != nil && detail?.viewport.contains(viewport) == false)
         detailPlane.present(detail?.image, from: detail?.viewport ?? Self.whole, in: viewport, host: rasterHost)
         CATransaction.commit()
@@ -790,7 +840,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
             cg.draw(tile, in: CGRect(origin: .zero, size: area.size))
             cg.restoreGState()
         }
-        if !view.viewport.contains(viewport), let overview { draw(overview, Self.whole) }
+        if !view.viewport.contains(viewport), let overview { draw(overview.image, Self.whole) }
         draw(view.image, view.viewport)
     }
     private func drawHairline(_ rect: CGRect, in context: CGContext) {
@@ -857,7 +907,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
         context.restoreGState()
     }
     private func route(at event: NSEvent) -> [DiskItem]? {
-        guard let g = geometry, let key = hit(world(convert(event.locationInWindow, from: nil))) else { return nil }
+        guard let g = geometry, let key = hit(world(convert(event.locationInWindow, from: nil), in: gestureSurface?.visibleViewport)) else { return nil }
         return g.model.route(to: key, from: g.folder)
     }
     override func menu(for event: NSEvent) -> NSMenu? {

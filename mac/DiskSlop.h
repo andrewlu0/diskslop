@@ -105,6 +105,7 @@ DTSummary dt_summary(const DTModel *, uint32_t folder);
 DTList *dt_list(const DTModel *, uint32_t folder, size_t limit);
 const DTRow *dt_rows(const DTList *, size_t *count);
 size_t dt_child_count(const DTModel *, uint32_t folder);
+intptr_t dt_child_rank(const DTModel *, uint32_t folder, uint32_t slot);
 bool dt_child(const DTModel *, uint32_t folder, size_t index, DTRow *row);
 bool dt_entry(const DTModel *, uint32_t folder, uint32_t slot, DTRow *row);
 void dt_list_free(DTList *);

@@ -4,6 +4,16 @@ Measured on an Apple M4 Pro running macOS 27.0.1. The tests used the local APFS 
 
 ## Interactive rendering
 
+### Folder expansion and treemap gestures in 0.1.10
+
+On the M4 Pro, the first expansion of a folder with **25,342 children** took **7.1 and 7.3 ms** in 0.1.10, down from **48.3 and 48.6 ms** in 0.1.9. Each trial started in a fresh process with the same inventory and included drawing the visible rows and committing the layout. The new outline created 22–23 row objects. All children were immediately addressable, including the last child and a Shift-selection spanning the entire folder.
+
+On the 120 Hz display, the 2,122 × 1,660-pixel treemap with 3,714,774 file shapes averaged **117.9 and 119.8 distinct FPS** during continuous mixed zoom and pan. The same chart workload in 0.1.9 averaged **114.9 and 115.0 FPS**. These comparisons used native-rate window capture and counted changes in the chart pixels.
+
+In the full app with both sidebars visible, a drag averaged **119.6 FPS**. A rapid mixed zoom-and-pan pass with whole-window capture averaged **61.0 FPS**. These figures count distinct frames presented over roughly six seconds. A separate check interrupted Metal presentation for 300 ms and confirmed the map continued to move using Core Animation until Metal resumed.
+
+### Changes measured in 0.1.9
+
 An M4 Pro reopened the same frozen APFS inventory with **3,714,774 file shapes** in instrumented, optimized builds of 0.1.8 and 0.1.9. The treemap measured 2,122 × 1,660 pixels. Two runs per version used the same viewport sequence, selections and native outline. The ranges below are the two runs’ 95th percentiles.
 
 | Interaction | Samples per run | 0.1.8 | 0.1.9 |

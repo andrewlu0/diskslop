@@ -168,8 +168,12 @@ final class NativeTableSurface: NSView {
     }
 }
 
-final class TableTextCell: NSTableCellView {
+class TableTextCell: NSTableCellView {
     private var pulse: CALayer?
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        pulse?.removeFromSuperlayer(); pulse = nil
+    }
 
     func highlightChange(from previous: UInt64?, to current: UInt64) {
         guard previous != current, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
@@ -225,8 +229,6 @@ final class TableTextCell: NSTableCellView {
 
     static func make(in view: NSTableView, column: NSUserInterfaceItemIdentifier, icon: Bool, numeric: Bool) -> TableTextCell {
         if let cell = view.makeView(withIdentifier: column, owner: view) as? TableTextCell {
-            cell.pulse?.removeFromSuperlayer()
-            cell.pulse = nil
             return cell
         }
         let cell = TableTextCell()

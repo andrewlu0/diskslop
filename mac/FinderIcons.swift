@@ -1,6 +1,17 @@
 import AppKit
 import UniformTypeIdentifiers
 
+protocol FinderIconTarget: AnyObject {
+    var finderImage: NSImage? { get set }
+}
+
+extension NSImageView: FinderIconTarget {
+    var finderImage: NSImage? {
+        get { image }
+        set { image = newValue; imageScaling = .scaleProportionallyUpOrDown; contentTintColor = nil }
+    }
+}
+
 final class FinderIcons {
     private final class Request: NSObject {
         let url: URL
@@ -12,9 +23,10 @@ final class FinderIcons {
         deinit { job.cancel() }
     }
 
-    private let requests = NSMapTable<NSImageView, Request>.weakToStrongObjects()
+    private let requests = NSMapTable<AnyObject, Request>.weakToStrongObjects()
     private let cache = NSCache<NSURL, NSImage>()
     private let queue = OperationQueue()
+    private var pending: [BlockOperation] = []
     private let folder = NSWorkspace.shared.icon(for: .folder)
     private let file = NSWorkspace.shared.icon(for: .data)
     private let link = NSWorkspace.shared.icon(for: .symbolicLink)
@@ -27,11 +39,12 @@ final class FinderIcons {
 
     func reset() {
         queue.cancelAllOperations()
+        pending.forEach { $0.cancel() }
         requests.removeAllObjects()
         cache.removeAllObjects()
     }
 
-    func display(_ url: URL?, in imageView: NSImageView, row: DTRow) {
+    func display<T: FinderIconTarget>(_ url: URL?, in imageView: T, row: DTRow) {
         display(url, in: imageView, placeholder: row.isFolder ? folder : row.kind == 2 ? link : file)
     }
 
@@ -39,20 +52,18 @@ final class FinderIcons {
         display(url, in: imageView, placeholder: folder)
     }
 
-    private func display(_ url: URL?, in imageView: NSImageView, placeholder: NSImage) {
+    private func display<T: FinderIconTarget>(_ url: URL?, in imageView: T, placeholder: NSImage) {
         if let url, requests.object(forKey: imageView)?.url == url { return }
         requests.removeObject(forKey: imageView)
-        imageView.contentTintColor = nil
-        imageView.imageScaling = .scaleProportionallyUpOrDown
         guard let url else {
-            imageView.image = nil
+            imageView.finderImage = nil
             return
         }
         if let icon = cache.object(forKey: url as NSURL) {
-            imageView.image = icon
+            imageView.finderImage = icon
             return
         }
-        imageView.image = placeholder
+        imageView.finderImage = placeholder
         let job = BlockOperation()
         let request = Request(url: url, job: job)
         requests.setObject(request, forKey: imageView)
@@ -62,10 +73,18 @@ final class FinderIcons {
             DispatchQueue.main.async {
                 guard let self, let imageView, self.requests.object(forKey: imageView) === request else { return }
                 self.cache.setObject(icon, forKey: url as NSURL)
-                imageView.image = icon
+                imageView.finderImage = icon
                 self.requests.removeObject(forKey: imageView)
             }
         }
-        queue.addOperation(job)
+        if pending.isEmpty {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let jobs = self.pending.filter { !$0.isCancelled }
+                self.pending.removeAll(keepingCapacity: true)
+                self.queue.addOperations(jobs, waitUntilFinished: false)
+            }
+        }
+        pending.append(job)
     }
 }

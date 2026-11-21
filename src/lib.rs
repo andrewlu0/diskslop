@@ -1011,6 +1011,12 @@ impl Inventory {
     pub fn sorted_children(&self, folder: u32) -> Vec<u32> {
         self.largest_children(folder, usize::MAX)
     }
+    fn compare_children(&self, folder: u32, a: u32, b: u32) -> std::cmp::Ordering {
+        let dir = &self.folders[folder as usize];
+        self.size(Key { folder, slot: b })
+            .cmp(&self.size(Key { folder, slot: a }))
+            .then_with(|| dir.name(a as usize).cmp(dir.name(b as usize)))
+    }
     fn largest_children(&self, folder: u32, limit: usize) -> Vec<u32> {
         if let Some(slots) = self.order.get(folder as usize) {
             return slots[..slots.len().min(limit)].to_vec();
@@ -1028,11 +1034,7 @@ impl Inventory {
             .filter(|(_, e)| e.flags & REMOVED == 0)
             .map(|(i, _)| i as u32)
             .collect();
-        let compare = |&a: &u32, &b: &u32| {
-            self.size(Key { folder, slot: b })
-                .cmp(&self.size(Key { folder, slot: a }))
-                .then_with(|| f.name(a as usize).cmp(f.name(b as usize)))
-        };
+        let compare = |&a: &u32, &b: &u32| self.compare_children(folder, a, b);
         if limit < slots.len() {
             slots.select_nth_unstable_by(limit, compare);
             slots.truncate(limit);

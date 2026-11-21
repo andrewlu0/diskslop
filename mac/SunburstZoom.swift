@@ -4,6 +4,8 @@ import MetalKit
 final class ChartRenderer {
     static let shared = ChartRenderer()
     let reflowPipeline: MTLRenderPipelineState
+    let viewportPipeline: MTLRenderPipelineState?
+    let labelPipeline: MTLRenderPipelineState?
     let device: MTLDevice, queue: MTLCommandQueue, pipeline: MTLRenderPipelineState
 
     init?() {
@@ -18,6 +20,16 @@ final class ChartRenderer {
         descriptor.fragmentFunction = library.makeFunction(name: "surface")
         guard let reflowPipeline = try? device.makeRenderPipelineState(descriptor: descriptor) else { return nil }
         self.reflowPipeline = reflowPipeline
+        descriptor.vertexFunction = library.makeFunction(name: "triangle")
+        descriptor.fragmentFunction = library.makeFunction(name: "viewportMap")
+        viewportPipeline = try? device.makeRenderPipelineState(descriptor: descriptor)
+        descriptor.vertexFunction = library.makeFunction(name: "labelQuad")
+        descriptor.fragmentFunction = library.makeFunction(name: "labelInk")
+        let blend = descriptor.colorAttachments[0]!
+        blend.isBlendingEnabled = true
+        blend.sourceRGBBlendFactor = .sourceAlpha; blend.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        blend.sourceAlphaBlendFactor = .one; blend.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        labelPipeline = try? device.makeRenderPipelineState(descriptor: descriptor)
         self.device = device; self.queue = queue; self.pipeline = pipeline
     }
 
@@ -67,6 +79,31 @@ final class ChartRenderer {
     fragment half4 surface(Vertex v [[stage_in]], texture2d<half> target [[texture(0)]]) {
         constexpr sampler sample(coord::normalized, address::clamp_to_edge, filter::linear);
         return target.sample(sample, v.uv);
+    }
+    fragment half4 viewportMap(Vertex v [[stage_in]], texture2d<half> overview [[texture(0)]],
+                               texture2d<half> detail [[texture(1)]], constant float4 *rects [[buffer(0)]]) {
+        constexpr sampler point(coord::normalized, address::clamp_to_edge, filter::nearest);
+        float2 uv = rects[1].xy + v.uv * rects[1].zw;
+        if (all(uv >= 0) && all(uv < 1)) return half4(detail.sample(point, uv).rgb, 1);
+        return half4(overview.sample(point, rects[0].xy + v.uv * rects[0].zw).rgb, 1);
+    }
+    struct Label { float4 rect, uv, ink; };
+    struct Glyph { float4 position [[position]]; float2 uv; float4 line [[flat]], ink [[flat]]; };
+    vertex Glyph labelQuad(uint corner [[vertex_id]], uint i [[instance_id]], constant Label *labels [[buffer(0)]]) {
+        Label l = labels[i];
+        float2 edge = float2(corner & 1, corner >> 1), p = l.rect.xy + edge * l.rect.zw;
+        return {float4(2*p.x-1, 1-2*p.y, 0, 1), edge, l.uv, l.ink};
+    }
+    fragment half4 labelInk(Glyph g [[stage_in]], texture2d<half> glyphs [[texture(0)]]) {
+        if (g.ink.w > 0) return half4(half3(g.ink.z), half(g.ink.w));
+        constexpr sampler linear(coord::normalized, address::clamp_to_edge, filter::linear);
+        float x = g.uv.x * g.line.x, y = g.line.y, lead = (g.line.x - g.ink.x) * 0.5;
+        if (g.line.z > g.line.x && x >= lead) {
+            if (x < lead + g.ink.x) { x -= lead; y = g.ink.y; }
+            else { x += g.line.z - g.line.x; }
+        }
+        half a = glyphs.sample(linear, float2(x, y + g.uv.y * g.line.w)).r;
+        return half4(half3(g.ink.z), a);
     }
     fragment half4 zoom(Vertex v [[stage_in]], texture2d<half> parent [[texture(0)]],
                         texture2d<half> child [[texture(1)]], constant float4 &lens [[buffer(0)]],
