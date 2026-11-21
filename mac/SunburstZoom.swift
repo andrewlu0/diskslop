@@ -21,12 +21,20 @@ final class ChartRenderer {
         self.device = device; self.queue = queue; self.pipeline = pipeline
     }
 
-    func snapshot(width: Int, height: Int, draw: (CGContext) -> Void) -> MTLTexture? {
+    static func bitmap(width: Int, height: Int) -> CGContext? {
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
         let info = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
-        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
-            bytesPerRow: width * 4, space: space, bitmapInfo: info), let data = context.data else { return nil }
+        return CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
+            bytesPerRow: width * 4, space: space, bitmapInfo: info)
+    }
+    func snapshot(width: Int, height: Int, draw: (CGContext) -> Void) -> MTLTexture? {
+        guard let context = Self.bitmap(width: width, height: height) else { return nil }
         draw(context)
+        return texture(from: context)
+    }
+    func texture(from context: CGContext) -> MTLTexture? {
+        guard let data = context.data else { return nil }
+        let width = context.width, height = context.height
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
         descriptor.usage = .shaderRead
         guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
@@ -62,28 +70,27 @@ final class ChartRenderer {
     }
     fragment half4 zoom(Vertex v [[stage_in]], texture2d<half> parent [[texture(0)]],
                         texture2d<half> child [[texture(1)]], constant float4 &lens [[buffer(0)]],
-                        constant float2 *stops [[buffer(1)]], constant uint &count [[buffer(2)]]) {
+                        constant float4 *stops [[buffer(1)]], constant float4 &state [[buffer(2)]]) {
         constexpr sampler sample(coord::normalized, address::clamp_to_edge, filter::linear);
         float2 xy = 2 * v.uv - 1;
-        float radius = length(xy), hub = lens.z, t = lens.w;
+        float radius = length(xy), hub = state.x, t = state.y;
         if (t <= 0) return parent.sample(sample, v.uv);
         if (t >= 1) return child.sample(sample, v.uv);
-        float fade = smoothstep(0.12f, 0.88f, t);
+        float fade = state.z;
+        uint count = uint(state.w);
         if (radius <= hub || radius >= 1)
             return mix(parent.sample(sample, v.uv), child.sample(sample, v.uv), half(fade));
         float angle = fract(atan2(xy.x, -xy.y) / 6.28318530718f + 1);
-        float width = lens.y - lens.x, span = pow(width, t);
-        float start = width < 0.999999f ? lens.x * (1 - span) / (1 - width) : t * lens.x;
-        float a = start + angle * span, b = (a - lens.x) / width;
+        float a = lens.w + angle * lens.z, b = (a - lens.x) * lens.y;
         float r = (radius - hub) / (1 - hub);
-        float2 lo = stops[0], hi = lo;
+        float4 lo = stops[0], hi = lo;
         for (uint i = 1; i < count; ++i) {
             hi = stops[i];
-            if (r <= mix(hi.x, hi.y, t) || i + 1 == count) break;
+            if (r <= hi.z || i + 1 == count) break;
             lo = hi;
         }
-        float f = saturate((r - mix(lo.x, lo.y, t)) / max(0.000001f, mix(hi.x-lo.x, hi.y-lo.y, t)));
-        float2 radii = hub + (1 - hub) * mix(lo, hi, f);
+        float f = saturate((r - lo.z) * hi.w);
+        float2 radii = hub + (1 - hub) * mix(lo.xy, hi.xy, f);
         half4 p = parent.sample(sample, polar(a, radii.x));
         if (b < 0 || b > 1 || hi.y <= lo.y) return p;
         half4 c = child.sample(sample, polar(b, radii.y));
@@ -97,6 +104,7 @@ final class SunburstZoomView: MTKView {
     private let renderer: ChartRenderer
     private let parent: MTLTexture, child: MTLTexture
     private let stops: [SIMD2<Float>]
+    private var mappedStops: [SIMD4<Float>]
     private var lens: SIMD4<Float>
     private var from: Double, to: Double, began: CFTimeInterval = 0
     var completed: (() -> Void)?
@@ -111,6 +119,7 @@ final class SunburstZoomView: MTKView {
             SIMD2(Float(parentStops[min(index, parentStops.count - 1)]),
                 Float(childStops[min(max(0, index - offset), childStops.count - 1)]))
         }
+        mappedStops = Array(repeating: .zero, count: stops.count)
         lens = SIMD4(Float(anchor.start), Float(anchor.end), Float(hub), inward ? 0 : 1)
         from = inward ? 0 : 1; to = 1 - from
         super.init(frame: frame, device: renderer.device)
@@ -137,7 +146,7 @@ final class SunburstZoomView: MTKView {
     }
     private var legDuration: Double { max(0.08, 0.32 * abs(to - from)) }
     func start() {
-        preferredFramesPerSecond = min(120, window?.screen?.maximumFramesPerSecond ?? 60)
+        preferredFramesPerSecond = displayRefreshRate
         beginLeg()
         isPaused = false
         draw()
@@ -168,17 +177,28 @@ final class SunburstZoomView: MTKView {
     override func draw(_ dirtyRect: NSRect) {
         guard began > 0, !isPaused else { return }
         let time = min(1, (CACurrentMediaTime() - began) / legDuration)
-        guard time < 1, let pass = currentRenderPassDescriptor, let drawable = currentDrawable,
+        guard time < 1 else { isPaused = true; completed?(); return }
+        guard let pass = currentRenderPassDescriptor, let drawable = currentDrawable,
               let command = renderer.queue.makeCommandBuffer(), let encoder = command.makeRenderCommandEncoder(descriptor: pass)
-        else { isPaused = true; completed?(); return }
+        else { return }
         let ease = ChartMotion.easeOut(time)
         lens.w = Float(from + (to - from) * ease)
         encoder.setRenderPipelineState(renderer.pipeline)
         encoder.setFragmentTexture(parent, index: 0); encoder.setFragmentTexture(child, index: 1)
-        encoder.setFragmentBytes(&lens, length: MemoryLayout.size(ofValue: lens), index: 0)
-        stops.withUnsafeBytes { encoder.setFragmentBytes($0.baseAddress!, length: $0.count, index: 1) }
-        var count = UInt32(stops.count)
-        encoder.setFragmentBytes(&count, length: MemoryLayout<UInt32>.size, index: 2)
+        let width = lens.y - lens.x, t = lens.w, span = pow(width, t)
+        let start = width < 0.999999 ? lens.x * (1 - span) / (1 - width) : t * lens.x
+        var angles = SIMD4(lens.x, 1 / width, span, start)
+        let fade = min(1, max(0, (t - 0.12) / 0.76))
+        var state = SIMD4(lens.z, t, fade * fade * (3 - 2 * fade), Float(stops.count))
+        var previous: Float = 0
+        for (i, stop) in stops.enumerated() {
+            let depth = stop.x + (stop.y - stop.x) * t
+            mappedStops[i] = SIMD4(stop.x, stop.y, depth, 1 / max(0.000001, depth - previous))
+            previous = depth
+        }
+        encoder.setFragmentBytes(&angles, length: MemoryLayout.size(ofValue: angles), index: 0)
+        mappedStops.withUnsafeBytes { encoder.setFragmentBytes($0.baseAddress!, length: $0.count, index: 1) }
+        encoder.setFragmentBytes(&state, length: MemoryLayout.size(ofValue: state), index: 2)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding(); command.present(drawable); command.commit()
     }

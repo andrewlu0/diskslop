@@ -4,6 +4,14 @@ import Metal
 struct Sector {
     let item: DiskItem, start: Double, end: Double, group: UInt32?, tone: KindTone
     let lastRing: Int, parentInode: UInt64
+    func path(center: CGPoint, inner: CGFloat, outer: CGFloat) -> CGPath {
+        let a = (.pi / 2) - start * 2 * .pi, b = (.pi / 2) - end * 2 * .pi
+        let path = CGMutablePath()
+        path.addArc(center: center, radius: outer, startAngle: a, endAngle: b, clockwise: true)
+        path.addArc(center: center, radius: inner, startAngle: b, endAngle: a, clockwise: false)
+        path.closeSubpath()
+        return path
+    }
     var identity: MapItemName { MapItemName(parent: parentInode, name: item.title) }
     func spanning(_ start: Double, _ end: Double) -> Self {
         Self(item: item, start: start, end: end, group: group, tone: tone, lastRing: lastRing, parentInode: parentInode)
@@ -30,6 +38,99 @@ private struct SectorPaint {
     }
 }
 
+struct SunburstStyle: Equatable {
+    let radius: CGFloat, scale: CGFloat, appearance: NSAppearance, shine: Bool
+    var hub: CGFloat { min(70, max(22, radius * 0.23)) }
+
+    fileprivate func draw(_ rings: Rings, list: FolderListing, center: CGPoint, in context: CGContext, cancelled: () -> Bool) {
+        let pixel = 1 / scale, dark = appearance.usesDarkColors
+        var paints = [UInt32: SectorPaint]()
+        func ringRadius(_ i: Int) -> CGFloat { hub + (radius - hub) * rings.stops[i] }
+        context.setLineWidth(pixel)
+        let style = NSMutableParagraphStyle(); style.alignment = .center; style.lineBreakMode = .byTruncatingMiddle
+        let font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        for (i, band) in rings.bands.enumerated() {
+            if cancelled() { return }
+            let inner = ringRadius(i), outer = ringRadius(i+1)
+            let middle = (inner+outer)/2, thickness = outer-inner
+            var shapes: [UInt32: CGMutablePath] = [:]
+            for sector in band {
+                let rgb = dark ? sector.tone.dark : sector.tone.light
+                if shapes[rgb] == nil { shapes[rgb] = CGMutablePath() }
+                shapes[rgb]!.addPath(sector.path(center: center, inner: inner, outer: outer))
+            }
+            for (rgb, shape) in shapes {
+                if cancelled() { return }
+                let paint = paints[rgb] ?? SectorPaint(rgb)
+                paints[rgb] = paint
+                if shine {
+                    context.saveGState(); context.addPath(shape); context.clip()
+                    context.drawRadialGradient(paint.surface, startCenter: center, startRadius: inner,
+                        endCenter: center, endRadius: outer, options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+                    context.restoreGState()
+                } else { context.setFillColor(paint.fill); context.addPath(shape); context.fillPath() }
+            }
+            for sector in band {
+                let rgb = dark ? sector.tone.dark : sector.tone.light
+                guard let paint = paints[rgb] else { continue }
+                let arc = (sector.end-sector.start) * 2 * .pi
+                if middle * arc >= pixel * 2.5 {
+                    let a = .pi/2 - sector.start * 2 * .pi, b = .pi/2 - sector.end * 2 * .pi
+                    context.setStrokeColor(paint.seam)
+                    context.move(to: CGPoint(x: center.x + inner*cos(a), y: center.y + inner*sin(a)))
+                    context.addLine(to: CGPoint(x: center.x + outer*cos(a), y: center.y + outer*sin(a)))
+                    context.strokePath()
+                    context.setStrokeColor(shine ? paint.outer : paint.seam)
+                    context.addArc(center: center, radius: outer - pixel/2, startAngle: a, endAngle: b, clockwise: true)
+                    context.strokePath()
+                    if shine && thickness > 4 * pixel {
+                        context.setStrokeColor(paint.inner)
+                        context.addArc(center: center, radius: inner + pixel/2, startAngle: a, endAngle: b, clockwise: true)
+                        context.strokePath()
+                    }
+                }
+                let width = min(142, middle * arc - 10, sqrt(max(0, 3 * middle * (thickness-14))))
+                if width >= 43 && thickness >= 17 {
+                    let angle = .pi/2 - (sector.start + sector.end) * .pi
+                    var tangent = (angle - .pi/2).truncatingRemainder(dividingBy: .pi)
+                    if tangent < -.pi/2 { tangent += .pi }
+                    context.saveGState()
+                    context.translateBy(x: center.x + middle*cos(angle), y: center.y + middle*sin(angle))
+                    context.rotate(by: tangent)
+                    (sector.item.title as NSString).draw(in: CGRect(x: -width/2, y: -7, width: width, height: 14),
+                        withAttributes: [.font: font, .foregroundColor: paint.ink, .paragraphStyle: style])
+                    context.restoreGState()
+                }
+            }
+        }
+        let url = list.model.url(folder: list.folder, directory: true)
+        let title = url.map { $0.lastPathComponent.isEmpty ? $0.path : $0.lastPathComponent } ?? ""
+        let textWidth = max(15, hub * 1.82)
+        let textRect = CGRect(x: center.x - textWidth/2, y: center.y + 1, width: textWidth, height: 16)
+        (title as NSString).draw(in: textRect, withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.labelColor, .paragraphStyle: style])
+        (formatBytes(list.summary.bytes) as NSString).draw(in: textRect.offsetBy(dx: 0, dy: -18), withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: style])
+    }
+}
+
+private final class RingArtwork {
+    let image: CGImage, texture: MTLTexture?, style: SunburstStyle
+    init?(_ layout: Rings, list: FolderListing, style: SunburstStyle, cancelled: () -> Bool) {
+        let side = max(1, Int(ceil(style.radius * 2 * style.scale)))
+        guard side <= Int(sqrt(24_000_000.0)), !cancelled(), let context = ChartRenderer.bitmap(width: side, height: side) else { return nil }
+        let scale = CGFloat(side) / (2 * style.radius)
+        context.scaleBy(x: scale, y: scale)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        style.appearance.performAsCurrentDrawingAppearance {
+            style.draw(layout, list: list, center: CGPoint(x: style.radius, y: style.radius), in: context, cancelled: cancelled)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard !cancelled(), let image = context.makeImage() else { return nil }
+        self.image = image; self.style = style
+        texture = side <= 2048 ? ChartRenderer.shared?.texture(from: context) : nil
+    }
+}
+
 private final class RingSelection: NSView {
     weak var map: Sunburst?
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
@@ -39,7 +140,8 @@ private final class RingSelection: NSView {
 struct Rings {
     let bands: [[Sector]]
     let stops: [CGFloat]
-    init(_ list: FolderListing, colors: MapBreakdown?, radius: CGFloat, scale: CGFloat, cancelled: () -> Bool) {
+    fileprivate var artwork: RingArtwork?
+    init(_ list: FolderListing, colors: MapBreakdown?, radius: CGFloat, scale: CGFloat, style: SunburstStyle? = nil, cancelled: () -> Bool) {
         let maximum = max(2, min(8, Int(radius / 26)))
         var levels = Array(repeating: [Sector](), count: maximum)
         var tones: [UInt32: KindTone] = [:]
@@ -94,6 +196,7 @@ struct Rings {
             position += 0.35 / Double(coverage.count) + 0.65 * share / total
             return position
         }
+        if let style { artwork = RingArtwork(self, list: list, style: style, cancelled: cancelled) }
     }
     private init(bands: [[Sector]], stops: [CGFloat]) { self.bands = bands; self.stops = stops }
     func starting(at previous: Self) -> Self? {
@@ -122,6 +225,78 @@ struct Rings {
     }
 }
 
+private struct RingHighlight: Equatable {
+    let focusedGroup: UInt32?, selection: Set<UInt64>, whole: Bool
+    var empty: Bool { focusedGroup == nil && selection.isEmpty }
+    func draw(_ rings: Rings, style: SunburstStyle, center: CGPoint, in context: CGContext) {
+        guard !empty else { return }
+        let hub = style.hub, radius = style.radius
+        func path(_ sector: Sector, _ first: Int, through last: Int? = nil) -> CGPath {
+            sector.path(center: center, inner: hub + (radius - hub) * rings.stops[first],
+                outer: hub + (radius - hub) * rings.stops[(last ?? first) + 1])
+        }
+        if let focusedGroup {
+            let matches = CGMutablePath(), others = CGMutablePath()
+            for (level, band) in rings.bands.enumerated() {
+                for sector in band {
+                    (sector.group == focusedGroup ? matches : others).addPath(path(sector, level))
+                }
+            }
+            context.addPath(others)
+            context.setFillColor(CGColor(gray: 0, alpha: selectionDimOpacity))
+            context.fillPath()
+            context.addPath(matches)
+            context.setLineWidth(1 / style.scale)
+            context.setStrokeColor(NSColor.labelColor.cgColor)
+            context.strokePath()
+            return
+        }
+        guard !selection.isEmpty else { return }
+        context.setLineWidth(1 / style.scale)
+        context.setStrokeColor(NSColor.labelColor.cgColor)
+        if whole {
+            for r in [hub, radius] {
+                context.strokeEllipse(in: CGRect(x: center.x-r, y: center.y-r, width: 2*r, height: 2*r))
+            }
+            return
+        }
+        let selected = CGMutablePath()
+        for (i, band) in rings.bands.enumerated() {
+            for sector in band where selection.contains(sector.item.key) { selected.addPath(path(sector, i, through: sector.lastRing)) }
+        }
+        guard !selected.isEmpty else { return }
+        let chart = CGMutablePath()
+        for r in [hub, radius] { chart.addEllipse(in: CGRect(x: center.x-r, y: center.y-r, width: 2*r, height: 2*r)) }
+        shadeUnselected(in: context, chart: chart, selected: selected)
+        context.addPath(selected)
+        context.strokePath()
+    }
+}
+
+private struct RingFrame {
+    let layout: Rings, list: FolderListing, style: SunburstStyle, highlight: RingHighlight
+    var readyTexture: MTLTexture? { highlight.empty ? layout.artwork?.texture : nil }
+
+    func texture(using renderer: ChartRenderer) -> MTLTexture? {
+        if let readyTexture { return readyTexture }
+        let diameter = 2 * style.radius, center = CGPoint(x: style.radius, y: style.radius)
+        let side = min(2048, max(1, Int(ceil(diameter * style.scale))))
+        return renderer.snapshot(width: side, height: side) { context in
+            let scale = CGFloat(side) / diameter
+            context.scaleBy(x: scale, y: scale)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+            style.appearance.performAsCurrentDrawingAppearance {
+                if let artwork = layout.artwork {
+                    context.draw(artwork.image, in: CGRect(x: 0, y: 0, width: diameter, height: diameter))
+                } else { style.draw(layout, list: list, center: center, in: context, cancelled: { false }) }
+                highlight.draw(layout, style: style, center: center, in: context)
+            }
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+}
+
 final class Sunburst: NSView {
     var choose: (([[DiskItem]], SelectionMode) -> Void)?
     var menuForRoute: (([DiskItem]) -> NSMenu?)?
@@ -137,13 +312,17 @@ final class Sunburst: NSView {
     private var trashTransition: ChartReflow?
     private var zoomView: SunburstZoomView?
     private struct Departure {
-        let source: FolderListing, target: FolderListing, rings: Rings, texture: MTLTexture?
+        let source: FolderListing, target: FolderListing, rings: Rings, frame: RingFrame?
+    }
+    private struct ZoomImages {
+        let previous: MTLTexture?, next: MTLTexture?, highlight: RingHighlight
     }
     private var departure: Departure?
     var preparingZoom: Bool { departure != nil }
     private var chartFrame: CGRect { CGRect(x: center.x - radius, y: center.y - radius, width: 2 * radius, height: 2 * radius) }
 
     func highlight(group: UInt32?, colors: MapBreakdown?) {
+        guard focusedGroup != group || focusColors !== colors else { return }
         focusedGroup = group
         focusColors = colors
         overlay.needsDisplay = true
@@ -155,7 +334,6 @@ final class Sunburst: NSView {
     private let motion = ChartMotion()
     private let queue = OperationQueue()
     private let overlay = RingSelection()
-    private var paints: [UInt32: SectorPaint] = [:]
     private var task: BlockOperation?
     private var lastRadius: CGFloat = 0
     private var tracking: NSTrackingArea?
@@ -165,7 +343,10 @@ final class Sunburst: NSView {
     private var center: CGPoint { CGPoint(x: bounds.midX, y: bounds.midY) }
     private var radius: CGFloat { max(1, min(bounds.width, bounds.height) / 2 - 10) }
     private var hub: CGFloat { min(70, max(22, radius * 0.23)) }
-    var liveDimensions: (radius: CGFloat, scale: CGFloat) { (radius, window?.backingScaleFactor ?? 2) }
+    var liveDimensions: SunburstStyle {
+        SunburstStyle(radius: radius, scale: window?.backingScaleFactor ?? 2, appearance: effectiveAppearance,
+            shine: !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency)
+    }
     var trackingSelection: Bool { dragStart != nil }
     private func ringRadius(_ boundary: Int) -> CGFloat { hub + (radius - hub) * (rings?.stops[boundary] ?? 0) }
 
@@ -185,21 +366,16 @@ final class Sunburst: NSView {
         setAccessibilityHelp("Select a wedge to reveal its item in the folder list. Double-click a folder to explore it.")
     }
     required init?(coder: NSCoder) { nil }
+    private func highlight(for colors: MapBreakdown?) -> RingHighlight {
+        RingHighlight(focusedGroup: focusColors === colors ? focusedGroup : nil, selection: selection,
+            whole: !selection.isDisjoint(with: scopeKeys))
+    }
+    private func frame(_ layout: Rings, _ list: FolderListing, _ colors: MapBreakdown?) -> RingFrame {
+        RingFrame(layout: layout, list: list, style: liveDimensions, highlight: highlight(for: colors))
+    }
     private func snapshot(using renderer: ChartRenderer) -> MTLTexture? {
-        let frame = chartFrame
-        let side = min(2048, max(1, Int(ceil(frame.width * (window?.backingScaleFactor ?? 1)))))
-        return renderer.snapshot(width: side, height: side) { context in
-            let scale = CGFloat(side) / frame.width
-            context.scaleBy(x: scale, y: scale)
-            context.translateBy(x: -frame.minX, y: -frame.minY)
-            NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
-            effectiveAppearance.performAsCurrentDrawingAppearance {
-                drawChart(in: context)
-                drawSelection(in: context)
-            }
-            NSGraphicsContext.restoreGraphicsState()
-        }
+        guard let rings, let ringList else { return nil }
+        return frame(rings, ringList, ringColors).texture(using: renderer)
     }
     func prepareZoom(to target: FolderListing) {
         endTrashReflow()
@@ -207,8 +383,9 @@ final class Sunburst: NSView {
         guard let source = ringList, source.model === target.model, source.folder != target.folder,
               !isHiddenOrHasHiddenAncestor, window?.isVisible == true, radius > hub,
               let rings else { return }
-        let texture = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : zoomRenderer.flatMap(snapshot(using:))
-        departure = Departure(source: source, target: target, rings: rings, texture: texture)
+        let reversing = zoomView.map { Set([$0.parentID, $0.childID]) == Set([source.folder, target.folder]) } ?? false
+        let sourceFrame = reversing || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : frame(rings, source, ringColors)
+        departure = Departure(source: source, target: target, rings: rings, frame: sourceFrame)
     }
     private func endZoom() {
         zoomView?.isPaused = true
@@ -216,9 +393,35 @@ final class Sunburst: NSView {
         zoomView?.removeFromSuperview(); zoomView = nil
         needsDisplay = true; overlay.needsDisplay = true
     }
-    private func install(_ result: Rings, for list: FolderListing, colors: MapBreakdown?, sameFolder: Bool = false) {
+    private func install(_ result: Rings, for list: FolderListing, colors: MapBreakdown?, sameFolder: Bool = false, prepared: ZoomImages? = nil) {
         let staying = ringList === list || sameFolder
         let trip = departure
+        var images = prepared
+        if let trip, trip.target === list, let source = trip.frame, let renderer = zoomRenderer,
+           !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            let target = frame(result, list, colors)
+            if prepared?.highlight != target.highlight {
+                if let previous = source.readyTexture, let next = target.readyTexture {
+                    images = ZoomImages(previous: previous, next: next, highlight: target.highlight)
+                } else {
+                    let work = BlockOperation()
+                    task?.cancel(); task = work
+                    work.addExecutionBlock { [weak self, weak work] in
+                        guard let work, !work.isCancelled else { return }
+                        let previous = prepared?.previous ?? source.texture(using: renderer)
+                        guard !work.isCancelled else { return }
+                        let textures = ZoomImages(previous: previous, next: target.texture(using: renderer), highlight: target.highlight)
+                        DispatchQueue.main.async {
+                            guard let self, self.task === work, !work.isCancelled, self.departure?.target === list else { return }
+                            self.task = nil
+                            self.install(result, for: list, colors: colors, sameFolder: sameFolder, prepared: textures)
+                        }
+                    }
+                    queue.addOperation(work)
+                    return
+                }
+            }
+        }
         departure = nil
         rings = result; ringList = list; ringColors = colors
         needsDisplay = true; overlay.needsDisplay = true
@@ -238,9 +441,9 @@ final class Sunburst: NSView {
         }
         let entering = anchor(in: trip.rings, folder: list.folder)
         guard let (level, wedge) = entering ?? anchor(in: result, folder: trip.source.folder),
-              Float(wedge.end) > Float(wedge.start), let zoomRenderer, let previous = trip.texture,
-              let image = snapshot(using: zoomRenderer) else {
-            let fade = CATransition(); fade.type = .fade; fade.duration = 0.16; fade.timingFunction = ChartMotion.timingFunction
+              Float(wedge.end) > Float(wedge.start), let zoomRenderer, let previous = images?.previous,
+              let image = images?.next else {
+            let fade = CATransition(); fade.type = .fade; fade.duration = 0.16; fade.preferredFrameRateRange = chartFrameRate(displayRefreshRate); fade.timingFunction = ChartMotion.timingFunction
             layer?.add(fade, forKey: "folderChange")
             return
         }
@@ -274,7 +477,7 @@ final class Sunburst: NSView {
         guard let view = trashTransition else { return }
         view.cancel(); trashTransition = nil; needsDisplay = true; overlay.needsDisplay = true
     }
-    private func animateTrash(from previous: Rings, to layout: Rings) -> Bool {
+    private func animateReflow(from previous: Rings, to layout: Rings, duration: CFTimeInterval) -> Bool {
         guard !layout.bands.isEmpty, let zoomRenderer, window?.isVisible == true else { return false }
         let hubRatio = Float(hub / radius)
         func radiusAt(_ stop: CGFloat) -> Float { hubRatio + (1 - hubRatio) * Float(stop) }
@@ -299,7 +502,7 @@ final class Sunburst: NSView {
         let hubBox = SIMD4<Float>(0, 0, 1, hubRatio)
         patches.append(ChartPatch(from: hubBox, to: hubBox))
         guard let texture = snapshot(using: zoomRenderer),
-              let view = ChartReflow(frame: chartFrame, renderer: zoomRenderer, texture: texture, patches: patches, radial: true) else { return false }
+              let view = ChartReflow(frame: chartFrame, renderer: zoomRenderer, texture: texture, patches: patches, radial: true, duration: duration) else { return false }
         trashTransition = view; addSubview(view)
         view.completed = { [weak self] in self?.endTrashReflow(); self?.refreshHover() }
         view.start()
@@ -309,27 +512,35 @@ final class Sunburst: NSView {
         endTrashReflow()
         if afterTrash { departure = nil; endZoom() }
         task?.cancel(); task = nil; motion.stop(); discardTrashBacking()
+        if let style = layout.artwork?.style, style != liveDimensions {
+            list = next; self.colors = colors; rebuild(); return
+        }
         list = next; self.colors = colors; lastRadius = radius
         let previous = rings
         install(layout, for: next, colors: colors, sameFolder: sameFolder)
+        guard departure == nil else { return }
         setAccessibilityValue("\(layout.bands.count) rings · \(formatBytes(next.summary.bytes))")
         if sameFolder, zoomView == nil, let previous, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            if afterTrash && animateTrash(from: previous, to: layout) {
+            if afterTrash && animateReflow(from: previous, to: layout, duration: 0.36) {
                 refreshHover()
                 return
             }
-            if afterTrash || layout.bands.reduce(0, { $0 + $1.count }) <= 256 {
-                if let start = layout.starting(at: previous) {
-                    motion.start { [weak self] in
+            if let start = layout.starting(at: previous) {
+                if !afterTrash && animateReflow(from: start, to: layout, duration: ChartMotion.duration) {
+                    refreshHover()
+                    return
+                }
+                if layout.bands.reduce(0, { $0 + $1.count }) <= 256 {
+                    motion.start(on: self) { [weak self] in
                         guard let self else { return }
                         self.rings = self.motion.fraction == 1 ? layout : layout.interpolated(from: start, fraction: self.motion.fraction)
                         self.needsDisplay = true; self.overlay.needsDisplay = true
                         if self.motion.fraction == 1 { self.refreshHover() }
                     }
+                } else {
+                    let fade = CATransition(); fade.type = .fade; fade.duration = 0.16; fade.preferredFrameRateRange = chartFrameRate(displayRefreshRate); fade.timingFunction = ChartMotion.timingFunction
+                    layer?.add(fade, forKey: "liveReflow")
                 }
-            } else {
-                let fade = CATransition(); fade.type = .fade; fade.duration = 0.16; fade.timingFunction = ChartMotion.timingFunction
-                layer?.add(fade, forKey: "liveReflow")
             }
         }
         needsDisplay = true; overlay.needsDisplay = true
@@ -349,19 +560,20 @@ final class Sunburst: NSView {
     override func viewDidHide() { super.viewDidHide(); endTrashReflow(); endZoom() }
     override func viewDidChangeBackingProperties() { super.viewDidChangeBackingProperties(); departure = nil; endTrashReflow(); endZoom(); rebuild() }
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); appearanceChanged() }
-    @objc private func appearanceChanged() { endTrashReflow(); departure = nil; endZoom() }
+    @objc private func appearanceChanged() { endTrashReflow(); departure = nil; endZoom(); rebuild() }
     private func rebuild() {
         motion.stop()
         task?.cancel()
         guard let list, !isHidden, radius > 2 else { return }
-        let radius = radius, scale = window?.backingScaleFactor ?? 2, colors = colors
-        lastRadius = radius
+        let style = liveDimensions, colors = colors
+        lastRadius = style.radius
         let work = BlockOperation(); task = work
         work.addExecutionBlock { [weak self, weak work] in
             guard let work, !work.isCancelled else { return }
-            let result = Rings(list, colors: colors, radius: radius, scale: scale) { work.isCancelled }
+            let result = Rings(list, colors: colors, radius: style.radius, scale: style.scale, style: style) { work.isCancelled }
             DispatchQueue.main.async {
                 guard let self, self.task === work, !work.isCancelled else { return }
+                self.task = nil
                 self.discardTrashBacking()
                 self.install(result, for: list, colors: colors)
                 self.setAccessibilityValue("\(result.bands.count) rings · \(formatBytes(list.summary.bytes))")
@@ -376,85 +588,17 @@ final class Sunburst: NSView {
         let area = NSTrackingArea(rect: .zero, options: [.activeInKeyWindow, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved], owner: self, userInfo: nil)
         tracking = area; addTrackingArea(area)
     }
-    private func path(_ sector: Sector, _ ring: Int, through last: Int? = nil) -> CGPath {
-        let a = (.pi / 2) - sector.start * 2 * .pi, b = (.pi / 2) - sector.end * 2 * .pi
-        let inner = ringRadius(ring), outer = ringRadius((last ?? ring)+1)
-        let path = CGMutablePath()
-        path.addArc(center: center, radius: outer, startAngle: a, endAngle: b, clockwise: true)
-        path.addArc(center: center, radius: inner, startAngle: b, endAngle: a, clockwise: false)
-        path.closeSubpath()
-        return path
-    }
     override func draw(_ dirtyRect: NSRect) {
         guard trashTransition == nil, zoomView == nil, let context = NSGraphicsContext.current?.cgContext else { return }
         drawChart(in: context)
     }
     private func drawChart(in context: CGContext) {
-        guard let list = ringList ?? list else { return }
-        let dark = effectiveAppearance.usesDarkColors, pixel = 1 / (window?.backingScaleFactor ?? 2)
-        context.setLineWidth(pixel)
-        let shine = !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
-        if paints.count > 512 { paints.removeAll(keepingCapacity: true) }
-        let style = NSMutableParagraphStyle(); style.alignment = .center; style.lineBreakMode = .byTruncatingMiddle
-        let font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        for (i, band) in (rings?.bands ?? []).enumerated() {
-            let inner = ringRadius(i), outer = ringRadius(i+1)
-            let middle = (inner+outer)/2, thickness = outer-inner
-            var shapes: [UInt32: CGMutablePath] = [:]
-            for sector in band {
-                let rgb = dark ? sector.tone.dark : sector.tone.light
-                if shapes[rgb] == nil { shapes[rgb] = CGMutablePath() }
-                shapes[rgb]!.addPath(path(sector, i))
-            }
-            for (rgb, shape) in shapes {
-                let paint = paints[rgb] ?? SectorPaint(rgb)
-                paints[rgb] = paint
-                if shine {
-                    context.saveGState(); context.addPath(shape); context.clip()
-                    context.drawRadialGradient(paint.surface, startCenter: center, startRadius: inner,
-                        endCenter: center, endRadius: outer, options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
-                    context.restoreGState()
-                } else { context.setFillColor(paint.fill); context.addPath(shape); context.fillPath() }
-            }
-            for sector in band {
-                let rgb = dark ? sector.tone.dark : sector.tone.light
-                guard let paint = paints[rgb] else { continue }
-                let arc = (sector.end-sector.start) * 2 * .pi
-                if middle * arc >= pixel * 2.5 {
-                    let a = .pi/2 - sector.start * 2 * .pi, b = .pi/2 - sector.end * 2 * .pi
-                    context.setStrokeColor(paint.seam)
-                    context.move(to: CGPoint(x: center.x + inner*cos(a), y: center.y + inner*sin(a)))
-                    context.addLine(to: CGPoint(x: center.x + outer*cos(a), y: center.y + outer*sin(a)))
-                    context.strokePath()
-                    context.setStrokeColor(shine ? paint.outer : paint.seam)
-                    context.addArc(center: center, radius: outer - pixel/2, startAngle: a, endAngle: b, clockwise: true)
-                    context.strokePath()
-                    if shine && thickness > 4 * pixel {
-                        context.setStrokeColor(paint.inner)
-                        context.addArc(center: center, radius: inner + pixel/2, startAngle: a, endAngle: b, clockwise: true)
-                        context.strokePath()
-                    }
-                }
-                let width = min(142, middle * arc - 10, sqrt(max(0, 3 * middle * (thickness-14))))
-                if width >= 43 && thickness >= 17 {
-                    let angle = .pi/2 - (sector.start + sector.end) * .pi
-                    var tangent = (angle - .pi/2).truncatingRemainder(dividingBy: .pi)
-                    if tangent < -.pi/2 { tangent += .pi }
-                    context.saveGState()
-                    context.translateBy(x: center.x + middle*cos(angle), y: center.y + middle*sin(angle))
-                    context.rotate(by: tangent)
-                    (sector.item.title as NSString).draw(in: CGRect(x: -width/2, y: -7, width: width, height: 14),
-                        withAttributes: [.font: font, .foregroundColor: paint.ink, .paragraphStyle: style])
-                    context.restoreGState()
-                }
-            }
+        guard let rings, let list = ringList ?? list else { return }
+        if let artwork = rings.artwork {
+            context.draw(artwork.image, in: chartFrame)
+        } else {
+            liveDimensions.draw(rings, list: list, center: center, in: context, cancelled: { false })
         }
-        let url = list.model.url(folder: list.folder, directory: true)
-        let title = url.map { $0.lastPathComponent.isEmpty ? $0.path : $0.lastPathComponent } ?? ""
-        let textWidth = max(15, hub * 1.82)
-        let textRect = CGRect(x: center.x - textWidth/2, y: center.y + 1, width: textWidth, height: 16)
-        (title as NSString).draw(in: textRect, withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.labelColor, .paragraphStyle: style])
-        (formatBytes(list.summary.bytes) as NSString).draw(in: textRect.offsetBy(dx: 0, dy: -18), withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: style])
     }
     fileprivate func drawSelection() {
         guard trashTransition == nil, zoomView == nil, let context = NSGraphicsContext.current?.cgContext else { return }
@@ -462,41 +606,7 @@ final class Sunburst: NSView {
     }
     private func drawSelection(in context: CGContext) {
         guard let rings else { return }
-        if let focusedGroup, focusColors === ringColors {
-            let matches = CGMutablePath(), others = CGMutablePath()
-            for (level, band) in rings.bands.enumerated() {
-                for sector in band {
-                    (sector.group == focusedGroup ? matches : others).addPath(path(sector, level))
-                }
-            }
-            context.addPath(others)
-            context.setFillColor(CGColor(gray: 0, alpha: selectionDimOpacity))
-            context.fillPath()
-            context.addPath(matches)
-            context.setLineWidth(1 / (window?.backingScaleFactor ?? 2))
-            context.setStrokeColor(NSColor.labelColor.cgColor)
-            context.strokePath()
-            return
-        }
-        guard !selection.isEmpty else { return }
-        context.setLineWidth(1 / (window?.backingScaleFactor ?? 2))
-        context.setStrokeColor(NSColor.labelColor.cgColor)
-        if !selection.isDisjoint(with: scopeKeys) {
-            for r in [hub, radius] {
-                context.strokeEllipse(in: CGRect(x: center.x-r, y: center.y-r, width: 2*r, height: 2*r))
-            }
-            return
-        }
-        let selected = CGMutablePath()
-        for (i, band) in rings.bands.enumerated() {
-            for sector in band where selection.contains(sector.item.key) { selected.addPath(path(sector, i, through: sector.lastRing)) }
-        }
-        guard !selected.isEmpty else { return }
-        let chart = CGMutablePath()
-        for r in [hub, radius] { chart.addEllipse(in: CGRect(x: center.x-r, y: center.y-r, width: 2*r, height: 2*r)) }
-        shadeUnselected(in: context, chart: chart, selected: selected)
-        context.addPath(selected)
-        context.strokePath()
+        highlight(for: ringColors).draw(rings, style: liveDimensions, center: center, in: context)
     }
     func trashRegions(for keys: Set<UInt64>) -> [TrashGlassRegion] {
         guard let rings, let window, !keys.isEmpty else { return [] }

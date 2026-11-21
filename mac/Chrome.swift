@@ -84,7 +84,8 @@ final class WindowToolbar: NSObject, NSToolbarDelegate {
         updateZoom(inward: hasScan && scale < CGFloat(1 << 30), outward: hasScan && scale > 1)
     }
     func updateZoom(inward: Bool, outward: Bool) {
-        items["zoomIn"]?.isEnabled = inward; items["zoomOut"]?.isEnabled = outward
+        if let item = items["zoomIn"], item.isEnabled != inward { item.isEnabled = inward }
+        if let item = items["zoomOut"], item.isEnabled != outward { item.isEnabled = outward }
     }
     func update(busy: Bool, scanning: Bool, back: Bool, forward: Bool, hasScan: Bool) {
         for name in ["choose", "home", "disk"] { items[name]?.isEnabled = !busy }

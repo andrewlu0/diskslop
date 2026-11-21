@@ -89,6 +89,7 @@ final class FileOutlineView: NSOutlineView {
 }
 
 private final class TreeSource {
+    var orderGeneration: UInt64 = 0
     var model: ScanModel
     init(_ model: ScanModel) { self.model = model }
 }
@@ -99,6 +100,19 @@ private final class TreeRow: NSObject {
     weak var parent: TreeRow?
     let folder: UInt32, slot: UInt32
     private var cached: DTRow
+    private var orderGeneration: UInt64 = 0
+    private var children: [TreeRow] = []
+    // AppKit asks for the same ordered children again when an outline item reopens.
+    func child(at index: Int, load: () -> TreeRow?) -> TreeRow? {
+        if orderGeneration != source.orderGeneration {
+            children.removeAll(keepingCapacity: true); orderGeneration = source.orderGeneration
+        }
+        if children.indices.contains(index) { return children[index] }
+        guard let child = load() else { return nil }
+        if index == children.count { children.append(child) }
+        return child
+    }
+
     var raw: DTRow {
         get {
             if snapshot !== model {
@@ -190,6 +204,7 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
             return
         }
         guard refresh else { return }
+        source?.orderGeneration &+= 1
         let old = expanded.values.sorted { view.level(forItem: $0) < view.level(forItem: $1) }
         updateRoot(in: newModel)
         view.reloadData()
@@ -434,10 +449,13 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         guard let model else { return NSNull() }
         if item == nil, let rootRow { return rootRow }
         guard let parent = item as? TreeRow else { return NSNull() }
-        let folder = parent.raw.child
-        var raw = DTRow()
-        guard dt_child(model.handle, folder, index, &raw) else { return NSNull() }
-        return object(raw, folder: folder, parent: parent)
+        guard let child = parent.child(at: index, load: {
+            let folder = parent.raw.child
+            var raw = DTRow()
+            guard dt_child(model.handle, folder, index, &raw) else { return nil }
+            return object(raw, folder: folder, parent: parent)
+        }) else { return NSNull() }
+        return child
     }
     func outlineViewItemDidExpand(_ notification: Notification) {
         if let row = notification.userInfo?["NSObject"] as? TreeRow { expanded[row.key] = row }

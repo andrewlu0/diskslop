@@ -10,12 +10,13 @@ final class ChartReflow: MTKView {
     private let patches: [ChartPatch]
     private let batches: [(offset: Int, count: Int, segments: Int)]
     private let radial: Bool
-    private static let duration: CFTimeInterval = 0.36
+    private let duration: CFTimeInterval
     private var began: CFTimeInterval = 0
     private var fraction: Float = 0
     var completed: (() -> Void)?
 
-    init?(frame: CGRect, renderer: ChartRenderer, texture: MTLTexture, patches: [ChartPatch], radial: Bool) {
+    init?(frame: CGRect, renderer: ChartRenderer, texture: MTLTexture, patches: [ChartPatch], radial: Bool, duration: CFTimeInterval = 0.36) {
+        self.duration = duration
         guard !patches.isEmpty else { return nil }
         self.renderer = renderer; self.texture = texture; self.radial = radial
         if radial {
@@ -54,9 +55,9 @@ final class ChartReflow: MTKView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     func start() {
-        preferredFramesPerSecond = min(120, window?.screen?.maximumFramesPerSecond ?? 60)
+        preferredFramesPerSecond = displayRefreshRate
         began = CACurrentMediaTime(); isPaused = false; draw()
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.duration) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
             guard let self, !self.isPaused else { return }
             self.isPaused = true; self.completed?()
         }
@@ -77,10 +78,11 @@ final class ChartReflow: MTKView {
     }
     override func draw(_ dirtyRect: NSRect) {
         guard !isPaused, began > 0 else { return }
-        let t = min(1, (CACurrentMediaTime() - began) / Self.duration)
-        guard t < 1, let pass = currentRenderPassDescriptor, let drawable = currentDrawable,
+        let t = min(1, (CACurrentMediaTime() - began) / duration)
+        guard t < 1 else { isPaused = true; completed?(); return }
+        guard let pass = currentRenderPassDescriptor, let drawable = currentDrawable,
               let command = renderer.queue.makeCommandBuffer(), let encoder = command.makeRenderCommandEncoder(descriptor: pass)
-        else { isPaused = true; completed?(); return }
+        else { return }
         fraction = Float(ChartMotion.easeOut(t))
         encoder.setRenderPipelineState(renderer.reflowPipeline)
         encoder.setFragmentTexture(texture, index: 0)

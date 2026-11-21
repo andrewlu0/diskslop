@@ -76,7 +76,44 @@ final class LiveCheckpointWriter {
     }
 }
 
-/// Runs only while geometry is moving. Hit testing and drawing use the same presentation values.
+func chartFrameRate(_ refreshRate: Int) -> CAFrameRateRange {
+    let rate = Float(refreshRate > 0 ? refreshRate : 60)
+    return CAFrameRateRange(minimum: min(30, rate), maximum: rate, preferred: rate)
+}
+
+extension NSView {
+    var displayRefreshRate: Int {
+        let rate = (window?.screen ?? NSScreen.main)?.maximumFramesPerSecond ?? 0
+        return rate > 0 ? rate : 60
+    }
+}
+
+private final class DisplayTick: NSObject {
+    let action: () -> Void
+    init(_ action: @escaping () -> Void) { self.action = action }
+    @objc func tick() { action() }
+}
+
+final class ChartFrameClock {
+    private var invalidate: (() -> Void)?
+    var running: Bool { invalidate != nil }
+    func start(on view: NSView, _ update: @escaping () -> Void) {
+        guard !running else { return }
+        if #available(macOS 14.0, *), view.window != nil {
+            let link = view.displayLink(target: DisplayTick(update), selector: #selector(DisplayTick.tick))
+            link.preferredFrameRateRange = chartFrameRate(view.displayRefreshRate)
+            invalidate = { link.invalidate() }
+            link.add(to: .main, forMode: .common)
+        } else {
+            let timer = Timer(timeInterval: 1 / Double(view.displayRefreshRate), repeats: true) { _ in update() }
+            invalidate = { timer.invalidate() }
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+    func stop() { invalidate?(); invalidate = nil }
+    deinit { stop() }
+}
+
 final class ChartMotion {
     static let duration: TimeInterval = 0.22
     static let timingFunction = CAMediaTimingFunction(controlPoints: 1/3, 1, 2/3, 1)
@@ -84,26 +121,31 @@ final class ChartMotion {
         let remaining = 1 - time
         return 1 - remaining * remaining * remaining
     }
-    private var timer: Timer?
+    private let clock = ChartFrameClock()
+    private var deadline: DispatchWorkItem?
     private(set) var fraction: CGFloat = 1
-    func stop() { timer?.invalidate(); timer = nil; fraction = 1 }
-    func start(_ update: @escaping () -> Void) {
+    func stop() {
+        clock.stop(); deadline?.cancel(); deadline = nil; fraction = 1
+    }
+    func start(on view: NSView, _ update: @escaping () -> Void) {
         stop()
         guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { update(); return }
         let start = CACurrentMediaTime()
-        fraction = 0
-        update()
-        let clock = Timer(timeInterval: 1 / 60, repeats: true) { [weak self] timer in
-            guard let self else { timer.invalidate(); return }
-            let time = min(1, (CACurrentMediaTime() - start) / Self.duration)
-            self.fraction = Self.easeOut(time)
-            if time == 1 { self.stop() }
+        fraction = 0; update()
+        clock.start(on: view) { [weak self] in
+            guard let self else { return }
+            let t = min(1, (CACurrentMediaTime() - start) / Self.duration)
+            self.fraction = Self.easeOut(t)
+            if t == 1 { self.stop() }
             update()
         }
-        timer = clock
-        RunLoop.main.add(clock, forMode: .common)
+        let finish = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.stop(); update()
+        }
+        deadline = finish
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.duration, execute: finish)
     }
-    deinit { timer?.invalidate() }
 }
 
 /// The event journal stays with the cached scan. Only the displayed scan has a subscriber.

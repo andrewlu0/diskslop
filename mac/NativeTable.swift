@@ -3,6 +3,11 @@ import AppKit
 final class FittingTableScrollView: NSScrollView {
     private let table: NSTableView
     private let flexibleID: NSUserInterfaceItemIdentifier
+    private struct Fit: Equatable {
+        let width: CGFloat, viewport: CGFloat, count: Int, style: NSTableView.Style
+        let control: NSControl.ControlSize, border: NSBorderType
+    }
+    private var lastFit: Fit?
     private var fitting = false
     private var insets: (style: NSTableView.Style, count: Int, leading: CGFloat, columns: CGFloat)?
     private var widthObservers: [NSKeyValueObservation] = []
@@ -30,14 +35,15 @@ final class FittingTableScrollView: NSScrollView {
             name: NSTableView.columnDidResizeNotification, object: table)
     }
     required init?(coder: NSCoder) { nil }
-    override func tile() { super.tile(); fitColumns() }
-    override func layout() { super.layout(); fitColumns() }
+    override func tile() { super.tile(); fitColumns(ifNeeded: true) }
+    override func layout() { super.layout(); fitColumns(ifNeeded: true) }
 
     @objc private func columnResized(_ notification: Notification) {
         if let column = notification.userInfo?["NSTableColumn"] as? NSTableColumn { scheduleFit(afterResizing: column) }
     }
     private func scheduleFit(afterResizing column: NSTableColumn) {
         guard !fitting else { return }
+        lastFit = nil
         if let index = table.headerView?.resizedColumn, table.tableColumns.indices.contains(index),
            table.tableColumns[index] === column {
             pendingResize = (column, column.width)
@@ -50,13 +56,18 @@ final class FittingTableScrollView: NSScrollView {
         }
     }
 
-    func fitColumns() {
+    func fitColumns(ifNeeded: Bool = false) {
         let columns = table.tableColumns
         guard !fitting, window != nil, let flex = table.tableColumn(withIdentifier: flexibleID),
               contentView.bounds.width > 0, !columns.isEmpty else { return }
         fitting = true
         defer { fitting = false }
         let viewport = floor(contentView.bounds.width)
+        let controlSize = verticalScroller?.controlSize ?? .regular
+        let fit = Fit(width: bounds.width, viewport: viewport, count: columns.count, style: table.effectiveStyle,
+            control: controlSize, border: borderType)
+        if ifNeeded, table.frame.width == viewport, pendingResize == nil, lastFit == fit { return }
+        lastFit = fit
         if table.frame.width != viewport { table.frame.size.width = viewport }
         // Column rectangles can still reflect the preceding widths while AppKit is resizing.
         if insets?.style != table.effectiveStyle || insets?.count != columns.count {
@@ -68,7 +79,6 @@ final class FittingTableScrollView: NSScrollView {
         guard let insets else { return }
         let nativeInsets = insets.columns
         let outerInset = insets.leading
-        let controlSize = verticalScroller?.controlSize ?? .regular
         // Reserve the scrollbar lane even when every row fits.
         let usable = NSScrollView.contentSize(forFrameSize: bounds.size, horizontalScrollerClass: nil,
             verticalScrollerClass: NSScroller.self, borderType: borderType, controlSize: controlSize, scrollerStyle: .legacy)
@@ -181,6 +191,7 @@ final class TableTextCell: NSTableCellView {
         pulse = glow
         CATransaction.commit()
         let fade = CABasicAnimation(keyPath: "opacity")
+        fade.preferredFrameRateRange = chartFrameRate(displayRefreshRate)
         fade.fromValue = 0.26; fade.toValue = 0; fade.duration = 0.48
         fade.timingFunction = ChartMotion.timingFunction
         glow.add(fade, forKey: "liveChange")

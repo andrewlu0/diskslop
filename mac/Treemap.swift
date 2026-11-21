@@ -3,15 +3,136 @@ import AppKit
 private class FlippedCanvas: NSView {
     override var isFlipped: Bool { true }
 }
+private final class RasterPlane {
+    let layer = CALayer()
+    private var source: CGImage?
+
+    init() {
+        layer.contentsGravity = .resize
+        layer.minificationFilter = .nearest
+        layer.magnificationFilter = .nearest
+    }
+
+    func present(_ image: CGImage?, from sourceRect: CGRect, in viewport: CGRect, host: NSView, visible show: Bool = true) {
+        if source !== image { source = image; layer.contents = image }
+        // Crop in map space so even the deepest zoom keeps compositor layers inside the window.
+        let visible = sourceRect.intersection(viewport)
+        guard show, image != nil, !visible.isEmpty, !visible.isNull else { layer.isHidden = true; return }
+        layer.isHidden = false
+        let size = host.bounds.size
+        let frame = CGRect(x: (visible.minX - viewport.minX) * size.width / viewport.width,
+            y: (visible.minY - viewport.minY) * size.height / viewport.height,
+            width: visible.width * size.width / viewport.width, height: visible.height * size.height / viewport.height)
+        layer.frame = host.convertToLayer(frame)
+        layer.contentsRect = CGRect(x: (visible.minX - sourceRect.minX) / sourceRect.width,
+            y: (visible.minY - sourceRect.minY) / sourceRect.height,
+            width: visible.width / sourceRect.width, height: visible.height / sourceRect.height)
+    }
+}
+
+private final class MapText {
+    let layer = CATextLayer()
+    private var text: String?, font: NSFont?
+    private var width: CGFloat = 0
+
+    init(in parent: CALayer) {
+        layer.truncationMode = .middle
+        parent.addSublayer(layer)
+    }
+    func place(_ value: String, font: NSFont, ink: CGColor, box: CGRect, in host: NSView, scale: CGFloat) {
+        if text != value || self.font != font {
+            text = value; self.font = font
+            layer.string = value; layer.font = font; layer.fontSize = font.pointSize
+            width = ceil((value as NSString).size(withAttributes: [.font: font]).width) + 2
+        }
+        var rect = box
+        rect.size.width = min(rect.width, width)
+        rect.origin.x = (rect.minX * scale).rounded() / scale
+        rect.origin.y = (rect.minY * scale).rounded() / scale
+        let frame = host.convertToLayer(rect)
+        if layer.frame != frame { layer.frame = frame }
+        if layer.foregroundColor != ink { layer.foregroundColor = ink }
+        if layer.contentsScale != scale { layer.contentsScale = scale }
+        layer.isHidden = false
+    }
+}
 private final class MapOverlay: FlippedCanvas {
     weak var map: Treemap?
-    override func draw(_ dirtyRect: NSRect) { map?.drawOverlay(dirtyRect) }
+    private var entries: [UInt64: (title: MapText, size: MapText)] = [:]
+    private var message: MapText?
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        guard let map, let layer else { return }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        let scale = window?.backingScaleFactor ?? 2
+        var visible = Set<UInt64>()
+        map.visitLabels(in: bounds) { label, box, sizeBox, large in
+            let pair = entries[label.key] ?? (title: MapText(in: layer), size: MapText(in: layer))
+            entries[label.key] = pair
+            visible.insert(label.key)
+            let ink = label.lightInk ? CGColor.white : CGColor.black
+            pair.title.place(label.title, font: Treemap.titleFont(large), ink: ink, box: box, in: self, scale: scale)
+            if let sizeBox {
+                pair.size.place(label.size, font: Treemap.sizeFont(large), ink: ink, box: sizeBox, in: self, scale: scale)
+            } else { pair.size.layer.isHidden = true }
+        }
+        for (key, pair) in entries where !visible.contains(key) {
+            pair.title.layer.removeFromSuperlayer(); pair.size.layer.removeFromSuperlayer(); entries[key] = nil
+        }
+        if let title = map.placeholder {
+            let field = message ?? MapText(in: layer); message = field
+            let font = NSFont.systemFont(ofSize: 13), width = ceil((title as NSString).size(withAttributes: [.font: font]).width) + 2
+            field.place(title, font: font, ink: NSColor.secondaryLabelColor.cgColor,
+                box: CGRect(x: bounds.midX - width/2, y: bounds.midY - 9, width: width, height: 18), in: self, scale: scale)
+        } else { message?.layer.isHidden = true }
+        CATransaction.commit()
+    }
 }
 
 private final class MapSelectionOverlay: FlippedCanvas {
     weak var map: Treemap?
+    private let shade = (0..<4).map { _ in CALayer() }, edges = (0..<4).map { _ in CALayer() }
+    private var drawsRange = false
+
+    func present(_ rect: CGRect?, dim: Bool, range: Bool, dark: Bool) {
+        guard let host = layer else { return }
+        if range || drawsRange { needsDisplay = true }
+        drawsRange = range
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        if let rect {
+            let pixel = 1 / (window?.backingScaleFactor ?? 2)
+            let left = max(bounds.minX, min(bounds.maxX, rect.minX)), right = max(left, min(bounds.maxX, rect.maxX))
+            let top = max(bounds.minY, min(bounds.maxY, rect.minY)), bottom = max(top, min(bounds.maxY, rect.maxY))
+            let bands = [CGRect(x: 0, y: 0, width: bounds.width, height: top),
+                CGRect(x: 0, y: bottom, width: bounds.width, height: bounds.height - bottom),
+                CGRect(x: 0, y: top, width: left, height: bottom - top),
+                CGRect(x: right, y: top, width: bounds.width - right, height: bottom - top)]
+            func aligned(_ value: CGFloat) -> CGFloat { (value / pixel).rounded() * pixel }
+            let x = rect.width < pixel ? floor(rect.midX / pixel) * pixel : aligned(rect.minX)
+            let y = rect.height < pixel ? floor(rect.midY / pixel) * pixel : aligned(rect.minY)
+            let w = max(pixel, aligned(rect.maxX) - x), h = max(pixel, aligned(rect.maxY) - y)
+            let lines = [CGRect(x: x, y: y, width: w, height: pixel), CGRect(x: x, y: y + h - pixel, width: w, height: pixel),
+                CGRect(x: x, y: y + pixel, width: pixel, height: max(0, h - 2 * pixel)),
+                CGRect(x: x + w - pixel, y: y + pixel, width: pixel, height: max(0, h - 2 * pixel))]
+            func place(_ layer: CALayer, _ frame: CGRect, _ color: CGColor) {
+                let clipped = frame.intersection(bounds)
+                layer.isHidden = clipped.isEmpty
+                guard !clipped.isEmpty else { return }
+                if layer.superlayer == nil { host.addSublayer(layer) }
+                layer.frame = convertToLayer(clipped); layer.backgroundColor = color
+            }
+            let tint = CGColor(gray: 0, alpha: selectionDimOpacity), ink = CGColor(gray: dark ? 0 : 1, alpha: 0.95)
+            for i in bands.indices {
+                if dim { place(shade[i], bands[i], tint) } else { shade[i].isHidden = true }
+            }
+            for i in lines.indices { place(edges[i], lines[i], ink) }
+        } else {
+            for layer in shade + edges { layer.isHidden = true }
+        }
+    }
     override func draw(_ dirtyRect: NSRect) {
-        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        guard drawsRange, let context = NSGraphicsContext.current?.cgContext else { return }
         map?.drawSelection(in: context)
     }
 }
@@ -90,14 +211,23 @@ final class Treemap: NSView, NSViewToolTipOwner {
     private var requestedColors: MapBreakdown?
     private var geometry: FileMap?
     private var rendered: RenderedFiles? {
-        didSet { selectionOverlay.needsDisplay = true }
+        didSet {
+            if !marked.isEmpty { presentSelection() }
+            presentRaster()
+        }
     }
-    private var overview: CGImage?
+    private var overview: CGImage? { didSet { presentRaster() } }
+    private let rasterHost = FlippedCanvas()
+    private let basePlane = RasterPlane(), detailPlane = RasterPlane()
     private var overviewIsCurrent = false
     private var movingTiles: [MovingTile] = []
+    private var movingLabels: [UInt64: MovingTile] = [:]
     private let motion = ChartMotion()
     private var trashTransition: ChartReflow? {
-        didSet { selectionOverlay.isHidden = trashTransition != nil }
+        didSet {
+            selectionOverlay.isHidden = trashTransition != nil
+            rasterHost.isHidden = trashTransition != nil
+        }
     }
     private var renderer: ChartRenderer?
     private let tileSheet = FlippedCanvas()
@@ -108,10 +238,18 @@ final class Treemap: NSView, NSViewToolTipOwner {
     var trackingSelection: Bool { down != nil }
     private var revision = 0, drawing = false
     private var reflow: DispatchWorkItem?
+    private let viewportClock = ChartFrameClock()
+    private var settle: DispatchWorkItem?
+    private var lastMove: CFTimeInterval = 0, lastRefinement: CFTimeInterval = 0
+    private var hoverMoved = false
+    private var installedRevision = -1
     private var lastSize: NSSize = .zero, lastScale: CGFloat = 0
     private static let whole = MapRenderSettings.whole
     private(set) var viewport = whole {
-        didSet { selectionOverlay.needsDisplay = true }
+        didSet {
+            if !marked.isEmpty { presentSelection() }
+            presentRaster()
+        }
     }
     var zoom: CGFloat { 1 / viewport.width }
     var aspect: CGFloat { bounds.width > 1 && bounds.height > 1 ? bounds.width / bounds.height : 1.4 }
@@ -127,6 +265,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
     private var hoverTracking: NSTrackingArea?
     private var hoverPoint: CGPoint?
     private var hoverKey: UInt64?
+    private var hoverWorldRect: CGRect?, hoverTipRect: CGRect?
     private var hoverPath: String?
     private var hoverTip: NSView.ToolTipTag?
     override var isFlipped: Bool { true }
@@ -142,10 +281,17 @@ final class Treemap: NSView, NSViewToolTipOwner {
             DispatchQueue.main.async { [weak self] in self?.renderer = renderer }
         }
         layer?.masksToBounds = true
+        rasterHost.wantsLayer = true
+        rasterHost.frame = bounds; rasterHost.autoresizingMask = [.width, .height]
+        rasterHost.setAccessibilityElement(false)
+        rasterHost.layer?.addSublayer(basePlane.layer)
+        rasterHost.layer?.addSublayer(detailPlane.layer)
+        addSubview(rasterHost)
         tileSheet.wantsLayer = true
         tileSheet.frame = bounds; tileSheet.autoresizingMask = [.width, .height]
         tileSheet.setAccessibilityElement(false)
         addSubview(tileSheet)
+        overlay.wantsLayer = true
         overlay.map = self
         overlay.frame = bounds; overlay.autoresizingMask = [.width, .height]
         addSubview(overlay)
@@ -164,7 +310,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
     required init?(coder: NSCoder) { nil }
     @objc private func accessibilityChanged() {
         overviewIsCurrent = false; endMotion(); revision += 1; scheduleFrame()
-        overlay.needsDisplay = true; selectionOverlay.needsDisplay = true
+        overlay.needsDisplay = true; presentSelection()
     }
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -185,19 +331,29 @@ final class Treemap: NSView, NSViewToolTipOwner {
     override func mouseExited(with event: NSEvent) { hoverPoint = nil; updateHover() }
 
     private func updateHover(force: Bool = false) {
-        let key = hoverPoint.flatMap { p in bounds.contains(p) ? hit(world(p)) : nil }
+        let point = hoverPoint.flatMap { bounds.contains($0) ? world($0) : nil }
+        let key: DTKey?
+        if !force, movingTiles.isEmpty, trashTransition == nil, let point, let hoverKey, hoverWorldRect?.contains(point) == true {
+            key = DTKey(hoverKey)
+        } else { key = point.flatMap(hit) }
         let packed = key.map { UInt64($0.folder) << 32 | UInt64($0.slot) }
-        guard packed != hoverKey || (force && hoverPoint != nil) else { return }
-        hoverKey = packed
-        if let hoverTip { removeToolTip(hoverTip); self.hoverTip = nil }
-        guard let key, let packed, let geometry, let url = geometry.model.url(folder: key.folder, slot: key.slot, directory: false) else {
-            hoverPath = nil; hovered?(nil, nil); return
+        let changed = packed != hoverKey || force
+        if changed {
+            hoverKey = packed
+            hoverWorldRect = packed.flatMap { geometry?.bounds(of: $0) }
+        }
+        let area = packed != nil ? bounds : nil
+        if area != hoverTipRect || changed {
+            if let hoverTip { removeToolTip(hoverTip); self.hoverTip = nil }
+            hoverTipRect = area
+            if let area, !area.isEmpty { hoverTip = addToolTip(area, owner: self, userData: nil) }
+        }
+        guard changed else { return }
+        guard let key, let geometry, let url = geometry.model.url(folder: key.folder, slot: key.slot, directory: false) else {
+            if hoverPath != nil { hoverPath = nil; hovered?(nil, nil) }
+            return
         }
         hoverPath = url.path
-        if let rect = geometry.bounds(of: packed) {
-            let area = screen(rect).intersection(bounds)
-            if !area.isEmpty { hoverTip = addToolTip(area, owner: self, userData: nil) }
-        }
         hovered?(url, colorGroup(for: key))
     }
     func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData: UnsafeMutableRawPointer?) -> String {
@@ -247,11 +403,11 @@ final class Treemap: NSView, NSViewToolTipOwner {
         guard isHidden != hidden else { return }
         isHidden = hidden
         revision += 1
-        if presented { scheduleFrame(); scheduleReflow() } else { reflow?.cancel(); endMotion() }
+        if presented { scheduleFrame(); scheduleReflow() } else { reflow?.cancel(); finishViewportWork(); endMotion() }
     }
 
     func clear() {
-        reflow?.cancel(); endMotion(); revision += 1
+        reflow?.cancel(); finishViewportWork(); endMotion(); revision += 1
         firstClickKey = nil
         geometry = nil; rendered = nil; requestedColors = nil; displayedColors = nil
         rootKeys.removeAll(); selection.removeAll(); viewport = Self.whole
@@ -262,7 +418,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
     }
 
     func show(_ listing: FolderListing, ancestors: Set<UInt64>) {
-        reflow?.cancel()
+        reflow?.cancel(); finishViewportWork()
         endMotion()
         firstClickKey = nil
         geometry = listing.geometry
@@ -299,7 +455,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
         if !sameFolder { viewport = Self.whole; overview = nil }
         revision += 1
         if let frame, let settings, settings == renderSettings {
-            rendered = frame.raster
+            rendered = frame.raster; installedRevision = revision
             overview = frame.overview; overviewIsCurrent = overview != nil
             discardTrashBacking()
             if sameFolder, let prior, prior.image === frame.priorImage, prior.focus == frame.raster.focus,
@@ -331,7 +487,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
             NSGraphicsContext.saveGraphicsState()
             NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
             effectiveAppearance.performAsCurrentDrawingAppearance {
-                draw(bounds); drawOverlay(bounds); drawSelection(in: context)
+                paintRaster(bounds); drawOverlay(bounds); drawSelection(in: context)
             }
             NSGraphicsContext.restoreGraphicsState()
         }), let view = ChartReflow(frame: bounds, renderer: renderer, texture: texture, patches: patches, radial: false) else { return }
@@ -343,12 +499,14 @@ final class Treemap: NSView, NSViewToolTipOwner {
         if let view = trashTransition {
             view.cancel(); trashTransition = nil; needsDisplay = true; overlay.needsDisplay = true
         }
-        motion.stop(); movingTiles.removeAll()
+        guard !movingTiles.isEmpty else { return }
+        motion.stop(); movingTiles.removeAll(); movingLabels.removeAll()
         tileSheet.layer?.sublayers?.forEach { $0.removeFromSuperlayer() }
     }
     private func animateTiles(_ moves: [MovingTile], over previous: RenderedFiles) {
         guard let sheet = tileSheet.layer else { return }
         movingTiles = moves
+        movingLabels = Dictionary(uniqueKeysWithValues: moves.map { ($0.key, $0) })
         CATransaction.begin(); CATransaction.setDisableActions(true)
         func place(_ image: CGImage, in rect: CGRect) -> CALayer {
             let layer = CALayer(); layer.contents = image; layer.contentsGravity = .resize
@@ -357,6 +515,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
         }
         func animate(_ layer: CALayer, _ key: String, from: Any, to: Any) {
             let animation = CABasicAnimation(keyPath: key)
+            animation.preferredFrameRateRange = chartFrameRate(displayRefreshRate)
             animation.fromValue = from; animation.toValue = to; animation.duration = ChartMotion.duration
             animation.timingFunction = ChartMotion.timingFunction
             layer.add(animation, forKey: key)
@@ -379,7 +538,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
             animate(layer, "bounds", from: bounds, to: layer.bounds)
         }
         CATransaction.commit()
-        motion.start { [weak self] in
+        motion.start(on: self) { [weak self] in
             guard let self else { return }
             if self.motion.fraction == 1 { self.endMotion(); self.updateHover(force: true) }
             self.overlay.needsDisplay = true
@@ -401,8 +560,9 @@ final class Treemap: NSView, NSViewToolTipOwner {
         guard lastSize != bounds.size || scale != lastScale else { return }
         discardTrashBacking()
         endMotion()
-        selectionOverlay.needsDisplay = true
+        presentSelection()
         lastSize = bounds.size; lastScale = scale
+        presentRaster(); overlay.needsDisplay = true
         revision += 1
         scheduleFrame()
         updateHover(force: true)
@@ -443,6 +603,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
             return
         }
         guard !drawing, let current = geometry, let settings = renderSettings else { return }
+        if installedRevision == revision, rendered?.viewport == settings.viewport { return }
         let token = revision
         let colors = requestedColors
         let needsOverview = !overviewIsCurrent
@@ -453,19 +614,25 @@ final class Treemap: NSView, NSViewToolTipOwner {
                 (needsOverview ? settings.overview(current, colors: colors) : nil)
             DispatchQueue.main.async {
                 self.drawing = false
-                if !self.isHidden, self.geometry === current, self.requestedColors === colors, self.renderSettings == settings, let frame {
-                    self.rendered = frame
+                if !self.isHidden, self.revision == token, self.geometry === current, let frame {
                     if let base { self.overview = base; self.overviewIsCurrent = true }
+                    let exact = settings.viewport == self.viewport
+                    let priorScore = self.rendered.map { self.detailScore($0.viewport) } ?? -1
+                    if exact || self.installedRevision != token || self.detailScore(settings.viewport) > priorScore {
+                        self.rendered = frame; self.installedRevision = token
+                    }
                     self.discardTrashBacking()
                     if self.displayedColors !== colors {
                         self.displayedColors = colors
                         self.coloringDidDisplay?(colors)
                         self.updateHover(force: true)
                     }
-                    self.needsDisplay = true; self.overlay.needsDisplay = true
+                    self.overlay.needsDisplay = true
                     self.setAccessibilityValue("\(current.count.formatted()) file shapes · \(Int(self.zoom.rounded()))×")
                 }
-                if self.revision != token { self.scheduleFrame() }
+                if self.revision != token || (self.settle == nil && settings.viewport != self.viewport) {
+                    self.scheduleFrame()
+                }
             }
         }
     }
@@ -481,15 +648,51 @@ final class Treemap: NSView, NSViewToolTipOwner {
         let a = world(rect.origin), b = world(CGPoint(x: rect.maxX, y: rect.maxY))
         return CGRect(x: a.x, y: a.y, width: b.x - a.x, height: b.y - a.y)
     }
+    // Prefer detail that covers more of the current view at its requested resolution.
+    private func detailScore(_ rect: CGRect) -> CGFloat {
+        let overlap = rect.intersection(viewport)
+        guard !overlap.isNull else { return 0 }
+        return (overlap.width / viewport.width) * (overlap.height / viewport.height) * min(1, viewport.width / rect.width)
+    }
+    private func finishViewportWork() {
+        viewportClock.stop(); settle?.cancel(); settle = nil; hoverMoved = false
+    }
+    private func scheduleSettle() {
+        let delay = max(0, lastMove + 0.075 - CACurrentMediaTime())
+        let task = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if CACurrentMediaTime() - self.lastMove < 0.074 { self.scheduleSettle(); return }
+            if self.hoverMoved { self.updateHover() }
+            self.finishViewportWork()
+            self.scheduleFrame()
+        }
+        settle = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: task)
+    }
+    private func scheduleViewportWork() {
+        lastMove = CACurrentMediaTime(); hoverMoved = true
+        if settle == nil { scheduleSettle() }
+        viewportClock.start(on: self) { [weak self] in
+            guard let self, self.hoverMoved else { return }
+            self.hoverMoved = false
+            self.updateHover()
+            let now = CACurrentMediaTime()
+            if !self.drawing, now - self.lastRefinement >= 0.075,
+               self.rendered.map({ self.detailScore($0.viewport) < 0.68 }) ?? true {
+                self.lastRefinement = now; self.scheduleFrame()
+            }
+        }
+    }
     private func move(to rect: CGRect) {
         let size = min(1, max(1 / CGFloat(1 << 30), rect.width))
         let next = CGRect(x: min(max(0,rect.minX),1 - size), y: min(max(0,rect.minY),1 - size), width: size, height: size)
         guard next != viewport else { return }
         discardTrashBacking()
         endMotion()
-        viewport = next; revision += 1
-        needsDisplay = true; overlay.needsDisplay = true
-        updateHover(force: true); scheduleFrame(); zoomChanged?()
+        viewport = next
+        overlay.needsDisplay = true
+        scheduleViewportWork()
+        zoomChanged?()
         if next == Self.whole { scheduleReflow() }
     }
     private func magnify(by factor: CGFloat, around anchor: CGPoint) {
@@ -541,21 +744,29 @@ final class Treemap: NSView, NSViewToolTipOwner {
     }
 
     private func updateSelection() {
-        let previous = marked
         if !rootKeys.isDisjoint(with: selection) { marked = [Self.whole] }
         else { marked = selection.compactMap { geometry?.bounds(of: $0) } }
         selectedBounds = marked.reduce(nil as CGRect?) { $0?.union($1) ?? $1 }
-        if previous.count == 1, marked.count == 1, let old = previous.first, let new = marked.first,
-           old != Self.whole, new != Self.whole, old.intersects(viewport), new.intersects(viewport) {
-            for rect in [old, new] {
-                let visible = screen(rect).intersection(bounds)
-                selectionOverlay.setNeedsDisplay(visible.insetBy(dx: -1, dy: -1))
-            }
-        } else {
-            selectionOverlay.needsDisplay = true
-        }
+        presentSelection()
+    }
+    private func presentSelection() {
+        let show = rendered != nil && rendered?.focus == nil
+        selectionOverlay.present(show && marked.count == 1 ? screen(marked[0]) : nil,
+            dim: rootKeys.isDisjoint(with: selection), range: show && marked.count > 1, dark: effectiveAppearance.usesDarkColors)
+    }
+    private func presentRaster() {
+        let detail = geometry?.count == 0 ? nil : rendered
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        basePlane.present(overview, from: Self.whole, in: viewport, host: rasterHost,
+            visible: detail != nil && detail?.viewport.contains(viewport) == false)
+        detailPlane.present(detail?.image, from: detail?.viewport ?? Self.whole, in: viewport, host: rasterHost)
+        CATransaction.commit()
     }
     override func draw(_ dirtyRect: NSRect) {
+        NSColor.controlBackgroundColor.setFill(); dirtyRect.fill()
+    }
+    private func paintRaster(_ dirtyRect: NSRect) {
         NSColor.controlBackgroundColor.setFill(); dirtyRect.fill()
         guard trashTransition == nil, let view = rendered, geometry?.count != 0, let cg = NSGraphicsContext.current?.cgContext else { return }
         func draw(_ image: CGImage, _ rect: CGRect) {
@@ -594,28 +805,33 @@ final class Treemap: NSView, NSViewToolTipOwner {
         }
         context.drawPath(using: .eoFill)
     }
-    fileprivate func drawOverlay(_ dirty: NSRect) {
-        guard trashTransition == nil else { return }
-        if rendered == nil || geometry?.count == 0 {
-            let title = geometry?.count == 0 ? "No files in this folder" : "Drawing file map…"
-            let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.secondaryLabelColor]
-            let size = (title as NSString).size(withAttributes: attrs)
-            (title as NSString).draw(at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2), withAttributes: attrs)
-            return
-        }
-        let para = NSMutableParagraphStyle(); para.lineBreakMode = .byTruncatingMiddle
-        for label in rendered?.labels ?? [] {
-            let tile = movingTiles.first { $0.key == label.key }
+    fileprivate var placeholder: String? {
+        guard trashTransition == nil, rendered == nil || geometry?.count == 0 else { return nil }
+        return geometry?.count == 0 ? "No files in this folder" : "Drawing file map…"
+    }
+    private static let titleFonts = [NSFont.systemFont(ofSize: 11, weight: .semibold), NSFont.systemFont(ofSize: 16, weight: .semibold)]
+    private static let sizeFonts = [NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular), NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)]
+    fileprivate static func titleFont(_ large: Bool) -> NSFont { titleFonts[large ? 1 : 0] }
+    fileprivate static func sizeFont(_ large: Bool) -> NSFont { sizeFonts[large ? 1 : 0] }
+    fileprivate func visitLabels(in dirty: CGRect, _ visit: (FileLabel, CGRect, CGRect?, Bool) -> Void) {
+        guard trashTransition == nil, let rendered, geometry?.count != 0 else { return }
+        for label in rendered.labels {
+            let tile = movingLabels[label.key]
             let r = screen(tile?.rect(at: motion.fraction) ?? label.rect).intersection(bounds)
             guard r.intersects(dirty), r.width >= 44, r.height >= 21 else { continue }
-            let ink = label.lightInk ? NSColor.white : NSColor.black
             let large = r.width >= 150 && r.height >= 74
             let inset: CGFloat = large ? 9 : 4
             let box = CGRect(x: r.minX + inset, y: r.minY + inset, width: r.width - 2 * inset, height: large ? 23 : 16)
-            (label.title as NSString).draw(in: box, withAttributes: [.font: NSFont.systemFont(ofSize: large ? 16 : 11, weight: .semibold), .foregroundColor: ink, .paragraphStyle: para])
-            if r.height > 39 {
-                (label.size as NSString).draw(in: box.offsetBy(dx: 0, dy: large ? 22 : 15), withAttributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: large ? 12 : 10, weight: .regular), .foregroundColor: ink, .paragraphStyle: para])
+            visit(label, box, r.height > 39 ? box.offsetBy(dx: 0, dy: large ? 22 : 15) : nil, large)
+        }
+    }
+    fileprivate func drawOverlay(_ dirty: NSRect) {
+        let paragraph = NSMutableParagraphStyle(); paragraph.lineBreakMode = .byTruncatingMiddle
+        visitLabels(in: dirty) { label, box, sizeBox, large in
+            let ink = label.lightInk ? NSColor.white : NSColor.black
+            (label.title as NSString).draw(in: box, withAttributes: [.font: Self.titleFont(large), .foregroundColor: ink, .paragraphStyle: paragraph])
+            if let sizeBox {
+                (label.size as NSString).draw(in: sizeBox, withAttributes: [.font: Self.sizeFont(large), .foregroundColor: ink, .paragraphStyle: paragraph])
             }
         }
     }

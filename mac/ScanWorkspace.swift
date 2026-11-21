@@ -3,7 +3,7 @@ import AppKit
 struct ScanMapRequest {
     let aspect: CGFloat, mode: MapColorMode, sort: (key: String, ascending: Bool)
     let settings: MapRenderSettings?, priorFrame: (FileMap, RenderedFiles)?
-    let radial: Bool, dimensions: (radius: CGFloat, scale: CGFloat)
+    let radial: Bool, dimensions: SunburstStyle
 
     func prepare(_ list: FolderListing, progress: ScanProgress, afterTrash: Bool = false) -> ScanMapFrame? {
         guard !dt_is_cancelled(progress.handle) else { return nil }
@@ -16,7 +16,7 @@ struct ScanMapRequest {
         let frame = settings.flatMap { spec in
             spec.render(list.geometry, colors: colors).map { LiveMapFrame($0, geometry: list.geometry, settings: spec, colors: colors, source: priorFrame, afterTrash: afterTrash) }
         }
-        let rings = radial ? Rings(list, colors: colors, radius: dimensions.radius, scale: dimensions.scale) {
+        let rings = radial ? Rings(list, colors: colors, radius: dimensions.radius, scale: dimensions.scale, style: dimensions) {
             dt_is_cancelled(progress.handle)
         } : nil
         return ScanMapFrame(list: list, colors: colors, order: order, raster: frame, rings: rings)

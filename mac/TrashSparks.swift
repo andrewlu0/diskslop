@@ -93,7 +93,7 @@ struct TrashSpark {
         return result
     }
 
-    func layer(to target: DockTrashTarget, texture: SparkTexture, shine: Bool, backingScale: CGFloat) -> CALayer {
+    func layer(to target: DockTrashTarget, texture: SparkTexture, shine: Bool, backingScale: CGFloat, refreshRate: Int) -> CALayer {
         let spark = CALayer()
         let halo = diameter * (shine ? 4.5 : 2.8)
         spark.bounds = CGRect(x: -halo/2, y: -halo/2, width: halo, height: halo)
@@ -159,6 +159,7 @@ struct TrashSpark {
             return effect
         }
         let flight = CAAnimationGroup()
+        flight.preferredFrameRateRange = chartFrameRate(refreshRate)
         flight.duration = duration
         let times: [Double], scales: [Double], opacity: [Double], name: String
         switch part {

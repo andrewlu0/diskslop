@@ -2,6 +2,21 @@
 
 Measured on an Apple M4 Pro running macOS 27.0.1. The tests used the local APFS volume with a warm filesystem cache. Startup, command-line scanning, rendering, and moving to Trash were timed separately.
 
+## Interactive rendering
+
+An M4 Pro reopened the same frozen APFS inventory with **3,714,774 file shapes** in instrumented, optimized builds of 0.1.8 and 0.1.9. The treemap measured 2,122 × 1,660 pixels. Two runs per version used the same viewport sequence, selections and native outline. The ranges below are the two runs’ 95th percentiles.
+
+| Interaction | Samples per run | 0.1.8 | 0.1.9 |
+| --- | ---: | ---: | ---: |
+| Treemap zoom or pan, main-thread update through Core Animation commit | 192 | 16.0–16.2 ms | 0.59–1.51 ms |
+| Single-file selection through commit | 120 | 0.91–1.06 ms | 0.028–0.033 ms |
+| Native outline scroll through commit | 180 | 17.5–39.4 ms | 3.89–4.41 ms |
+| Sunburst zoom, Metal command buffer GPU time | 468–471 | 0.62–0.63 ms | 0.55–0.63 ms |
+
+The treemap stayed within the 8.33 ms CPU budget for 120 Hz on all 384 measured moves in 0.1.9. Expanding 25,342 children in the native outline still took a median **15–19 ms**, with the first expansion taking **69–86 ms**. Selecting a sunburst folder and starting navigation now schedules the highlighted artwork on a worker. The previous version painted the outgoing chart on the main thread for a median **285–290 ms**.
+
+The display was locked. These measurements cover main-thread work and GPU execution with offscreen drawables. Physical presentation cadence requires an active display. Separate native interaction checks covered zoom reversal, Reduce Motion, selection through 25 folder levels, live refresh, and Trash reflow in both charts.
+
 ## Opening a document
 
 On a generated tree containing **50,048 entries** across 128 groups and six subfolders per group, opening a fresh DiskSlop window took a median **0.509 s** with the Finder icons and file-kind legend. Disk Inventory X 1.3 took **5.018 s**, a **9.9×** difference. Each run launched a new process. Both apps had to show a document window with the requested name and a populated native outline with a nonzero-height visible row. DiskSlop additionally had to report a completed file raster. The timer included launch and accessibility polling. Each app had one warm-up followed by three alternating measured launches. These are warm-cache observations on the local APFS volume.
