@@ -69,6 +69,7 @@ private final class KindMarkerCell: NSTableCellView {
 }
 
 final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
+    static let leadingInset: CGFloat = 6
     private let background: NSView
     private let title = NSTextField(labelWithString: "Color by")
     private let picker = NSPopUpButton()
@@ -164,7 +165,7 @@ final class KindLegend: NSView, NSTableViewDataSource, NSTableViewDelegate {
     }
     private func positionContents() {
         guard title.superview === self else { return }
-        let panel = NSRect(x: 6, y: 0, width: max(0, bounds.width - 13), height: bounds.height)
+        let panel = NSRect(x: Self.leadingInset, y: 0, width: max(0, bounds.width - Self.leadingInset - 7), height: bounds.height)
         let headerY = panel.maxY - 31
         let textSize = title.intrinsicContentSize
         background.frame = panel

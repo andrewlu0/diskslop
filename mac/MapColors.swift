@@ -46,12 +46,12 @@ enum MapColorMode: Int, CaseIterable {
     var ordered: Bool { [.created, .modified, .accessed, .depth, .size].contains(self) }
     var help: String {
         switch self {
-        case .created, .modified, .accessed: return "Age at scan time. Recent files use warm colors and older files use cool colors."
+        case .created, .modified, .accessed: return "Newer files are darker teal in Light appearance and brighter mint in Dark appearance. Future and unknown dates use muted swatches."
         case .folder: return "Files directly inside the same folder share a color."
         case .topFolder: return "Each folder directly below the map root shares its color with all its descendants."
         case .fileExtension: return "Group files by their final filename extension."
-        case .depth: return "Depth counts folders below the current map root."
-        case .size: return "Group files by the bytes they occupy on disk."
+        case .depth: return "Depth is relative to this folder. Deeper levels are darker teal in Light appearance and brighter mint in Dark appearance."
+        case .size: return "Larger allocations are darker teal in Light appearance and brighter mint in Dark appearance."
         case .name: return "Group files with the same full filename across folders."
         case .kind: return "Group by Finder file kind and recognized package."
         }
@@ -108,9 +108,23 @@ private struct MapPalette {
         light = tones.map { dt_glass_tint($0.light) }
         dark = tones.map { dt_glass_tint($0.dark) }
     }
-    static let age = Self([.red, .orange, .amber, .lime, .emerald, .teal, .sky, .blue, .indigo, .fuchsia, .neutral])
-    static let size = Self([.neutral, .indigo, .blue, .sky, .teal, .lime, .amber, .orange, .red])
-    static let depth = Self([.amber, .lime, .emerald, .teal, .sky, .indigo, .violet])
+    private static func tealScale(count: Int) -> [KindTone] {
+        let faint = KindTone(0x9cd2c4, 0x285e51)
+        let middle = KindTone(0x439c86, 0x53bda4)
+        let strong = KindTone(0x104c3d, 0xa9f3e0)
+        return (0..<count).map { index in
+            let t = 2 * Double(index) / Double(count - 1)
+            return t <= 1 ? faint.blended(toward: middle, fraction: t)
+                          : middle.blended(toward: strong, fraction: t - 1)
+        }
+    }
+    private static let magnitudes = tealScale(count: 9)
+    static let size = Self(magnitudes)
+    static let depth = Self(tealScale(count: 7))
+    static let age = Self(magnitudes.reversed() + [
+        KindTone(0x637d76, 0x90aaa3), // Future
+        KindTone(0x777b7a, 0x929795), // Unknown
+    ])
     static let categories = Self(KindTone.categories)
 }
 

@@ -20,8 +20,12 @@ struct KindTone: Equatable {
     static let categories: [Self] = (0..<4).flatMap { step in
         spectrum.indices.map { index in
             let a = spectrum[index], b = spectrum[(index + 1) % spectrum.count], t = Double(step) / 4
-            return Self(mix(a.light, b.light, t), mix(a.dark, b.dark, t))
+            return a.blended(toward: b, fraction: t)
         }
+    }
+
+    func blended(toward other: Self, fraction: Double) -> Self {
+        Self(Self.mix(light, other.light, fraction), Self.mix(dark, other.dark, fraction))
     }
 
     private static func mix(_ a: UInt32, _ b: UInt32, _ fraction: Double) -> UInt32 {
@@ -39,7 +43,7 @@ struct KindTone: Equatable {
         let direction = hash & 256 == 0 ? 1 : -1
         let a = tones[index], b = tones[(index + tones.count + direction) % tones.count]
         let fraction = Double((hash >> 16) & 255) / 255 * (acrossSpectrum ? 1 : 0.65)
-        return Self(Self.mix(a.light, b.light, fraction), Self.mix(a.dark, b.dark, fraction))
+        return a.blended(toward: b, fraction: fraction)
     }
 }
 extension NSColor {

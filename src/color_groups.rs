@@ -186,6 +186,13 @@ impl Groups {
         self.text.extend_from_slice(label);
         group
     }
+    fn bucket(&mut self, bins: &mut [u32], tag: u32) -> u32 {
+        let group = &mut bins[tag as usize];
+        if *group == NONE {
+            *group = self.add(&[], tag, tag);
+        }
+        *group
+    }
     fn label(&self, row: &Row) -> &[u8] {
         &self.text[row.start..row.start + row.len]
     }
@@ -302,11 +309,7 @@ impl Groups {
                                     age(minute, now)
                                 }
                             };
-                            let g = &mut bins[bucket as usize];
-                            if *g == NONE {
-                                *g = result.add(&[], bucket, bucket)
-                            }
-                            *g
+                            result.bucket(&mut bins, bucket)
                         }
                     }
                 };
@@ -326,6 +329,8 @@ impl Groups {
             }
             result.folders[index] = if let Some(g) = shared {
                 Assignments::Shared(g)
+            } else if mode == Mode::Depth && !scan.order[index].is_empty() {
+                Assignments::Shared(result.bucket(&mut bins, depth_band(depth)))
             } else if slots.is_empty() {
                 Assignments::Empty
             } else {

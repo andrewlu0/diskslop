@@ -45,6 +45,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private var recentColors: [MapBreakdown] = []
     private let colorQueue = DispatchQueue(label: "local.diskslop.color-groups", qos: .userInitiated)
     private let split = NSSplitView()
+    private let sidebarTrailingInset: CGFloat = 8
     private let sidebarWidthKey = "DiskSlopSidebarWidth"
     private let legendWidthKey = "DiskSlopLegendWidth"
     private var preferredPanes: [NSLayoutConstraint] = []
@@ -468,7 +469,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             sidebarTabs.centerXAnchor.constraint(equalTo: sidebar.centerXAnchor),
             sidebarTabs.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 1),
             listHost.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 10),
-            listHost.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -8),
+            listHost.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -sidebarTrailingInset),
             listHost.topAnchor.constraint(equalTo: sidebarTabs.bottomAnchor, constant: 6),
             listHost.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -1),
             sidebarMinimum
@@ -818,6 +819,12 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                 self.map.useColors(result)
             }
         }
+    }
+
+    func splitView(_ splitView: NSSplitView, effectiveRect proposed: NSRect, forDrawnRect divider: NSRect,
+                   ofDividerAt index: Int) -> NSRect {
+        let gutter = index == 0 ? -sidebarTrailingInset : KindLegend.leadingInset
+        return proposed.union(divider.offsetBy(dx: gutter, dy: 0)).intersection(splitView.bounds)
     }
 
     func splitView(_ splitView: NSSplitView, constrainSplitPosition proposedPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
