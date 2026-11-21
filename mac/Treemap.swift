@@ -71,9 +71,9 @@ private final class MapOverlay: FlippedCanvas {
             entries[label.key] = pair
             visible.insert(label.key)
             let ink = label.lightInk ? CGColor.white : CGColor.black
-            pair.title.place(label.title, font: Treemap.titleFont(large), ink: ink, box: box, in: self, scale: scale)
+            pair.title.place(label.title, font: MapLabelStyle.titleFont(large), ink: ink, box: box, in: self, scale: scale)
             if let sizeBox {
-                pair.size.place(label.size, font: Treemap.sizeFont(large), ink: ink, box: sizeBox, in: self, scale: scale)
+                pair.size.place(label.size, font: MapLabelStyle.sizeFont(large), ink: ink, box: sizeBox, in: self, scale: scale)
             } else { pair.size.layer.isHidden = true }
         }
         for (key, pair) in entries where !visible.contains(key) {
@@ -137,6 +137,26 @@ private final class MapSelectionOverlay: FlippedCanvas {
     }
 }
 
+private enum MapLabelStyle {
+    private static let titleFonts = [NSFont.systemFont(ofSize: 11, weight: .semibold), NSFont.systemFont(ofSize: 16, weight: .semibold)]
+    private static let sizeFonts = [NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular), NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)]
+    static func titleFont(_ large: Bool) -> NSFont { titleFonts[large ? 1 : 0] }
+    static func sizeFont(_ large: Bool) -> NSFont { sizeFonts[large ? 1 : 0] }
+    static func place(_ label: FileLabel, in r: CGRect, _ visit: (FileLabel, CGRect, CGRect?, Bool) -> Void) {
+        let large = r.width >= 150 && r.height >= 74
+        let inset: CGFloat = large ? 9 : 4
+        let box = CGRect(x: r.minX + inset, y: r.minY + inset, width: r.width - 2 * inset, height: large ? 23 : 16)
+        visit(label, box, r.height > 39 ? box.offsetBy(dx: 0, dy: large ? 22 : 15) : nil, large)
+    }
+    static func draw(_ label: FileLabel, _ box: CGRect, _ sizeBox: CGRect?, _ large: Bool, _ paragraph: NSParagraphStyle) {
+        let ink = label.lightInk ? NSColor.white : NSColor.black
+        (label.title as NSString).draw(in: box, withAttributes: [.font: Self.titleFont(large), .foregroundColor: ink, .paragraphStyle: paragraph])
+        if let sizeBox {
+            (label.size as NSString).draw(in: sizeBox, withAttributes: [.font: Self.sizeFont(large), .foregroundColor: ink, .paragraphStyle: paragraph])
+        }
+    }
+}
+
 struct MapRenderSettings: Equatable {
     let viewport: CGRect, width: Int, height: Int, scale: CGFloat, dark: Bool, shine: Bool
     var focus: LegendFocus?
@@ -147,6 +167,31 @@ struct MapRenderSettings: Equatable {
         return geometry.render(viewport: Self.whole, width: max(1, Int(CGFloat(width) * ratio)),
             height: max(1, Int(CGFloat(height) * ratio)), scale: scale * ratio,
             dark: dark, shine: shine, coloring: colors, focus: focus)
+    }
+
+    func reflowTexture(_ raster: RenderedFiles) -> MTLTexture? {
+        let ratio = min(1, 2048 / Double(max(width, height)))
+        let w = max(1, Int(Double(width) * ratio)), h = max(1, Int(Double(height) * ratio))
+        let bounds = CGRect(x: 0, y: 0, width: CGFloat(width) / scale, height: CGFloat(height) / scale)
+        return ChartRenderer.shared?.snapshot(width: w, height: h) { context in
+            context.draw(raster.image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            context.translateBy(x: 0, y: CGFloat(h))
+            context.scaleBy(x: CGFloat(w) / bounds.width, y: -CGFloat(h) / bounds.height)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineBreakMode = .byTruncatingMiddle
+            for label in raster.labels {
+                let r = label.rect
+                let rect = CGRect(x: (r.minX - viewport.minX) * bounds.width / viewport.width,
+                    y: (r.minY - viewport.minY) * bounds.height / viewport.height,
+                    width: r.width * bounds.width / viewport.width, height: r.height * bounds.height / viewport.height).intersection(bounds)
+                if rect.width >= 44 && rect.height >= 21 {
+                    MapLabelStyle.place(label, in: rect) { MapLabelStyle.draw($0, $1, $2, $3, paragraph) }
+                }
+            }
+            NSGraphicsContext.restoreGraphicsState()
+        }
     }
 
     var gestureDetail: Self {
@@ -174,6 +219,7 @@ struct LiveMapFrame {
     let raster: RenderedFiles, moves: [MovingTile], priorImage: CGImage?
     let overview: RenderedFiles?
     let trashPatches: [ChartPatch]
+    private(set) var trashTexture: MTLTexture?
     init(_ raster: RenderedFiles, geometry: FileMap, settings: MapRenderSettings, colors: MapBreakdown?, source: (FileMap, RenderedFiles)?, afterTrash: Bool = false) {
         self.raster = raster
         overview = raster.viewport == MapRenderSettings.whole ? raster : settings.overview(geometry, colors: colors)
@@ -181,8 +227,9 @@ struct LiveMapFrame {
             moves = []; priorImage = nil; trashPatches = []; return
         }
         priorImage = prior.image
-        if afterTrash {
+        if afterTrash || (!geometry.model.isScanPreview && geometry.count < previous.count) {
             trashPatches = geometry.reflow(from: previous, in: settings)
+            if !trashPatches.isEmpty { trashTexture = settings.reflowTexture(raster) }
             moves = []
             return
         }
@@ -209,6 +256,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
     var zoomChanged: (() -> Void)?
     var hovered: ((URL?, UInt32?) -> Void)?
     var coloringDidDisplay: ((MapBreakdown?) -> Void)?
+    var artworkReady: ((CGImage?, MapColorMode) -> Void)?
     private(set) var displayedColors: MapBreakdown?
     var legendFocus: LegendFocus? {
         didSet {
@@ -266,7 +314,13 @@ final class Treemap: NSView, NSViewToolTipOwner {
     private var rootKeys = Set<UInt64>()
     private var marked: [CGRect] = []
     private var selectedBounds: CGRect?
-    var selection = Set<UInt64>() { didSet { if selection != oldValue { updateSelection() } } }
+    var selection = Set<UInt64>() {
+        didSet {
+            guard selection != oldValue else { return }
+            if trashTransition != nil { endMotion() }
+            updateSelection()
+        }
+    }
     private let overlay = MapOverlay()
     private let selectionOverlay = MapSelectionOverlay()
     private var hoverTracking: NSTrackingArea?
@@ -466,12 +520,11 @@ final class Treemap: NSView, NSViewToolTipOwner {
         if let frame, let settings, settings == renderSettings {
             rendered = frame.raster; installedRevision = revision
             overview = frame.overview; overviewIsCurrent = overview != nil
-            discardTrashBacking()
             if sameFolder, let prior, prior.image === frame.priorImage, prior.focus == frame.raster.focus,
                !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
                 if !frame.trashPatches.isEmpty {
                     updateSelection()
-                    animateTrash(frame.trashPatches, settings: settings)
+                    if let texture = frame.trashTexture { animateTrash(frame.trashPatches, texture: texture) }
                 } else if !frame.moves.isEmpty { animateTiles(frame.moves, over: prior) }
             }
         } else {
@@ -484,22 +537,18 @@ final class Treemap: NSView, NSViewToolTipOwner {
         needsDisplay = true; overlay.needsDisplay = true
         setAccessibilityValue("\(list.geometry.count.formatted()) file shapes · \(Int(zoom.rounded()))×")
         scheduleReflow()
+        if !isHidden, installedRevision == revision { reportArtwork() }
     }
 
-    private func animateTrash(_ patches: [ChartPatch], settings: MapRenderSettings) {
-        guard let renderer, window?.isVisible == true else { return }
-        let ratio = min(1, 2048 / Double(max(settings.width, settings.height)))
-        let w = max(1, Int(Double(settings.width) * ratio)), h = max(1, Int(Double(settings.height) * ratio))
-        guard let texture = renderer.snapshot(width: w, height: h, draw: { context in
-            context.translateBy(x: 0, y: CGFloat(h))
-            context.scaleBy(x: CGFloat(w) / bounds.width, y: -CGFloat(h) / bounds.height)
-            NSGraphicsContext.saveGraphicsState()
-            NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
-            effectiveAppearance.performAsCurrentDrawingAppearance {
-                paintRaster(bounds); drawOverlay(bounds); drawSelection(in: context)
-            }
-            NSGraphicsContext.restoreGraphicsState()
-        }), let view = ChartReflow(frame: bounds, renderer: renderer, texture: texture, patches: patches, radial: false) else { return }
+    private func reportArtwork() {
+        let image = geometry?.count != 0 && legendFocus == nil && rendered?.viewport == Self.whole ? rendered?.image : nil
+        artworkReady?(image, displayedColors?.mode ?? .kind)
+    }
+
+    private func animateTrash(_ patches: [ChartPatch], texture: MTLTexture) {
+        guard let renderer, window?.isVisible == true,
+              let view = ChartReflow(frame: bounds, renderer: renderer, texture: texture, patches: patches,
+                  radial: false, sliding: true, duration: 0.24) else { return }
         trashTransition = view; addSubview(view)
         view.completed = { [weak self] in self?.endMotion(); self?.updateHover(force: true) }
         view.start()
@@ -568,7 +617,6 @@ final class Treemap: NSView, NSViewToolTipOwner {
         let scale = window?.backingScaleFactor ?? 2
         guard lastSize != bounds.size || scale != lastScale else { return }
         finishViewportWork()
-        discardTrashBacking()
         endMotion()
         presentSelection()
         lastSize = bounds.size; lastScale = scale
@@ -637,7 +685,6 @@ final class Treemap: NSView, NSViewToolTipOwner {
                     if exact || self.installedRevision != token || self.detailScore(settings.viewport) > priorScore {
                         self.rendered = frame; self.installedRevision = token
                     }
-                    self.discardTrashBacking()
                     if self.displayedColors !== colors {
                         self.displayedColors = colors
                         self.coloringDidDisplay?(colors)
@@ -645,6 +692,7 @@ final class Treemap: NSView, NSViewToolTipOwner {
                     }
                     self.overlay.needsDisplay = true
                     self.setAccessibilityValue("\(current.count.formatted()) file shapes · \(Int(self.zoom.rounded()))×")
+                    self.reportArtwork()
                 }
                 if self.revision != token || (self.settle == nil && (interactive || settings.viewport != self.viewport)) {
                     self.scheduleFrame()
@@ -709,7 +757,6 @@ final class Treemap: NSView, NSViewToolTipOwner {
         let size = min(1, max(1 / CGFloat(1 << 30), rect.width))
         let next = CGRect(x: min(max(0,rect.minX),1 - size), y: min(max(0,rect.minY),1 - size), width: size, height: size)
         guard next != viewport else { return }
-        discardTrashBacking()
         endMotion()
         if #available(macOS 14.0, *), settle != nil, gestureSurface == nil,
            let renderer, let overview, let rendered, overview.texture != nil, rendered.texture != nil {
@@ -859,30 +906,19 @@ final class Treemap: NSView, NSViewToolTipOwner {
         guard trashTransition == nil, rendered == nil || geometry?.count == 0 else { return nil }
         return geometry?.count == 0 ? "No files in this folder" : "Drawing file map…"
     }
-    private static let titleFonts = [NSFont.systemFont(ofSize: 11, weight: .semibold), NSFont.systemFont(ofSize: 16, weight: .semibold)]
-    private static let sizeFonts = [NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular), NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)]
-    fileprivate static func titleFont(_ large: Bool) -> NSFont { titleFonts[large ? 1 : 0] }
-    fileprivate static func sizeFont(_ large: Bool) -> NSFont { sizeFonts[large ? 1 : 0] }
     fileprivate func visitLabels(in dirty: CGRect, _ visit: (FileLabel, CGRect, CGRect?, Bool) -> Void) {
         guard trashTransition == nil, let rendered, geometry?.count != 0 else { return }
         for label in rendered.labels {
             let tile = movingLabels[label.key]
             let r = screen(tile?.rect(at: motion.fraction) ?? label.rect).intersection(bounds)
             guard r.intersects(dirty), r.width >= 44, r.height >= 21 else { continue }
-            let large = r.width >= 150 && r.height >= 74
-            let inset: CGFloat = large ? 9 : 4
-            let box = CGRect(x: r.minX + inset, y: r.minY + inset, width: r.width - 2 * inset, height: large ? 23 : 16)
-            visit(label, box, r.height > 39 ? box.offsetBy(dx: 0, dy: large ? 22 : 15) : nil, large)
+            MapLabelStyle.place(label, in: r, visit)
         }
     }
     fileprivate func drawOverlay(_ dirty: NSRect) {
         let paragraph = NSMutableParagraphStyle(); paragraph.lineBreakMode = .byTruncatingMiddle
         visitLabels(in: dirty) { label, box, sizeBox, large in
-            let ink = label.lightInk ? NSColor.white : NSColor.black
-            (label.title as NSString).draw(in: box, withAttributes: [.font: Self.titleFont(large), .foregroundColor: ink, .paragraphStyle: paragraph])
-            if let sizeBox {
-                (label.size as NSString).draw(in: sizeBox, withAttributes: [.font: Self.sizeFont(large), .foregroundColor: ink, .paragraphStyle: paragraph])
-            }
+            MapLabelStyle.draw(label, box, sizeBox, large, paragraph)
         }
     }
     fileprivate func drawSelection(in context: CGContext) {

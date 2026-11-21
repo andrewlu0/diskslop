@@ -47,51 +47,39 @@ private final class FlightPanel: NSPanel {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
-private final class MissingGlass: NSView {
-    var holes: CGPath?
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-    override func draw(_ dirtyRect: NSRect) {
-        guard let holes, let context = NSGraphicsContext.current?.cgContext else { return }
-        context.addPath(holes); context.setFillColor(NSColor.windowBackgroundColor.cgColor); context.fillPath()
-    }
-}
-
-extension NSView {
-    func discardTrashBacking() { (subviews.last as? MissingGlass)?.removeFromSuperview() }
-}
-
 final class TrashGlass {
     static let regionLimit = 24
     let dock = DockTrashLocator()
     private var panels: [NSPanel] = []
     private var clearance: DispatchWorkItem?
-    private weak var missing: MissingGlass?
-
-    private func revealNewMap() { missing?.removeFromSuperview(); missing = nil }
+    private var flight = UUID()
 
     func play(_ regions: [TrashGlassRegion], from view: NSView) {
         guard !regions.isEmpty, let window = view.window, window.isVisible, !window.isMiniaturized,
               window.occlusionState.contains(.visible), !view.isHiddenOrHasHiddenAncestor,
               NSApp.isActive, let screen = window.screen else { return }
         clearPanels()
-        revealNewMap()
         let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let shine = !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         let footprints = regions.prefix(Self.regionLimit)
         let path = CGMutablePath()
         for region in footprints { path.addPath(region.shape.outline) }
-        let backing = MissingGlass(frame: view.bounds)
-        backing.autoresizingMask = [.width, .height]
-        backing.setAccessibilityElement(false)
-        view.addSubview(backing)
-        let origin = window.convertPoint(toScreen: backing.convert(.zero, to: nil))
-        var local = CGAffineTransform(translationX: -origin.x, y: -origin.y)
-        backing.holes = path.copy(using: &local); backing.needsDisplay = true
-        missing = backing
-
         let target = reduced ? nil : dock.target(from: screen)
-        let sparks = target.map { TrashSpark.scatter(in: footprints, toward: $0.point) } ?? []
-        var textures: [UInt32: SparkTexture] = [:]
+        let id = UUID(), windowFrame = window.frame
+        flight = id
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, weak view, weak window] in
+            let sparks = target.map { TrashSpark.scatter(in: footprints, toward: $0.point) } ?? []
+            let textures = Dictionary(uniqueKeysWithValues: Set(sparks.map(\.rgb)).map { ($0, SparkTexture(rgb: $0)) })
+            DispatchQueue.main.async { [weak self, weak view, weak window] in
+                guard let self, self.flight == id, let view, let window, view.window === window,
+                      window.isVisible, window.frame == windowFrame, !view.isHiddenOrHasHiddenAncestor, NSApp.isActive else { return }
+                self.present(footprints, path: path, target: target, sparks: sparks, textures: textures, reduced: reduced, shine: shine)
+            }
+        }
+    }
+
+    private func present(_ footprints: ArraySlice<TrashGlassRegion>, path: CGPath, target: DockTrashTarget?,
+                         sparks: [TrashSpark], textures: [UInt32: SparkTexture], reduced: Bool, shine: Bool) {
         var extent = path.boundingBoxOfPath
         if let target {
             extent = extent.union(CGRect(origin: target.point, size: CGSize(width: 1, height: 1))).insetBy(dx: -65, dy: -110)
@@ -138,8 +126,7 @@ final class TrashGlass {
             }
             if let target {
                 for spark in sparks {
-                    let texture = textures[spark.rgb] ?? SparkTexture(rgb: spark.rgb)
-                    textures[spark.rgb] = texture
+                    guard let texture = textures[spark.rgb] else { continue }
                     stage.addSublayer(spark.layer(to: target, texture: texture, shine: shine, backingScale: display.backingScaleFactor, refreshRate: display.maximumFramesPerSecond))
                 }
             }

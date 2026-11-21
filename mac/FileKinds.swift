@@ -1,7 +1,7 @@
 import AppKit
 import UniformTypeIdentifiers
 
-struct KindTone: Equatable {
+struct KindTone: Equatable, Codable {
     let light: UInt32, dark: UInt32
     init(_ light: UInt32, _ dark: UInt32) { self.light = light; self.dark = dark }
 
@@ -57,7 +57,7 @@ extension NSAppearance {
     var usesDarkColors: Bool { bestMatch(from: [.darkAqua, .aqua]) == .darkAqua }
 }
 
-struct FileKind {
+struct FileKind: Codable {
     let id: UInt32, identifier: String, title: String, glyph: String
     let tone: KindTone
 
@@ -164,13 +164,85 @@ private struct KindStyle {
 
 final class FileKindCatalog: @unchecked Sendable {
     static let shared = FileKindCatalog()
-    private struct Signature: Hashable { let ext: String, finder: UInt32, flags: UInt8 }
+    private struct Signature: Hashable, Codable { let ext: String, finder: UInt32, flags: UInt8 }
+    private struct Saved: Codable {
+        let context: [String]
+        let created: Date
+        let tags: [Signature: UInt32]
+        let kinds: [FileKind]
+    }
     private let lock = NSLock()
     private var byTag: [Signature: UInt32] = [:], byName: [String: UInt32] = [:]
     private static let folder = FileKind(
         id: 0, identifier: "public.folder", title: "Folder", glyph: "folder", tone: .neutral, vary: false)
     private var kinds = [folder]
     private var lightPalette = [dt_glass_tint(folder.tone.light)], darkPalette = [dt_glass_tint(folder.tone.dark)]
+    private static let capacity = 100_000
+    private let queue = DispatchQueue(label: "local.diskslop.file-kinds", qos: .utility)
+    private let cacheFile: URL
+    private let context = ["1", ProcessInfo.processInfo.operatingSystemVersionString, Locale.current.identifier] + Locale.preferredLanguages
+    private var created = Date()
+    private var dirty = false
+    private var lastChange = DispatchTime.now()
+
+    private init() {
+        cacheFile = StartupSnapshot.directory.appendingPathComponent("kinds.plist")
+        guard let size = try? cacheFile.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 16 * 1024 * 1024,
+              let data = try? Data(contentsOf: cacheFile),
+              let saved = try? PropertyListDecoder().decode(Saved.self, from: data),
+              saved.context == context, abs(saved.created.timeIntervalSinceNow) < 7 * 24 * 3600,
+              saved.tags.count <= Self.capacity, (1...Self.capacity + 1).contains(saved.kinds.count),
+              saved.kinds.enumerated().allSatisfy({ $0.offset == Int($0.element.id) }),
+              saved.tags.values.allSatisfy({ Int($0) < saved.kinds.count })
+        else { return }
+        created = saved.created
+        byTag = saved.tags
+        kinds = saved.kinds
+        lightPalette = kinds.map { dt_glass_tint($0.tone.light) }
+        darkPalette = kinds.map { dt_glass_tint($0.tone.dark) }
+        for kind in kinds.dropFirst() { byName[group(kind.title)] = kind.id }
+    }
+
+    private func group(_ title: String) -> String { title.folding(options: [.caseInsensitive], locale: .current) }
+
+    private func record(_ key: Signature, id: UInt32) {
+        guard byTag[key] == nil, byTag.count < Self.capacity else { return }
+        byTag[key] = id
+        lastChange = .now()
+        guard !dirty else { return }
+        dirty = true
+        queue.asyncAfter(deadline: lastChange + 2) { self.save(whenIdle: true) }
+    }
+
+    private func save(whenIdle: Bool = false) {
+        let saved = lock.withLock { () -> Saved? in
+            guard dirty else { return nil }
+            let deadline = lastChange + 2
+            if whenIdle && deadline > .now() {
+                queue.asyncAfter(deadline: deadline) { self.save(whenIdle: true) }
+                return nil
+            }
+            dirty = false
+            let count = Int(byTag.values.max() ?? 0) + 1
+            return Saved(context: context, created: created, tags: byTag, kinds: Array(kinds.prefix(count)))
+        }
+        guard let saved else { return }
+        do {
+            try FileManager.default.createDirectory(at: cacheFile.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            let encoder = PropertyListEncoder()
+            encoder.outputFormat = .binary
+            try encoder.encode(saved).write(to: cacheFile, options: .atomic)
+        } catch {
+            lock.withLock {
+                guard !dirty else { return }
+                dirty = true
+                queue.asyncAfter(deadline: .now() + 60) { self.save(whenIdle: true) }
+            }
+        }
+    }
+
+    func flush() { queue.sync { save() } }
     private static let fallbackNames = [
         "parquet": "Apache Parquet", "arrow": "Apache Arrow", "wasm": "WebAssembly module",
         "ndjson": "Newline-delimited JSON", "jsonl": "Newline-delimited JSON", "geojson": "GeoJSON", "avif": "AVIF image",
@@ -186,10 +258,11 @@ final class FileKindCatalog: @unchecked Sendable {
 
     func resolve(path: UnsafePointer<CChar>, ext: String, finder: UInt32, flags: UInt8) -> UInt32 {
         let directory = flags & 1 != 0
-        let url = URL(fileURLWithFileSystemRepresentation: path, isDirectory: directory, relativeTo: nil)
         let suffix = ext.lowercased()
-        let key = Signature(ext: flags & 32 == 0 ? suffix : url.lastPathComponent, finder: finder, flags: flags)
+        let special = flags & 32 == 0 ? nil : URL(fileURLWithFileSystemRepresentation: path, isDirectory: directory, relativeTo: nil)
+        let key = Signature(ext: special?.lastPathComponent ?? suffix, finder: finder, flags: flags)
         if let id = lock.withLock({ byTag[key] }) { return id }
+        let url = special ?? URL(fileURLWithFileSystemRepresentation: path, isDirectory: directory, relativeTo: nil)
         let values = try? url.resourceValues(forKeys: [.contentTypeKey, .localizedTypeDescriptionKey, .isPackageKey])
         let declared = suffix.isEmpty ? nil : UTType(filenameExtension: suffix, conformingTo: directory ? .directory : .data)
         var type = values?.contentType ?? declared ?? (directory ? .folder : .data)
@@ -202,8 +275,11 @@ final class FileKindCatalog: @unchecked Sendable {
         if directory
             && !(values?.isPackage == true || flags & 8 != 0 || type.conforms(to: .package) || type.conforms(to: .bundle))
         {
-            lock.withLock { byTag[key] = 0 }
-            return 0
+            return lock.withLock {
+                if let known = byTag[key] { return known }
+                record(key, id: 0)
+                return 0
+            }
         }
         if type.conforms(to: .applicationBundle) { type = .applicationBundle }
         let generic = type.isDynamic || type == .data || type == .folder || type == .directory
@@ -224,11 +300,12 @@ final class FileKindCatalog: @unchecked Sendable {
             id = type.identifier
             name = type.localizedDescription ?? values?.localizedTypeDescription ?? (directory ? "Package" : "Document")
         }
-        let group = name.folding(options: [.caseInsensitive], locale: .current)
+        let group = group(name)
         let style = KindStyle.resolve(type, suffix: suffix, identifier: id)
         return lock.withLock {
+            if let known = byTag[key] { return known }
             if let known = byName[group] {
-                byTag[key] = known
+                record(key, id: known)
                 return known
             }
             let value = UInt32(kinds.count)
@@ -238,7 +315,7 @@ final class FileKindCatalog: @unchecked Sendable {
             lightPalette.append(dt_glass_tint(kind.tone.light))
             darkPalette.append(dt_glass_tint(kind.tone.dark))
             byName[group] = value
-            byTag[key] = value
+            record(key, id: value)
             return value
         }
     }

@@ -77,6 +77,17 @@ For the storage comparison, the same 5.00-million-entry index occupied 355.9 MiB
 
 A controlled tree was scanned, the process exited, and its files were changed. On relaunch the indexed paths, allocated bytes, partial-directory flags and entry counts matched a new full scan after an in-place write, permission changes, a subtree rename, new nested files, deletion and hard-link changes. A truncated checkpoint was rejected.
 
+### Saved preview on relaunch
+
+Four interleaved launches per build on the same 14-core M4 Pro reused the same 74 MiB startup-volume index and a warm filesystem cache. The preview build reopened the last startup-volume scan without a launch argument. The baseline opened the same volume via its launch argument. First map was timed when the app handed the populated chart image to AppKit. Interactive was timed when a native treemap click selected the corresponding row from the refreshed inventory.
+
+| Median elapsed from process launch | Baseline | Saved preview |
+| --- | ---: | ---: |
+| First map | 8.57 s | 0.325 s |
+| Interactive map | 8.59 s | 9.20 s |
+
+First-map observations ranged from 8.47–14.01 s at baseline and 0.314–0.332 s with the preview. Interactive observations ranged from 8.50–14.04 s and 8.80–9.34 s, respectively. The desktop and volume remained active, so the filesystem events replayed after launch varied between trials. The preview file was 481 KiB.
+
 ### Screen-resolution treemap
 
 On the same 14-core M4 Pro with 48 GiB RAM, two signed release builds reopened the startup Data volume from the persistent index. Each build ran in four fresh processes, interleaved, and each process confirmed a cache hit. At the first complete frame the map contained roughly 4.34 million files at 2,122 × 1,660 physical pixels. Timing probes measured launch through the first completed AppKit draw, then four zoom-in and four zoom-out commands per process through the draw of the requested viewport.

@@ -3,6 +3,21 @@ import MetalKit
 
 struct ChartPatch {
     let from: SIMD4<Float>, to: SIMD4<Float>
+
+    static func filling(_ gap: SIMD4<Float>, from prior: SIMD4<Float>, to target: SIMD4<Float>, radial: Bool) -> Self {
+        guard gap.z > gap.x, gap.w > gap.y else { return Self(from: target, to: target) }
+        let dx = (prior.x + prior.z - target.x - target.z) * 0.5
+        let dy = (prior.y + prior.w - target.y - target.w) * 0.5
+        let left = gap.x - target.z, right = gap.z - target.x
+        let x = abs(left - dx) < abs(right - dx) ? left : right
+        var shift = SIMD4(x, 0, x, 0)
+        if !radial {
+            let top = gap.y - target.w, bottom = gap.w - target.y
+            let y = abs(top - dy) < abs(bottom - dy) ? top : bottom
+            if y * (y - 2 * dy) < x * (x - 2 * dx) { shift = SIMD4(0, y, 0, y) }
+        }
+        return Self(from: target + shift, to: target)
+    }
 }
 
 final class ChartReflow: MTKView {
@@ -10,13 +25,17 @@ final class ChartReflow: MTKView {
     private let patches: [ChartPatch]
     private let batches: [(offset: Int, count: Int, segments: Int)]
     private let radial: Bool
+    private let sliding: Bool
+    private let movingPatches: [ChartPatch]
     private let duration: CFTimeInterval
     private var began: CFTimeInterval = 0
     private var fraction: Float = 0
     var completed: (() -> Void)?
 
-    init?(frame: CGRect, renderer: ChartRenderer, texture: MTLTexture, patches: [ChartPatch], radial: Bool, duration: CFTimeInterval = 0.36) {
+    init?(frame: CGRect, renderer: ChartRenderer, texture: MTLTexture, patches: [ChartPatch], radial: Bool, sliding: Bool = false, duration: CFTimeInterval = 0.36) {
         self.duration = duration
+        self.sliding = sliding
+        movingPatches = sliding ? patches.filter { $0.from != $0.to } : []
         guard !patches.isEmpty else { return nil }
         self.renderer = renderer; self.texture = texture; self.radial = radial
         if radial {
@@ -67,6 +86,15 @@ final class ChartReflow: MTKView {
     }
     func destination(x: CGFloat, y: CGFloat) -> CGPoint? {
         let x = Float(x), y = Float(y)
+        if sliding {
+            for patch in movingPatches where x >= patch.to.x && x < patch.to.z && y >= patch.to.y && y < patch.to.w {
+                let u = x - (patch.from.x - patch.to.x) * (1 - fraction)
+                let v = y - (patch.from.y - patch.to.y) * (1 - fraction)
+                guard u >= patch.to.x, u < patch.to.z, v >= patch.to.y, v < patch.to.w else { return nil }
+                return CGPoint(x: CGFloat(u), y: CGFloat(v))
+            }
+            return CGPoint(x: CGFloat(x), y: CGFloat(y))
+        }
         for patch in patches.reversed() {
             let box = patch.from + (patch.to - patch.from) * fraction
             guard x >= box.x, x < box.z, y >= box.y, y < box.w else { continue }
@@ -87,7 +115,7 @@ final class ChartReflow: MTKView {
         encoder.setRenderPipelineState(renderer.reflowPipeline)
         encoder.setFragmentTexture(texture, index: 0)
         for batch in batches {
-            var mode = SIMD4<Float>(fraction, Float(batch.segments), radial ? 1 : 0, 0)
+            var mode = SIMD4<Float>(fraction, Float(batch.segments), radial ? 1 : 0, sliding ? 1 : 0)
             encoder.setVertexBytes(&mode, length: MemoryLayout.size(ofValue: mode), index: 0)
             encoder.setVertexBuffer(buffer, offset: batch.offset * MemoryLayout<ChartPatch>.stride, index: 1)
             encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 2 * (batch.segments + 1), instanceCount: batch.count)

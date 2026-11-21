@@ -76,13 +76,13 @@ final class FileMap: @unchecked Sendable {
         return dt_map_hit(handle, p.x, p.y, &key) ? key : nil
     }
     func reflow(from previous: FileMap, in settings: MapRenderSettings) -> [ChartPatch] {
-        guard previous.model === model, previous.folder == folder else { return [] }
+        guard !model.isScanPreview else { return [] }
         let scale = min(1, 192 / Double(max(settings.width, settings.height)))
         let w = max(1, Int(Double(settings.width) * scale)), h = max(1, Int(Double(settings.height) * scale))
         let tiles = [DTReflowTile](unsafeUninitializedCapacity: w * h) { buffer, count in
             count = dt_map_reflow(previous.handle, handle, DTRect(settings.viewport), UInt32(w), UInt32(h), buffer.baseAddress, buffer.count)
         }
-        return tiles.map { ChartPatch(from: $0.from.vector, to: $0.to.vector) }
+        return tiles.map { ChartPatch.filling($0.gap.vector, from: $0.from.vector, to: $0.to.vector, radial: false) }
     }
     func kind(at key: DTKey) -> UInt32 { dt_map_kind(handle, key) }
     func motionTiles(in frame: RenderedFiles) -> [MapItemName: (key: UInt64, rect: CGRect)] {

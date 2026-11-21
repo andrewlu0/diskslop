@@ -13,7 +13,7 @@ private struct LiveSnapshot {
     let colors: MapBreakdown?, order: MapGroupOrder?, ranked: [RankedFile]?
     let frame: LiveMapFrame?, settings: MapRenderSettings?, rings: Rings?
     let sort: (key: String, ascending: Bool)
-    let checkpointNotices: Int
+    let checkpointNotices: Int, sawRemoval: Bool
 }
 
 final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSplitViewDelegate {
@@ -21,6 +21,10 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private let tree = Outline()
     private let map = Treemap()
     private let sunburst = Sunburst()
+    private let startupPreview = StartupMapPreview()
+    private var savedPreviewStyle: StartupMapPreview.Style?
+    private let reopenStartupKey = "DiskSlopReopenStartupVolume"
+    private var reopeningStartup = false
     private let mapStyle = NSSegmentedControl(labels: ["Treemap", "Sunburst"], trackingMode: .selectOne, target: nil, action: nil)
     private let sidebarTabs = NSSegmentedControl(labels: ["Folders", "Largest Files"], trackingMode: .selectOne, target: nil, action: nil)
     private let largest = LargestFiles()
@@ -74,12 +78,13 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private let trashGlass = TrashGlass()
     private var listing: FolderListing?
     private var locations: [Location] = []
-    private var history = SelectionHistory()
+    private var history = FolderHistory()
     private var applyingNavigation = false
     private var scanning: ScanProgress?
     private var timer: Timer?
     private var busy = false
     private var pendingURL: URL?
+    private var trashLayoutWork: ScanProgress?
     private var movingToTrash = false
     private var waitingToQuit = false
 
@@ -118,23 +123,40 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         }
         let argumentURL = CommandLine.arguments.dropFirst().first(where: { !$0.hasPrefix("-") })
             .map { URL(fileURLWithPath: $0, isDirectory: true) }
-        if let url = pendingURL ?? argumentURL { scan(url) }
+        let launchURL = pendingURL ?? argumentURL
+        pendingURL = nil
+        if let url = launchURL {
+            scan(url)
+        } else if UserDefaults.standard.bool(forKey: reopenStartupKey) {
+            reopeningStartup = true
+            scan(URL(fileURLWithPath: StartupSnapshot.startupPath, isDirectory: true))
+        }
     }
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let url = urls.first else { return }
-        if window == nil { pendingURL = url } else if !busy { scan(url) }
+        if window == nil { pendingURL = url }
+        else if reopeningStartup {
+            guard url.path != StartupSnapshot.startupPath else { return }
+            pendingURL = url
+            cancel()
+        } else if !busy { scan(url) }
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard movingToTrash else { return .terminateNow }
+        if waitingToQuit { return .terminateLater }
         waitingToQuit = true
+        if !movingToTrash { flushAndQuit() }
         return .terminateLater
+    }
+    private func flushAndQuit() {
+        cancel()
+        updates.follow(nil)
+        liveCheckpoints.flush { NSApp.reply(toApplicationShouldTerminate: true) }
     }
     func applicationDidBecomeActive(_ notification: Notification) {
         trashGlass.dock.prepare()
         if let welcome, !welcome.isHidden { welcome.refreshCapacity() }
     }
-    func applicationWillTerminate(_ notification: Notification) { updates.follow(nil); liveCheckpoints.cancel() }
 
     @objc private func installAvailableUpdate() { updateDriver.installAvailableUpdate() }
     @objc private func checkForAppUpdates() { updateDriver.checkFromMenu(using: appUpdater) }
@@ -258,6 +280,14 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             return browserIsKey && listing != nil
         }
         if menuItem.action == #selector(cancel) { return browserIsKey && scanning != nil }
+        if menuItem.action == #selector(folderUp) { return browserIsKey && canChangeFolder && locations.count > 1 }
+        if menuItem.action == #selector(folderDown) { return browserIsKey && canEnterFolder }
+        if usingSunburst {
+            if menuItem.action == #selector(zoomIn) { return browserIsKey && canDrill }
+            if menuItem.action == #selector(zoomOut) || menuItem.action == #selector(fitMap) {
+                return browserIsKey && canChangeFolder && locations.count > 1
+            }
+        }
         guard browserIsKey, !busy else { return false }
         switch menuItem.action {
         case #selector(copyPaths):
@@ -271,13 +301,11 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
              #selector(openSelection), #selector(refreshSelection), #selector(fitSelection):
             return hasSelection
         case #selector(selectAll(_:)): return (listing?.summary.entries ?? 0) > 0
-        case #selector(zoomIn): return usingSunburst ? canDrill : listing != nil && map.zoom < CGFloat(1 << 30)
-        case #selector(zoomOut), #selector(fitMap): return usingSunburst ? locations.count > 1 : listing != nil && map.zoom > 1
+        case #selector(zoomIn): return listing != nil && map.zoom < CGFloat(1 << 30)
+        case #selector(zoomOut), #selector(fitMap): return listing != nil && map.zoom > 1
         case #selector(rescan), #selector(forceFullScan): return !locations.isEmpty
         case #selector(back): return history.adjacent(-1) != nil
         case #selector(forward): return history.adjacent(1) != nil
-        case #selector(folderUp): return locations.count > 1
-        case #selector(folderDown): return canEnterFolder
         default: return true
         }
     }
@@ -318,12 +346,13 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
     @objc private func fitSelection() { if usingSunburst { drillSelection() } else { map.fitSelection() } }
     private var canDrill: Bool {
+        guard canChangeFolder else { return false }
         if canEnterFolder { return true }
         if let item = tree.firstSelected, item.folder != locations.last?.id { return true }
         return false
     }
     private func drillSelection() {
-        guard !busy, let item = tree.firstSelected, let model, var route = model.route(to: DTKey(item.key), from: 0) else { return }
+        guard canChangeFolder, let item = tree.firstSelected, let model, var route = model.route(to: DTKey(item.key), from: 0) else { return }
         if !item.isFolder { route.removeLast() }
         enterFolder(route)
     }
@@ -430,14 +459,13 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         tree.selectionChanged = { [weak self] in
             guard let self, self.shelf != nil, !self.publishingLive else { return }
             if self.scanWorkspace != nil, !self.applyingNavigation { self.browsedDuringScan = true }
-            self.map.selection = self.tree.selectedKeys()
-            if !self.map.selection.isEmpty { self.legend.clearFocus() }
-            self.sunburst.selection = self.map.selection
+            let keys = self.tree.selectedKeys()
+            if !keys.isEmpty { self.legend.clearFocus() }
+            self.map.selection = keys
+            self.sunburst.selection = keys
             self.window.selectionDidChange { self.selectedURLs() }
-            if !self.tree.view.trackingSelection { self.recordVisit() }
             self.controls()
         }
-        tree.view.gestureEnded = { [weak self] in self?.recordVisit(); self?.controls() }
         tree.openFolder = { [weak self] route in self?.enterFolder(route) }
         let sidebar = NSView()
         let surface = NativeTableSurface(tree.view, preferencesName: "Folders")
@@ -490,6 +518,11 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         let mapHost = NSView()
         mapHost.widthAnchor.constraint(greaterThanOrEqualToConstant: mapMinimum).isActive = true
         place(map, in: mapHost); place(sunburst, in: mapHost)
+        startupPreview.present(nil)
+        startupPreview.setAccessibilityLabel("Cached disk map")
+        place(startupPreview, in: mapHost)
+        map.artworkReady = { [weak self] image, color in self?.mapArtworkReady(image, radial: false, color: color) }
+        sunburst.artworkReady = { [weak self] image, color in self?.mapArtworkReady(image, radial: true, color: color) }
         map.setPresented(!usingSunburst); sunburst.isHidden = !usingSunburst
         map.zoomChanged = { [weak self] in
             guard let self else { return }
@@ -595,6 +628,8 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     @objc private func chooseTreemap() { mapStyle.selectedSegment = 0; switchMap() }
     @objc private func chooseSunburst() { mapStyle.selectedSegment = 1; switchMap() }
     @objc private func switchMap() {
+        let wasUsingSunburst = !sunburst.isHidden
+        if wasUsingSunburst != usingSunburst { startupPreview.present(nil) }
         map.setPresented(!usingSunburst); sunburst.isHidden = !usingSunburst
         UserDefaults.standard.set(usingSunburst, forKey: "DiskSlopSunburst")
         showHover(nil, kind: nil)
@@ -602,7 +637,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         updateZoom()
     }
     private func updateZoom() {
-        if usingSunburst { toolbar.updateZoom(inward: !busy && canDrill, outward: !busy && locations.count > 1) }
+        if usingSunburst { toolbar.updateZoom(inward: canDrill, outward: canChangeFolder && locations.count > 1) }
         else { toolbar.updateZoom(hasScan: listing != nil, scale: map.zoom) }
     }
     @objc private func showLargest() { sidebarTabs.selectedSegment = 1; chooseSidebar(); window.makeFirstResponder(largest.table) }
@@ -614,17 +649,17 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private func switchSidebar() {
         let ranked = sidebarTabs.selectedSegment == 1
         treeSurface.isHidden = ranked; largest.view.isHidden = !ranked
-        if ranked, let scanWorkspace {
+        if ranked, let scanWorkspace, (listing?.folder ?? 0) == 0 {
             updateScanRanking(scanWorkspace)
             rankedSelectionChanged()
         } else if ranked, let listing {
             if rankedScope === listing && rankingWork == nil { rankedSelectionChanged() }
-            else { loadLargest(listing) }
+            else { loadLargest(listing, in: scanWorkspace) }
         }
         if !ranked { window.makeFirstResponder(tree.view) }
         controls()
     }
-    private func loadLargest(_ list: FolderListing, keepingRows: Bool = false) {
+    private func loadLargest(_ list: FolderListing, keepingRows: Bool = false, in workspace: ScanWorkspace? = nil) {
         guard rankedScope !== list else { return }
         rankedScope = list
         if pendingRankSelection == nil { pendingRankSelection = Set(largest.selected.map(\.url)) }
@@ -633,7 +668,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         DispatchQueue.global(qos: .userInitiated).async {
             let rows = dt_largest_files(list.model.handle, list.folder).map(RankedFile.read) ?? []
             DispatchQueue.main.async {
-                guard self.rankingWork == token, self.listing === list, self.scanWorkspace == nil else { return }
+                guard self.rankingWork == token, self.listing === list, self.scanWorkspace === workspace else { return }
                 self.rankingWork = nil
                 self.largest.replace(rows, keeping: self.pendingRankSelection ?? [])
                 self.pendingRankSelection = nil
@@ -678,6 +713,8 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
 
     private func clearWorkspace() {
+        cancelTrashLayout()
+        startupPreview.present(nil)
         legend.clearFocus()
         if let work = colorWork { dt_cancel(work.handle); colorWork = nil }
         rankingWork = nil; rankedScope = nil; pendingRankSelection = nil
@@ -706,7 +743,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
 
     private func updateScanRanking(_ workspace: ScanWorkspace) {
-        guard showingLargest else { return }
+        guard showingLargest, (listing?.folder ?? 0) == 0 else { return }
         if let model = workspace.indexed {
             guard !workspace.indexedRankingStarted else { return }
             workspace.indexedRankingStarted = true
@@ -714,6 +751,10 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                 let rows = dt_largest_files(model.handle, 0).map(RankedFile.read) ?? []
                 DispatchQueue.main.async {
                     guard self.scanWorkspace === workspace, !self.cancelledScan else { return }
+                    guard (self.listing?.folder ?? 0) == 0 else {
+                        workspace.indexedRankingStarted = false
+                        return
+                    }
                     self.largest.replace(rows, live: true)
                     workspace.indexedRankingDisplayed = true
                     if self.showingLargest { self.rankedSelectionChanged() }
@@ -729,12 +770,13 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
 
     private func updateScanWorkspace(_ workspace: ScanWorkspace) {
         updateScanRanking(workspace)
-        guard !tree.view.trackingSelection, !map.trackingSelection, !sunburst.trackingSelection else { return }
+        guard workspace.navigationRequest == nil,
+              !tree.view.trackingSelection, !map.trackingSelection, !sunburst.trackingSelection else { return }
         if let (request, frame) = workspace.deferredFrame {
             workspace.deferredFrame = nil
             publishScanFrame(request, frame, in: workspace)
         }
-        workspace.update(request: scanMapRequest) { [weak self] request, next in
+        workspace.update(visit: workspace.visit, request: scanMapRequest) { [weak self] request, next in
             guard let self, self.scanWorkspace === workspace, !self.cancelledScan else { return }
             self.publishScanFrame(request, next, in: workspace)
         }
@@ -746,22 +788,32 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
 
     private func publishScanFrame(_ request: ScanMapRequest, _ next: ScanMapFrame, in workspace: ScanWorkspace) {
-        guard scanWorkspace === workspace, !cancelledScan, model == nil || model?.isScanPreview == true else { return }
+        guard scanWorkspace === workspace, workspace.navigationRequest == nil, !cancelledScan,
+              model == nil || model?.isScanPreview == true else { return }
+        let list = next.list, previous = listing
+        let nextLocations: [Location]
+        if let visit = workspace.visit {
+            guard let route = visit.resolve(in: list.model), (route.last?.child ?? 0) == list.folder,
+                  let trail = trail(in: list.model, root: visit.root, route: route) else { return }
+            nextLocations = trail
+        } else {
+            guard let root = list.model.url(folder: 0, directory: true), list.folder == 0 else { return }
+            nextLocations = [Location(id: 0, url: root)]
+        }
         if tree.view.trackingSelection || map.trackingSelection || sunburst.trackingSelection {
             workspace.deferredFrame = (request, next)
             return
         }
         workspace.deferredFrame = nil
-        let list = next.list, previous = listing
         let keys = Array(tree.selectedKeys()), lead = tree.leadKey
         publishingLive = true
         if let work = colorWork { dt_cancel(work.handle); colorWork = nil }
         recentColors.removeAll()
-        model = list.model; listing = list
-        if previous == nil, let root = list.model.url(folder: 0, directory: true) { locations = [Location(id: 0, url: root)] }
+        model = list.model; listing = list; locations = nextLocations
         tree.showLive(list.model, keys: keys, lead: lead)
         if previous == nil { setHeading(workspace.root) }
         installScanCharts(request, next, continuing: previous != nil)
+        if showingLargest, list.folder != 0 { loadLargest(list, keepingRows: true, in: workspace) }
         if showingLargest, !largest.selected.isEmpty { syncRankedSelection() }
         if let file = pendingParentFile, let parent = list.model.route(to: file.deletingLastPathComponent()) {
             pendingParentFile = nil; selectParent(parent, in: list.model); browsedDuringScan = true
@@ -915,12 +967,11 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     @objc private func rescan() { if let root = locations.first { scan(root.url, preserve: true) } }
     @objc private func toggleLive() {
         UserDefaults.standard.set(liveSwitch.state == .on, forKey: "DiskSlopLiveUpdates")
-        if liveSwitch.state == .off { liveCheckpoints.cancel() }
         syncLive()
     }
     private func syncLive() {
         liveDot.isOn = liveSwitch.state == .on
-        let entry = liveSwitch.state == .on && !busy && scanWorkspace == nil
+        let entry = liveSwitch.state == .on && !waitingToQuit && !busy && trashLayoutWork == nil && scanWorkspace == nil
             ? locations.first.flatMap { cache.read($0.url) } : nil
         let current = entry?.model === model ? entry : nil
         if liveSwitch.toolTip == nil || current !== updates.source {
@@ -931,12 +982,8 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         }
         updates.follow(current)
     }
-    private func currentVisit(_ list: FolderListing) -> NavigationVisit {
-        let root = locations[0], here = locations[locations.count - 1]
-        let keys = tree.selectedKeys()
-        if let visit = history.current, visit.matches(list.model, folder: here.url, keys: keys) { return visit }
-        return NavigationVisit(model: list.model, root: root.url, folder: here.url, folderNumber: here.id,
-            keys: keys, lead: tree.leadKey, viewport: map.viewport)
+    private func saveSelection(in model: ScanModel) -> SavedSelection {
+        SavedSelection(model, keys: tree.selectedKeys(), lead: tree.leadKey)
     }
     private func refreshLive(_ entry: RecentScan, progress: ScanProgress, changes: CacheChanges) {
         guard !busy, let current = listing, current.model === entry.model, !locations.isEmpty else {
@@ -944,7 +991,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         }
         let root = entry.root, focus = locations
         let scope = focus.map { ($0.url, DirectoryID(entry.model, $0.id)) }
-        let visit = currentVisit(current), request = scanMapRequest(), ranked = showingLargest
+        let selection = saveSelection(in: current.model), request = scanMapRequest(), ranked = showingLargest
         let began = ProcessInfo.processInfo.systemUptime
         updates.queue.async {
             do {
@@ -958,7 +1005,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                     next = try entry.model.refreshed(changes: paths, progress: progress)
                 } else {
                     watcher = ChangeWatch(url: root, identity: identity)
-                    diskSnapshot = watcher == nil ? nil : StartupSnapshot.forStartupVolume(root, identity: identity)
+                    diskSnapshot = watcher == nil ? nil : StartupSnapshot.forRoot(root, identity: identity)
                     checkpointNotices = 512
                     next = try ScanModel(url: root, progress: progress, preview: false)
                 }
@@ -975,21 +1022,22 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                     }
                 }
                 let list = FolderListing(next, folder: trail.last!.id, aspect: request.aspect, previous: current.geometry)
-                guard let charts = request.prepare(list, progress: progress) else { return }
+                let sawRemoval: Bool
+                if case .paths(let paths) = changes { sawRemoval = paths.sawRemoval }
+                else { sawRemoval = false }
+                guard let charts = request.prepare(list, progress: progress, afterTrash: sawRemoval) else { return }
                 let rows = ranked ? dt_largest_files(next.handle, list.folder).map(RankedFile.read) ?? [] : nil
                 guard !dt_is_cancelled(progress.handle) else { return }
                 let scan = RecentScan(model: next, listing: list.folder == 0 ? list : nil, root: root, identity: identity,
                     watcher: watcher, elapsed: ProcessInfo.processInfo.systemUptime - began, startupSnapshot: diskSnapshot)
                 let snapshot = LiveSnapshot(scan: scan, list: list, trail: trail, colors: charts.colors, order: charts.order,
-                    ranked: rows, frame: charts.raster, settings: request.settings, rings: charts.rings, sort: request.sort, checkpointNotices: checkpointNotices)
-                let keys = visit.liveKeys(in: next) ?? []
+                    ranked: rows, frame: charts.raster, settings: request.settings, rings: charts.rings, sort: request.sort,
+                    checkpointNotices: checkpointNotices, sawRemoval: sawRemoval)
+                let keys = selection.resolve(in: next)
                 DispatchQueue.main.async {
                     guard self.updates.work === progress else { return }
-                    guard self.listing === current, self.colorMode == request.mode, self.legend.sort == request.sort,
-                          self.usingSunburst == request.radial, !self.showingLargest || ranked else {
-                        self.updates.finish(progress, retry: true); return
-                    }
-                    self.publishLive(snapshot, progress: progress, visit: visit, keys: keys)
+                    guard self.colorMode == request.mode else { self.updates.finish(progress, retry: true); return }
+                    self.publishLive(snapshot, replacing: current, progress: progress, selection: selection, keys: keys)
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -1002,23 +1050,26 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         }
     }
 
-    private func publishLive(_ next: LiveSnapshot, progress: ScanProgress, visit: NavigationVisit, keys: [UInt64]) {
-        guard updates.work === progress, let current = listing else { return }
-        guard locations.last?.url == visit.folder, colorMode == (next.colors?.mode ?? .kind), legend.sort == next.sort,
+    private func publishLive(_ next: LiveSnapshot, replacing current: FolderListing, progress: ScanProgress,
+                             selection: SavedSelection, keys: [UInt64]) {
+        guard updates.work === progress else { return }
+        guard listing === current, colorMode == (next.colors?.mode ?? .kind), legend.sort == next.sort,
               usingSunburst == (next.rings != nil), !showingLargest || next.ranked != nil else {
             updates.finish(progress, retry: true); return
         }
         if window.attachedSheet != nil || tree.view.trackingSelection || map.trackingSelection || sunburst.trackingSelection {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
-                self.publishLive(next, progress: progress, visit: visit, keys: keys)
+                self.publishLive(next, replacing: current, progress: progress, selection: selection, keys: keys)
             }
             return
         }
-        guard visit.matches(current.model, folder: locations.last!.url, keys: tree.selectedKeys()) else {
-            let latest = currentVisit(current)
+        guard selection.matches(current.model, keys: tree.selectedKeys()) else {
+            let latest = saveSelection(in: current.model)
             updates.queue.async {
-                let keys = latest.liveKeys(in: next.scan.model) ?? []
-                DispatchQueue.main.async { self.publishLive(next, progress: progress, visit: latest, keys: keys) }
+                let keys = latest.resolve(in: next.scan.model)
+                DispatchQueue.main.async {
+                    self.publishLive(next, replacing: current, progress: progress, selection: latest, keys: keys)
+                }
             }
             return
         }
@@ -1049,7 +1100,9 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         map.showLive(next.list, ancestors: scopeKeys, colors: next.colors, frame: next.frame,
             settings: next.settings, sameFolder: sameFolder)
         sunburst.scopeKeys = scopeKeys
-        if usingSunburst, let rings = next.rings { sunburst.showLive(next.list, colors: next.colors, layout: rings, sameFolder: sameFolder) }
+        if usingSunburst, let rings = next.rings {
+            sunburst.showLive(next.list, colors: next.colors, layout: rings, sameFolder: sameFolder, afterTrash: next.sawRemoval)
+        }
         map.selection = tree.selectedKeys(); sunburst.selection = map.selection
         if showingLargest { largest.table.refreshHover() } else { tree.view.refreshHover() }
         if let here = next.trail.last?.url {
@@ -1075,29 +1128,46 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
 
     private func scan(_ url: URL, force: Bool = false, preserve: Bool = false) {
-        guard !busy else { return }
+        guard !busy, !waitingToQuit else { return }
         if preserve { recordVisit() }
         let previous = preserve ? history.current : nil
+        let selection = preserve ? model.map(saveSelection(in:)) : nil
         let priorExpansions = preserve ? tree.expandedURLs : []
         var previewed: ScanModel?
         obtainRoot(url, force: force, keeping: preserve ? model : nil, preview: { entry in
-            guard !preserve else { return }
+            guard !preserve, self.scanWorkspace?.visit == nil else { return }
             previewed = entry.model
             self.showRoot(entry, message: "Checking cached scan")
-        }) { result in
+        }) { result, scanVisit in
+            if self.reopeningStartup {
+                self.reopeningStartup = false
+                if let requested = self.pendingURL {
+                    self.pendingURL = nil
+                    self.scan(requested)
+                    return
+                }
+            }
             switch result {
             case .success(let entry):
                 if self.showPendingParent(in: entry) { return }
-                if preserve, self.model === entry.model {
+                let previewVisit: NavigationVisit?
+                if let previewed, self.model === previewed, self.browsedDuringScan,
+                   let root = self.locations.first, let here = self.locations.last {
+                    previewVisit = NavigationVisit(model: previewed, root: root.url, folder: here.url,
+                        folderNumber: here.id, viewport: self.map.viewport)
+                } else { previewVisit = nil }
+                if scanVisit == nil, preserve, self.model === entry.model {
                     let result = entry.summary.issues == 0 ? "Up to date" : "Checked readable items"
                     self.setScanStatus([result, "\(formatCount(entry.summary.entries)) entries"], summary: entry.summary)
                     self.controls()
-                } else if let previous, !(self.browsedDuringScan && self.model?.isScanPreview == true) {
+                } else if let visit = scanVisit ?? previous ?? previewVisit,
+                          scanVisit != nil || !(self.browsedDuringScan && self.model?.isScanPreview == true) {
                     let expanded = Set(priorExpansions + self.tree.expandedURLs)
-                    self.restoreVisit(previous, in: entry.model, root: entry.root, rootList: entry.listing) { restored in
+                    let saved = scanVisit != nil ? self.model.map(self.saveSelection(in:)) : selection ?? previewed.map(self.saveSelection(in:))
+                    self.restoreVisit(visit, in: entry.model, rootList: entry.listing, selection: saved) { restored in
                         if !restored { self.showRoot(entry) }
                         for url in expanded { if let route = entry.model.route(to: url) { self.tree.expand(route) } }
-                        self.recordVisit(replace: true); self.controls()
+                        self.recordVisit(replace: scanVisit == nil); self.controls()
                     }
                 } else {
                     if previewed === entry.model {
@@ -1112,6 +1182,23 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             }
         }
     }
+
+    private var startupPreviewStyle: StartupMapPreview.Style {
+        StartupMapPreview.Style(radial: usingSunburst, color: colorMode, dark: window.effectiveAppearance.usesDarkColors,
+            shine: !NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency)
+    }
+
+    private func mapArtworkReady(_ image: CGImage?, radial: Bool, color: MapColorMode) {
+        guard let list = listing, radial == usingSunburst else { return }
+        if startupPreview.image != nil { startupPreview.present(nil) }
+        let style = startupPreviewStyle
+        guard !busy, !list.model.isScanPreview, let image, list.folder == 0, color == style.color, savedPreviewStyle != style,
+              let root = locations.first?.url, root.path == StartupSnapshot.startupPath, let snapshot = cache.read(root)?.startupSnapshot
+        else { return }
+        savedPreviewStyle = style
+        StartupMapPreview.save(image, to: snapshot, style: style)
+    }
+
     private func showRoot(_ entry: RecentScan, message: String? = nil) {
         guard let list = entry.listing else { return }
         let continuing = (model?.isScanPreview == true || (model === entry.model && listing == nil))
@@ -1147,21 +1234,25 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
 
     private func obtainRoot(_ url: URL, force: Bool = false, keeping current: ScanModel? = nil, preview: ((RecentScan) -> Void)? = nil,
-                            completion: @escaping (Result<RecentScan, Error>) -> Void) {
+                            completion: @escaping (Result<RecentScan, Error>, NavigationVisit?) -> Void) {
         pendingParentFile = nil
         browsedDuringScan = false
         let progress = beginScan()
         let began = ProcessInfo.processInfo.systemUptime
         let cached = force ? nil : cache.read(url)
+        let parents = force || cached != nil ? [] : cache.parents(of: url)
         let workspace = cached == nil && (current == nil || (force && locations.count <= 1))
             ? ScanWorkspace(root: url, progress: progress) : nil
         let prior = workspace.map(beginScanWorkspace)
+        let previewStyle = !force && workspace != nil && url.path == StartupSnapshot.startupPath ? startupPreviewStyle : nil
         let mapAspect = map.aspect
         controls()
         let update = { [weak self] in
             guard let self, self.scanning === progress, !self.cancelledScan else { return }
             if let indexed = workspace?.indexed {
                 self.status.stringValue = "Preparing map · \(formatCount(dt_summary(indexed.handle, 0).entries)) entries"
+            } else if self.startupPreview.image != nil {
+                self.status.stringValue = "Checking cached scan"
             } else {
                 self.status.stringValue = "\(url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent) · \(formatCount(dt_progress_count(progress.handle))) entries"
             }
@@ -1179,6 +1270,8 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         let pulse = Timer(timeInterval: 0.15, repeats: true) { _ in update() }
         RunLoop.main.add(pulse, forMode: .common); timer = pulse
         DispatchQueue.global(qos: .userInitiated).async {
+            var indexWrite: (StartupSnapshot, UInt64)?
+            var checkpointNotices = 0
             let measured = Result<(entry: RecentScan, elapsed: TimeInterval), Error> {
                 let identity = RootIdentity(url)
                 var previousWatch: ChangeWatch?
@@ -1198,10 +1291,21 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                     }
                 }
                 let watcher = ChangeWatch(url: url, identity: identity)
-                let snapshot = watcher == nil ? nil : StartupSnapshot.forStartupVolume(url, identity: identity)
+                let snapshot = watcher == nil ? nil : StartupSnapshot.forRoot(url, identity: identity)
+                if let snapshot, let previewStyle, let image = StartupMapPreview.read(snapshot, style: previewStyle) {
+                    DispatchQueue.main.async {
+                        guard let workspace, self.scanWorkspace === workspace, self.scanning === progress,
+                              !self.cancelledScan, self.listing == nil, self.startupPreviewStyle == previewStyle
+                        else { return }
+                        self.startupPreview.present(image, style: previewStyle)
+                        self.status.stringValue = "Checking cached scan"
+                    }
+                }
                 let observedInode = snapshot?.fileInode ?? 0
                 var replacingInode: UInt64 = 0
                 var shouldSave = snapshot?.needsRenewal == true
+                let restoredPreview = RestoredScanPreview()
+                var previewModel: ScanModel?
                 let scanned: ScanModel
                 if let previousWatch, let cached {
                     switch previousWatch.changes() {
@@ -1212,9 +1316,28 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                         scanned = try cached.model.refreshed(changes: ChangedDirectories(), retryIssues: true, progress: progress)
                     case .paths(let paths):
                         scanned = try cached.model.refreshed(changes: paths, retryIssues: true, progress: progress)
+                        if paths.outsideSnapshotDirectory {
+                            checkpointNotices = paths.shallow.count + paths.recursive.count
+                        }
                     }
-                } else if !force, let snapshot, let restored = try snapshot.restore(progress: progress) {
-                    scanned = restored
+                } else if let identity, watcher != nil,
+                          let reused = parents.lazy.compactMap({ $0.subtree(at: url, identity: identity, progress: progress) }).first {
+                    scanned = reused
+                    shouldSave = snapshot != nil
+                } else if !force, let snapshot, let restored = try snapshot.restore(progress: progress, preview: { saved in
+                    guard let preview else { return }
+                    previewModel = saved
+                    restoredPreview.prepare(saved, aspect: mapAspect, progress: progress) { list in
+                        let entry = RecentScan(model: saved, listing: list, root: saved.url(folder: 0, directory: true) ?? url,
+                            identity: identity, watcher: nil, elapsed: ProcessInfo.processInfo.systemUptime - began)
+                        DispatchQueue.main.async {
+                            guard self.scanning === progress, !self.cancelledScan else { return }
+                            preview(entry)
+                        }
+                    }
+                }) {
+                    scanned = restored.model
+                    checkpointNotices = restored.notices
                 } else {
                     scanned = try ScanModel(url: url, progress: progress)
                     shouldSave = true
@@ -1236,14 +1359,16 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                         }
                     }
                 }
-                if shouldSave, let snapshot {
-                    snapshot.save(scanned, progress: progress, replacingInode: replacingInode)
-                }
+                if shouldSave, let snapshot { indexWrite = (snapshot, replacingInode) }
+                let restoredList = previewModel == nil ? nil : restoredPreview.ready()
                 let list: FolderListing?
                 if let cached, scanned === cached.model, cached.listing != nil || scanned === current {
                     list = cached.listing
+                } else if scanned === previewModel, let restoredList {
+                    list = restoredList
                 } else {
-                    list = FolderListing(scanned, folder: 0, aspect: mapAspect, previous: priorGeometry ?? cached?.listing?.geometry)
+                    list = FolderListing(scanned, folder: 0, aspect: mapAspect,
+                        previous: restoredList?.geometry ?? priorGeometry ?? cached?.listing?.geometry)
                 }
                 let entry = RecentScan(model: scanned, listing: list, root: scanned.url(folder: 0, directory: true) ?? url,
                     identity: identity, watcher: watcher, elapsed: ProcessInfo.processInfo.systemUptime - began, startupSnapshot: snapshot)
@@ -1256,19 +1381,25 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                 let request = DispatchQueue.main.sync { self.scanMapRequest() }
                 finished = request.prepare(list, progress: progress).map { (request, $0) }
             } else { finished = nil }
+            let write = indexWrite, notices = checkpointNotices
             DispatchQueue.main.async {
                 self.timer?.invalidate(); self.timer = nil
                 self.endScan(elapsed: try? measured.get().elapsed)
+                var scanVisit = workspace?.visit
+                if scanVisit?.folder == self.locations.last?.url { scanVisit?.viewport = self.map.viewport }
                 if workspace != nil {
                     self.pendingRankSelection = Set(self.largest.selected.map(\.url))
                     self.scanWorkspace = nil
                 }
                 if self.cancelledScan {
                     if let prior { self.restoreWorkspace(prior) }
-                    completion(.failure(DiskError(message: "Scan cancelled.")))
+                    completion(.failure(DiskError(message: "Scan cancelled.")), nil)
                     return
                 }
-                if case .success(let entry) = result, entry !== cached { self.cache.put(entry, for: url) }
+                if case .success(let entry) = result, entry !== cached {
+                    self.cache.put(entry, for: url)
+                    if entry.startupSnapshot != nil { self.savedPreviewStyle = nil }
+                }
                 if case .success(let entry) = result, workspace?.indexedRankingDisplayed == true, workspace?.indexed === entry.model {
                     self.rankedScope = entry.listing; self.pendingRankSelection = nil
                 }
@@ -1277,8 +1408,15 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                     if let prior { self.restoreWorkspace(prior) }
                 }
                 self.finishedScanFrame = finished
-                completion(result)
+                completion(result, scanVisit)
                 self.finishedScanFrame = nil
+                if case .success(let entry) = result {
+                    if let (snapshot, inode) = write {
+                        self.liveCheckpoints.save(entry.model, to: snapshot, replacingInode: inode)
+                    } else if notices > 0 {
+                        self.liveCheckpoints.consider(entry, notices: notices)
+                    }
+                }
             }
         }
     }
@@ -1315,7 +1453,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             if usingSunburst && trashFrame == nil { sunburst.prepareZoom(to: list) }
             legend.clearFocus()
         }
-        if listing !== list { recentColors.removeAll() }
+        if listing !== list { cancelTrashLayout(); recentColors.removeAll() }
         listing = list
         if continuingScan { tree.showLive(list.model, keys: Array(tree.selectedKeys()), lead: tree.leadKey) }
         else { tree.show(list.model, refresh: reloadTree) }
@@ -1335,7 +1473,10 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             }
             updateColors(for: list)
         }
-        if showingLargest { loadLargest(list, keepingRows: continuingScan) }
+        if showingLargest {
+            if let workspace = scanWorkspace, list.folder == 0 { updateScanRanking(workspace) }
+            else { loadLargest(list, keepingRows: continuingScan, in: scanWorkspace) }
+        }
         map.selection = tree.selectedKeys()
         sunburst.selection = map.selection
         if let here = locations.last {
@@ -1355,13 +1496,12 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
     private func recordVisit(replace: Bool = false) {
         guard !applyingNavigation, !busy, let model, let root = locations.first, let here = locations.last else { return }
-        let keys = map.selection
-        if history.current?.matches(model, folder: here.url, keys: keys) == true {
-            history.updateViewport(map.viewport)
-            return
+        let reopenStartup = root.url.path == StartupSnapshot.startupPath
+        if UserDefaults.standard.bool(forKey: reopenStartupKey) != reopenStartup {
+            UserDefaults.standard.set(reopenStartup, forKey: reopenStartupKey)
         }
         history.record(NavigationVisit(model: model, root: root.url, folder: here.url, folderNumber: here.id,
-            keys: keys, lead: tree.leadKey, viewport: map.viewport), replace: replace)
+            viewport: map.viewport), replace: replace)
     }
     private func trail(in model: ScanModel, root: URL, route: [DiskItem]) -> [Location]? {
         var trail = [Location(id: 0, url: root)]
@@ -1371,41 +1511,35 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         }
         return trail
     }
-    private func restoreVisit(_ visit: NavigationVisit, in source: ScanModel, root: URL,
-                              rootList: FolderListing?, completion: @escaping (Bool) -> Void) {
+    private func restoreVisit(_ visit: NavigationVisit, in source: ScanModel, rootList: FolderListing?,
+                              selection: SavedSelection? = nil, completion: @escaping (Bool) -> Void) {
         let aspect = map.aspect, current = listing
         let apply = { (trail: [Location], list: FolderListing, keys: [UInt64], lead: UInt64?) in
             self.busy = false; self.applyingNavigation = true
             self.model = source; self.locations = trail
-            if current !== list {
-                self.display(list)
-                self.tree.expand(trail.compactMap(\.item))
-            }
-            self.tree.selectSaved(keys, lead: lead)
+            if selection == nil { self.clearFileSelection() }
+            if current !== list { self.display(list) }
+            self.tree.expand(trail.compactMap(\.item), scroll: keys.isEmpty)
+            if selection != nil { self.tree.selectSaved(keys, lead: lead) }
             self.map.restoreViewport(visit.viewport)
             self.applyingNavigation = false
             completion(true)
         }
         let prepare = { () -> ([Location], FolderListing, [UInt64], UInt64?)? in
-            guard let saved = visit.resolve(in: source), let trail = self.trail(in: source, root: root, route: saved.route),
+            guard let route = visit.resolve(in: source), let trail = self.trail(in: source, root: visit.root, route: route),
                   let id = trail.last?.id else { return nil }
             let list: FolderListing
             if let current, current.model === source, current.folder == id { list = current }
             else if let rootList, id == 0, rootList.model === source { list = rootList }
             else { list = FolderListing(source, folder: id, aspect: aspect) }
-            return (trail, list, saved.keys, saved.lead)
+            return (trail, list, selection?.resolve(in: source) ?? [], selection?.lead(in: source))
         }
-        if let current, current.model === source, visit.isIn(source, at: current.folder), visit.count <= 64 {
-            if let keys = visit.liveKeys(in: source) { apply(locations, current, keys, visit.lead) }
-            else { completion(false) }
-        } else {
-            busy = true; controls()
-            DispatchQueue.global(qos: .userInitiated).async {
-                let result = prepare()
-                DispatchQueue.main.async {
-                    if let (trail, list, keys, lead) = result { apply(trail, list, keys, lead) }
-                    else { self.busy = false; completion(false) }
-                }
+        busy = true; controls()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = prepare()
+            DispatchQueue.main.async {
+                if let (trail, list, keys, lead) = result { apply(trail, list, keys, lead) }
+                else { self.busy = false; completion(false) }
             }
         }
     }
@@ -1419,13 +1553,12 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             self.controls()
         }
         if visit.root == locations.first?.url, let model {
-            restoreVisit(visit, in: model, root: visit.root, rootList: cache.read(visit.root)?.listing, completion: finish)
+            restoreVisit(visit, in: model, rootList: cache.read(visit.root)?.listing, completion: finish)
         } else {
-            obtainRoot(visit.root) { result in
+            obtainRoot(visit.root, keeping: model) { result, _ in
                 switch result {
                 case .success(let entry):
-                    if self.showPendingParent(in: entry) { return }
-                    self.restoreVisit(visit, in: entry.model, root: entry.root, rootList: entry.listing, completion: finish)
+                    self.restoreVisit(visit, in: entry.model, rootList: entry.listing, completion: finish)
                 case .failure(let error):
                     self.status.stringValue = error.localizedDescription
                     if self.cancelledScan { self.controls() } else { finish(false) }
@@ -1433,8 +1566,9 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             }
         }
     }
+    private var canChangeFolder: Bool { !busy || (scanWorkspace != nil && !cancelledScan) }
     private var canEnterFolder: Bool {
-        guard tree.view.numberOfSelectedRows == 1, let item = tree.firstSelected else { return false }
+        guard canChangeFolder, tree.view.numberOfSelectedRows == 1, let item = tree.firstSelected else { return false }
         return item.isFolder && item.child != locations.last?.id
     }
     private var canShowParent: Bool {
@@ -1489,6 +1623,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             return true
         }
         showRoot(entry)
+        recordVisit(); controls()
         selectParent(route, in: entry.model)
         return true
     }
@@ -1497,20 +1632,40 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         enterFolder(route)
     }
     @objc private func folderUp() {
-        guard !busy, locations.count > 1 else { return }
+        guard locations.count > 1 else { return }
         changeFolder(Array(locations.dropLast()), select: locations.compactMap(\.item))
     }
     private func enterFolder(_ route: [DiskItem]) {
-        guard !busy, let model, let root = locations.first, route.last?.isFolder != false,
+        guard let model, let root = locations.first, route.last?.isFolder != false,
               (route.last?.child ?? 0) != locations.last?.id, let trail = trail(in: model, root: root.url, route: route) else { return }
         changeFolder(trail, select: route)
     }
     private func changeFolder(_ trail: [Location], select route: [DiskItem], expandSelection: Bool = true) {
-        guard !busy, let model, let here = trail.last else { return }
+        let workspace = scanWorkspace
+        guard canChangeFolder, let model, let root = trail.first, let here = trail.last else { return }
+        cancelTrashLayout()
         let aspect = map.aspect
-        let cached = here.id == 0 ? cache.read(here.url)?.listing : nil
+        let cached = workspace == nil && here.id == 0 ? cache.read(here.url)?.listing : nil
+        let navigationRequest = UUID()
+        if let workspace {
+            workspace.visit = NavigationVisit(model: model, root: root.url, folder: here.url, folderNumber: here.id,
+                viewport: MapRenderSettings.whole)
+            workspace.navigationRequest = navigationRequest
+            workspace.deferredFrame = nil
+            browsedDuringScan = true
+        }
         let apply = { (list: FolderListing) in
-            self.busy = false; self.applyingNavigation = true; self.locations = trail
+            if let workspace {
+                guard self.scanWorkspace === workspace, workspace.navigationRequest == navigationRequest else { return }
+                workspace.navigationRequest = nil
+                guard !self.cancelledScan, self.model === model else { return }
+                if list.folder == 0 && self.listing?.folder != 0 {
+                    workspace.rankRevision = 0
+                    workspace.indexedRankingStarted = false
+                    workspace.indexedRankingDisplayed = false
+                }
+            } else { self.busy = false }
+            self.applyingNavigation = true; self.locations = trail
             self.display(list)
             if expandSelection && route.last?.child == here.id { self.tree.expand(route) }
             self.tree.reveal(route)
@@ -1519,7 +1674,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         }
         if let cached, cached.model === model { apply(cached) }
         else {
-            busy = true; controls()
+            if workspace == nil { busy = true; controls() }
             DispatchQueue.global(qos: .userInitiated).async {
                 let list = FolderListing(model, folder: here.id, aspect: aspect)
                 DispatchQueue.main.async { apply(list) }
@@ -1590,6 +1745,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         }
         recordVisit()
         let previous = history.current
+        let selection = saveSelection(in: old)
         let expansions = tree.expandedURLs
         let mapAspect = map.aspect
         let focus = locations
@@ -1611,7 +1767,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                 let restored = locations
                 let list = FolderListing(updated, folder: restored.last!.id, aspect: mapAspect)
                 let opened = expansions.compactMap { updated.route(to: $0) }
-                let selected = previous?.liveKeys(in: updated) ?? []
+                let selected = selection.resolve(in: updated)
                 let elapsed = ProcessInfo.processInfo.systemUptime - start
                 DispatchQueue.main.async {
                     self.endScan(elapsed: scanElapsed)
@@ -1687,49 +1843,81 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         status.stringValue = "Moving selection to Trash…"; controls()
         DispatchQueue.global(qos: .userInitiated).async {
             let result = plan.perform(acknowledged: acknowledged)
-            if let geometry, result.moved > 0 {
-                let keys = plan.visibleMovedKeys(result, geometry: geometry, viewport: viewport, scope: scope)
-                if !keys.isEmpty {
-                    DispatchQueue.main.async {
-                        guard self.listing?.model === plan.model else { return }
-                        let radial = self.usingSunburst
-                        let regions = radial ? self.sunburst.trashRegions(for: keys) : self.map.trashRegions(for: keys)
-                        self.trashGlass.play(regions, from: radial ? self.sunburst : self.map)
-                    }
-                }
-            }
+            let movedKeys = geometry.map { plan.visibleMovedKeys(result, geometry: $0, viewport: viewport, scope: scope) } ?? []
             let surviving = Array(trail.prefix { location in
                 guard let item = location.item else { return true }
                 return plan.model.url(folder: item.folder, slot: item.slot, directory: true) != nil
             })
-            let fresh = result.moved > 0 ? FolderListing(plan.model, folder: surviving.last?.id ?? 0, aspect: request.aspect) : nil
-            let frame = fresh.flatMap { request.prepare($0, progress: ScanProgress(), afterTrash: true) }
-            DispatchQueue.main.async {
-                defer {
-                    self.movingToTrash = false
-                    if self.waitingToQuit {
-                        self.waitingToQuit = false
-                        NSApp.reply(toApplicationShouldTerminate: result.failed == 0)
-                    }
-                }
+            performOnMainRunLoop {
+                self.movingToTrash = false
                 self.busy = false
-                let message = "\(result.moved.formatted()) moved to Trash"
-                if let fresh {
-                    if let prior, prior.model === plan.model {
-                        self.cache.put(RecentScan(model: plan.model, listing: fresh.folder == 0 ? fresh : nil, root: prior.root,
+                if result.moved > 0 {
+                    if let prior, self.cache.read(prior.root) === prior {
+                        self.cache.put(RecentScan(model: plan.model, listing: nil, root: prior.root,
                             identity: prior.identity, watcher: prior.watcher, elapsed: prior.elapsed, startupSnapshot: prior.startupSnapshot), for: prior.root)
                     }
                     self.locations = surviving
-                    self.display(fresh, message: message, reloadTree: true, trashFrame: frame.map { (request, $0) })
-                    self.recordVisit(replace: true)
+                    let keys = Array(self.tree.selectedKeys()), lead = self.tree.leadKey
+                    self.applyingNavigation = true
+                    self.tree.show(plan.model, refresh: true)
+                    self.tree.selectSaved(keys, lead: lead, scroll: false)
+                    self.map.selection = self.tree.selectedKeys()
+                    self.sunburst.selection = self.map.selection
+                    self.applyingNavigation = false
+                    let message = "\(result.moved.formatted()) moved to Trash"
+                    self.status.stringValue = message
+                    self.prepareTrashLayout(plan.model, folder: surviving.last?.id ?? 0, request: request,
+                        movedKeys: movedKeys, message: message)
                 } else {
                     self.status.stringValue = "Selection stayed in place"
-                    self.controls()
+                }
+                self.controls()
+                if self.waitingToQuit {
+                    if result.failed == 0 { self.flushAndQuit() }
+                    else {
+                        self.waitingToQuit = false
+                        NSApp.reply(toApplicationShouldTerminate: false)
+                    }
                 }
                 if let detail = result.explanation {
                     let title = result.moved == 0 ? "Couldn’t move selection to Trash" : "\(result.moved.formatted()) moved · \(result.failed.formatted()) couldn’t be moved"
                     self.trashProblem(title: title, detail: detail, url: result.firstUnmovedURL)
                 }
+            }
+        }
+    }
+
+    private func cancelTrashLayout() {
+        if let work = trashLayoutWork { dt_cancel(work.handle); trashLayoutWork = nil }
+    }
+
+    private func prepareTrashLayout(_ model: ScanModel, folder: UInt32, request: ScanMapRequest,
+                                    movedKeys: Set<UInt64>, message: String) {
+        cancelTrashLayout()
+        let work = ScanProgress()
+        trashLayoutWork = work
+        let source = listing
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard !dt_is_cancelled(work.handle) else { return }
+            let fresh = FolderListing(model, folder: folder, aspect: request.aspect)
+            let frame = request.prepare(fresh, progress: work, afterTrash: true)
+            performOnMainRunLoop {
+                guard self.trashLayoutWork === work else { return }
+                self.trashLayoutWork = nil
+                guard self.listing === source, self.model === model, !self.waitingToQuit else {
+                    self.syncLive()
+                    return
+                }
+                let radial = self.usingSunburst
+                let regions = radial ? self.sunburst.trashRegions(for: movedKeys) : self.map.trashRegions(for: movedKeys)
+                if folder == 0, let root = self.locations.first?.url, let entry = self.cache.read(root), entry.model === model {
+                    self.cache.put(RecentScan(model: model, listing: fresh, root: root, identity: entry.identity, watcher: entry.watcher,
+                        elapsed: entry.elapsed, startupSnapshot: entry.startupSnapshot), for: root)
+                }
+                self.display(fresh, message: self.busy ? self.status.stringValue : message,
+                    trashFrame: frame.map { (request, $0) })
+                self.recordVisit(replace: true)
+                self.trashGlass.play(regions, from: radial ? self.sunburst : self.map)
             }
         }
     }

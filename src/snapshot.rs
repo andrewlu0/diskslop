@@ -50,6 +50,10 @@ fn checkpoint_header(r: &mut impl Read, journal: &[u8; 16], inode: u64) -> io::R
     Ok(cursor)
 }
 
+pub(super) fn checkpoint(path: &Path, root: &Path, journal: &[u8; 16]) -> io::Result<u64> {
+    checkpoint_header(&mut open_cache(path)?, journal, fs::metadata(root)?.ino())
+}
+
 pub(super) fn save(
     scan: &Inventory,
     path: &Path,

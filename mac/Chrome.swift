@@ -38,7 +38,7 @@ final class WindowToolbar: NSObject, NSToolbarDelegate {
                  willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
         let pair: (String, [String])
         switch id.rawValue {
-        case "history": pair = ("Selection History", ["back", "forward"])
+        case "history": pair = ("Folder History", ["back", "forward"])
         case "zoom": pair = ("Map Zoom", ["zoomOut", "zoomIn"])
         default: return makeItem(id)
         }

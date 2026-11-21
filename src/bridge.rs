@@ -130,6 +130,16 @@ unsafe extern "C" fn dt_snapshot_save(
 }
 
 #[unsafe(no_mangle)]
+unsafe extern "C" fn dt_snapshot_checkpoint(
+    file: *const c_char,
+    root: *const c_char,
+    journal: &[u8; 16],
+) -> u64 {
+    let path = |ptr| Path::new(OsStr::from_bytes(unsafe { CStr::from_ptr(ptr) }.to_bytes()));
+    snapshot::checkpoint(path(file), path(root), journal).unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
 unsafe extern "C" fn dt_snapshot_load(
     file: *const c_char,
     root: *const c_char,
@@ -143,6 +153,22 @@ unsafe extern "C" fn dt_snapshot_load(
     };
     *event = checkpoint;
     wrap(Ok(scan), ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn dt_subtree(
+    m: &Model,
+    folder: u32,
+    root: *const c_char,
+    p: &Progress,
+) -> *mut Model {
+    let path = Path::new(OsStr::from_bytes(
+        unsafe { CStr::from_ptr(root) }.to_bytes(),
+    ));
+    wrap(
+        m.scan.read().unwrap().subtree(path, folder, p),
+        ptr::null_mut(),
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -199,6 +225,10 @@ fn wrap_cached(
             let folder_bytes = |scan: &Inventory, id: usize| {
                 let f = &scan.folders[id];
                 std::mem::size_of::<Folder>()
+                    + f.shape
+                        .as_ref()
+                        .and_then(|s| s.slots.as_ref())
+                        .map_or(0, |slots| std::mem::size_of_val(slots.as_ref()))
                     + f.entries.capacity() * std::mem::size_of::<Entry>()
                     + f.names.capacity()
                     + f.dates

@@ -62,8 +62,8 @@ final class FileOutlineView: NSTableView, NSViewToolTipOwner {
     override func selectAll(_ sender: Any?) {
         if let selectScope { selectScope() } else { super.selectAll(sender) }
     }
-    var gestureEnded: (() -> Void)?
     private(set) var trackingSelection = false
+    private var pendingOpenRow: Int?
     override func menu(for event: NSEvent) -> NSMenu? {
         if event.modifierFlags.contains(.control) { return nil }
         let r = row(at: convert(event.locationInWindow, from: nil))
@@ -74,15 +74,16 @@ final class FileOutlineView: NSTableView, NSViewToolTipOwner {
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         let i = row(at: p)
-        guard i >= 0, event.clickCount == 1 else { super.mouseDown(with: event); return }
+        guard i >= 0, (1...2).contains(event.clickCount) else { super.mouseDown(with: event); return }
         if let cell = view(atColumn: 0, row: i, makeIfNecessary: false) as? OutlineCell,
            let toggle = cell.toggle, cell.disclosureFrame.contains(cell.convert(p, from: self)) {
-            toggle(event.modifierFlags.contains(.option))
+            if event.clickCount == 1 { toggle(event.modifierFlags.contains(.option)) }
             return
         }
         window?.makeFirstResponder(self)
         trackingSelection = true
-        selectGesture?(i, SelectionMode(event.modifierFlags))
+        pendingOpenRow = event.clickCount == 2 ? i : nil
+        if event.clickCount == 1 { selectGesture?(i, SelectionMode(event.modifierFlags)) }
     }
     override func mouseDragged(with event: NSEvent) {
         if !trackingSelection { super.mouseDragged(with: event) }
@@ -90,7 +91,11 @@ final class FileOutlineView: NSTableView, NSViewToolTipOwner {
     override func mouseUp(with event: NSEvent) {
         guard trackingSelection else { super.mouseUp(with: event); return }
         trackingSelection = false
-        gestureEnded?()
+        let target = pendingOpenRow
+        pendingOpenRow = nil
+        if let target, row(at: convert(event.locationInWindow, from: nil)) == target {
+            outline?.openFolderAtRow(target)
+        }
     }
     override func rightMouseDown(with event: NSEvent) {
         if event.modifierFlags.contains(.control) {
@@ -254,8 +259,14 @@ private final class OutlineCell: TableTextCell, FinderIconTarget {
             finderImage?.draw(in: CGRect(x: indent + 18, y: floor(bounds.midY - 8), width: 16, height: 16),
                 from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
         }
-        let text = CGRect(x: x, y: floor(bounds.midY - 8), width: max(0, bounds.width - x - 3), height: 17)
         let color: NSColor = backgroundStyle == .emphasized ? .alternateSelectedControlTextColor : .labelColor
+        drawValue(color, x: x)
+    }
+    override func drawChangeText(_ tint: NSColor, in overlay: NSView) {
+        drawValue(tint, x: 3)
+    }
+    private func drawValue(_ color: NSColor, x: CGFloat) {
+        let text = CGRect(x: x, y: floor(bounds.midY - 8), width: max(0, bounds.width - x - 3), height: 17)
         (value as NSString).draw(in: text, withAttributes: [.font: numeric ? TableTextCell.sizeFont : Self.font,
             .foregroundColor: color, .paragraphStyle: numeric ? Self.numberParagraph : Self.paragraph])
     }
@@ -313,7 +324,6 @@ final class Outline: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         view.allowsEmptySelection = true
         view.allowsColumnReordering = false
         view.delegate = self; view.dataSource = self
-        view.target = self; view.doubleAction = #selector(openClicked)
         view.setAccessibilityLabel("File tree, largest first")
         view.setAccessibilityRole(.outline)
         view.hoverRow = { [weak self] index in
@@ -472,8 +482,13 @@ final class Outline: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         return parent
     }
     func reveal(_ route: [DiskItem]) { select([route], mode: .replace) }
-    func expand(_ route: [DiskItem]) {
-        if let node = resolve(route), !isOpen(node) { setOpen(node, true) }
+    func expand(_ route: [DiskItem], scroll: Bool = false) {
+        guard let node = resolve(route) else { return }
+        if !isOpen(node) { setOpen(node, true) }
+        if scroll {
+            let row = rows.index(of: node)
+            if row >= 0 { view.scrollRowToVisible(row) }
+        }
     }
     func selectAll(in route: [DiskItem]) {
         applyingSelection = true
@@ -577,8 +592,8 @@ final class Outline: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             return row.item
         }
     }
-    @objc private func openClicked() {
-        guard let row = node(at: view.clickedRow), row.raw.isFolder else { return }
+    fileprivate func openFolderAtRow(_ index: Int) {
+        guard let row = node(at: index), row.raw.isFolder else { return }
         openFolder?(row.route)
     }
 

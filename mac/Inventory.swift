@@ -57,6 +57,11 @@ final class ScanModel: @unchecked Sendable {
         guard let new else { throw DiskError(message: takeError(error)) }
         return ScanModel(handle: new)
     }
+    func subtree(folder: UInt32, at url: URL, progress: ScanProgress) -> ScanModel? {
+        url.withUnsafeFileSystemRepresentation {
+            dt_subtree(handle, folder, $0, progress.handle).map { ScanModel(handle: $0) }
+        }
+    }
     func route(to url: URL) -> [DiskItem]? {
         guard let list = url.withUnsafeFileSystemRepresentation({ dt_route(handle, $0) }) else { return nil }
         return readRoute(list, from: 0)

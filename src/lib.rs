@@ -121,6 +121,45 @@ impl<T> SharedVec<T> {
     }
 }
 
+#[derive(Clone)]
+struct FolderShape {
+    slots: Option<Arc<[u32]>>,
+    directories: usize,
+    file_bytes: u64,
+}
+
+impl FolderShape {
+    fn read(entries: &[Entry]) -> Self {
+        let mut slots = Vec::new();
+        let mut links = Vec::new();
+        let mut file_bytes = 0;
+        for (slot, entry) in entries.iter().enumerate() {
+            if entry.kind == EntryKind::Directory {
+                slots.push(slot as u32);
+            } else if entry.flags & LINKED != 0 {
+                links.push(slot as u32);
+            } else {
+                file_bytes += entry.bytes;
+            }
+        }
+        let directories = slots.len();
+        slots.extend(links);
+        Self {
+            slots: (!slots.is_empty()).then(|| slots.into()),
+            directories,
+            file_bytes,
+        }
+    }
+
+    fn child_slots(&self) -> &[u32] {
+        &self.slots.as_deref().unwrap_or_default()[..self.directories]
+    }
+
+    fn link_slots(&self) -> &[u32] {
+        &self.slots.as_deref().unwrap_or_default()[self.directories..]
+    }
+}
+
 #[derive(Default, Clone)]
 struct Folder {
     parent: Option<Key>,
@@ -128,6 +167,7 @@ struct Folder {
     entries: SharedVec<Entry>,
     dates: Option<SharedVec<bulk::FileDates>>,
     names: SharedVec<u8>,
+    shape: Option<FolderShape>,
     inode: u64,
     total: u64,
     own_bytes: u64,
@@ -247,6 +287,7 @@ struct Build<'a> {
 
 struct Reuse<'a> {
     scan: &'a Inventory,
+    root: u32,
     relist: HashSet<u32>,
     descend: HashSet<u32>,
 }
@@ -255,7 +296,9 @@ impl Reuse<'_> {
         let old = &self.scan.folders[id as usize];
         let mut entries = old.entries.clone();
         let mut dates = old.dates.clone();
-        if entries.iter().any(|e| e.flags & REMOVED != 0) {
+        let shape = if let Some(shape) = &old.shape {
+            shape.clone()
+        } else {
             if let Some(values) = &mut dates {
                 *values = SharedVec::Building(
                     values
@@ -267,23 +310,23 @@ impl Reuse<'_> {
                 );
             }
             entries.retain(|e| e.flags & REMOVED == 0);
-        }
-        let mut leaf = true;
-        for slot in 0..entries.len() {
+            FolderShape::read(&entries)
+        };
+        for &slot in shape.link_slots() {
+            let slot = slot as usize;
             let e = &entries[slot];
-            leaf &= e.child == NONE;
-            if e.flags & LINKED != 0
-                && let Some(g) = self.scan.groups.get(&e.inode)
+            if let Some(g) = self.scan.groups.get(&e.inode)
                 && e.bytes != g.bytes
             {
                 entries[slot].bytes = g.bytes;
             }
         }
         Folder {
-            prior_leaf: leaf.then_some(id),
+            prior_leaf: (shape.directories == 0).then_some(id),
             entries,
             dates,
             names: old.names.clone(),
+            shape: Some(shape),
             inode: old.inode,
             total: old.own_bytes,
             own_bytes: old.own_bytes,
@@ -303,11 +346,10 @@ impl Reuse<'_> {
             let mut folder = self.copy_folder(old);
             folder.parent = dirs[id as usize].parent;
             count += folder.entries.len() as u64;
-            for slot in 0..folder.entries.len() {
+            let child_slots = folder.shape.as_ref().unwrap().clone();
+            for &slot in child_slots.child_slots() {
+                let slot = slot as usize;
                 let prior = folder.entries[slot].child;
-                if prior == NONE {
-                    continue;
-                }
                 let child = u32::try_from(dirs.len()).expect("Too many directories");
                 if prior != child {
                     folder.entries[slot].child = child;
@@ -521,6 +563,7 @@ impl Inventory {
     fn refreshed(&self, keys: &[Key], progress: &Progress) -> io::Result<Self> {
         let mut reuse = Reuse {
             scan: self,
+            root: 0,
             relist: HashSet::new(),
             descend: HashSet::new(),
         };
@@ -549,6 +592,7 @@ impl Inventory {
     ) -> io::Result<Cow<'_, Self>> {
         let mut reuse = Reuse {
             scan: self,
+            root: 0,
             relist: HashSet::new(),
             descend: HashSet::new(),
         };
@@ -563,6 +607,7 @@ impl Inventory {
                 }
             }
         }
+        let mut children = HashMap::new();
         for (raw, subtree) in
             [(shallow, false), (recursive, true)]
                 .into_iter()
@@ -573,6 +618,7 @@ impl Inventory {
                         .map(move |p| (p, subtree))
                 })
         {
+            progress.check()?;
             let path = Path::new(OsStr::from_bytes(raw));
             let Ok(relative) = path.strip_prefix(&self.root) else {
                 return Self::build(&self.root, default_threads(), progress, true).map(Cow::Owned);
@@ -583,15 +629,17 @@ impl Inventory {
                 return Self::build(&self.root, default_threads(), progress, true).map(Cow::Owned);
             }
             while let Some(part) = parts.next() {
-                let f = &self.folders[dir as usize];
-                if let Some((_, e)) = f.named_entry(part.as_bytes())
-                    && e.kind == EntryKind::Directory
-                {
+                let child = children.entry((dir, part.as_bytes())).or_insert_with(|| {
+                    self.folders[dir as usize]
+                        .named_entry(part.as_bytes())
+                        .and_then(|(_, e)| (e.kind == EntryKind::Directory).then_some(e.child))
+                });
+                if let Some(child) = *child {
                     if parts.peek().is_some() || !subtree {
-                        dir = e.child;
+                        dir = child;
                         continue;
                     }
-                    reuse.descend.insert(e.child);
+                    reuse.descend.insert(child);
                 }
                 break;
             }
@@ -612,6 +660,25 @@ impl Inventory {
             .map(Cow::Owned)
     }
 
+    fn subtree(&self, path: &Path, id: u32, progress: &Progress) -> io::Result<Self> {
+        let folder = self
+            .folders
+            .get(id as usize)
+            .ok_or_else(|| io::Error::other("Unknown folder"))?;
+        if self.provisional || !self.live_folder(id) || folder.issues != 0 {
+            return Err(io::Error::other("This folder needs a new scan."));
+        }
+        let path = fs::canonicalize(path)?;
+        bulk::open_dir(&path, self.device, folder.inode)?;
+        let reuse = Reuse {
+            scan: self,
+            root: id,
+            relist: HashSet::new(),
+            descend: HashSet::new(),
+        };
+        Self::build_reusing(&path, default_threads(), progress, true, Some(reuse))
+    }
+
     fn patch_directories(
         &self,
         changed: &HashSet<u32>,
@@ -621,7 +688,7 @@ impl Inventory {
         for &id in changed {
             progress.check()?;
             let old = &self.folders[id as usize];
-            if old.entries.iter().any(|e| e.flags & REMOVED != 0) {
+            if old.shape.is_none() {
                 return Ok(None);
             }
             let path = old
@@ -729,6 +796,7 @@ impl Inventory {
             };
             let bytes = i128::from(direct_bytes(&fresh)) - i128::from(direct_bytes(old));
             let count = fresh.entries.len() as i128 - old.entries.len() as i128;
+            fresh.shape = Some(FolderShape::read(&fresh.entries));
             fresh.freeze();
             updates.push((id, fresh, bytes, count));
         }
@@ -759,6 +827,7 @@ impl Inventory {
             f.entries = fresh.entries;
             f.dates = fresh.dates;
             f.names = fresh.names;
+            f.shape = fresh.shape;
             f.own_bytes = fresh.own_bytes;
             reorder.insert(id);
             let mut current = id;
@@ -797,9 +866,10 @@ impl Inventory {
                 "Choose a directory.",
             ));
         }
-        let reuse =
-            reuse.filter(|r| (r.scan.device, r.scan.folders[0].inode) == (meta.dev(), meta.ino()));
-        let root_prior = if reuse.is_some() { 0 } else { NONE };
+        let reuse = reuse.filter(|r| {
+            (r.scan.device, r.scan.folders[r.root as usize].inode) == (meta.dev(), meta.ino())
+        });
+        let root_prior = reuse.as_ref().map_or(NONE, |r| r.root);
         let mut dirty_branches = HashSet::new();
         if let Some(r) = &reuse {
             for &id in r.relist.iter().chain(&r.descend) {
@@ -878,6 +948,7 @@ impl Inventory {
                         let e = &mut f.entries[slot];
                         e.flags |= LINKED;
                         e.bytes = bytes;
+                        f.shape = None;
                     }
                 }
             }
@@ -929,33 +1000,40 @@ impl Inventory {
             self.boundaries += f.boundaries;
             f.count = f.entries.len() as u64;
             f.contains_mount = f.boundaries != 0;
-            for slot in 0..f.entries.len() {
+            let shape = f
+                .shape
+                .take()
+                .unwrap_or_else(|| FolderShape::read(&f.entries));
+            f.files = (f.entries.len() - shape.directories) as u64;
+            f.total = f.own_bytes + shape.file_bytes;
+            stack.extend(
+                shape
+                    .child_slots()
+                    .iter()
+                    .map(|&slot| (f.entries[slot as usize].child as usize, false)),
+            );
+            for &slot in shape.link_slots() {
+                let slot = slot as usize;
                 let e = &f.entries[slot];
-                if e.kind == EntryKind::Directory {
-                    stack.push((e.child as usize, false));
-                    continue;
+                let key = Key {
+                    folder: dir as u32,
+                    slot: slot as u32,
+                };
+                let group = Arc::get_mut(&mut self.groups)
+                    .unwrap()
+                    .entry(e.inode)
+                    .or_insert_with(|| LinkGroup {
+                        bytes: e.bytes,
+                        owner: key,
+                        members: Vec::new(),
+                    });
+                group.members.push(key);
+                if group.owner != key && e.bytes != 0 {
+                    f.entries[slot].bytes = 0;
                 }
-                if e.flags & LINKED != 0 {
-                    let key = Key {
-                        folder: dir as u32,
-                        slot: slot as u32,
-                    };
-                    let group = Arc::get_mut(&mut self.groups)
-                        .unwrap()
-                        .entry(e.inode)
-                        .or_insert_with(|| LinkGroup {
-                            bytes: e.bytes,
-                            owner: key,
-                            members: Vec::new(),
-                        });
-                    group.members.push(key);
-                    if group.owner != key && e.bytes != 0 {
-                        f.entries[slot].bytes = 0;
-                    }
-                }
-                f.files += 1;
                 f.total += f.entries[slot].bytes;
             }
+            f.shape = Some(shape);
         }
         Arc::get_mut(&mut self.groups)
             .unwrap()
@@ -1123,6 +1201,7 @@ impl Inventory {
             )
         };
         self.folders[key.folder as usize].entries[key.slot as usize].flags |= REMOVED;
+        self.folders[key.folder as usize].shape = None;
         self.adjust(key.folder, bytes, count, files, false);
         for inode in displaced {
             let g = &self.groups[&inode];
@@ -1231,5 +1310,85 @@ impl Target {
             }
             Err(io::Error::other(message))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topology_refresh_preserves_shared_entries_and_hard_links() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = fs::canonicalize(root.path())?;
+        for name in ["kept", "removed", "linked"] {
+            fs::create_dir(path.join(name))?;
+        }
+        fs::write(path.join("kept/file"), vec![1; 8192])?;
+        fs::write(path.join("removed/file"), vec![2; 8192])?;
+        fs::hard_link(path.join("removed/file"), path.join("linked/file"))?;
+        let before = Inventory::build(&path, 2, &Progress::default(), true)?;
+        let child = |scan: &Inventory, name: &[u8]| {
+            scan.folders[0].named_entry(name).unwrap().1.child as usize
+        };
+        let kept = child(&before, b"kept");
+
+        fs::remove_dir_all(path.join("removed"))?;
+        fs::create_dir_all(path.join("added/nested"))?;
+        fs::write(path.join("added/nested/file"), vec![3; 8192])?;
+
+        let paths = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        let updated =
+            before.refresh_changes(paths.as_bytes_with_nul(), &[], false, &Progress::default())?;
+        let fresh = Inventory::build(&path, 2, &Progress::default(), true)?;
+        assert_eq!(
+            (updated.total(), updated.count()),
+            (fresh.total(), fresh.count())
+        );
+        assert_eq!(updated.groups.len(), 0);
+        assert_eq!(
+            updated.folders[child(&updated, b"linked")].total,
+            fresh.folders[child(&fresh, b"linked")].total
+        );
+        assert_eq!(
+            updated.folders[child(&updated, b"kept")].entries.as_ptr(),
+            before.folders[kept].entries.as_ptr()
+        );
+
+        let index_dir = tempfile::tempdir()?;
+        let index = index_dir.path().join("scan.index");
+        snapshot::save(&updated, &index, &[0; 16], 1, 0, &Progress::default())?;
+        assert_eq!(snapshot::checkpoint(&index, &path, &[0; 16])?, 1);
+        let (restored, checkpoint) = snapshot::load(&index, &path, &[0; 16], &Progress::default())?;
+        assert_eq!(
+            (restored.total(), restored.count(), checkpoint),
+            (fresh.total(), fresh.count(), 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cached_subtree_reassigns_link_ownership_to_its_new_scope() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = fs::canonicalize(root.path())?;
+        let child = path.join("nested");
+        fs::create_dir(&child)?;
+        let outer = path.join("outer");
+        fs::write(&outer, vec![1; 8192])?;
+        fs::hard_link(&outer, child.join("inner"))?;
+        let parent = Inventory::build(&path, 2, &Progress::default(), true)?;
+        let folder = parent.folders[0].named_entry(b"nested").unwrap().1.child;
+        let projected = parent.subtree(&child, folder, &Progress::default())?;
+        let fresh = Inventory::build(&child, 2, &Progress::default(), true)?;
+        assert_eq!(parent.folders[folder as usize].entries[0].bytes, 0);
+        assert_eq!(
+            projected.folders[0].entries[0].bytes,
+            fresh.folders[0].entries[0].bytes
+        );
+        assert_eq!(
+            (projected.total(), projected.count()),
+            (fresh.total(), fresh.count())
+        );
+        Ok(())
     }
 }

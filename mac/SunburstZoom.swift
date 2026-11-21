@@ -73,6 +73,11 @@ final class ChartRenderer {
         float4 box = mix(p.from, p.to, mode.x);
         float2 edge = float2(float(corner / 2) / mode.y, float(corner % 2));
         float2 xy = mix(box.xy, box.zw, edge), uv = mix(p.to.xy, p.to.zw, edge);
+        if (mode.w > 0) {
+            float2 shift = (p.from.xy - p.to.xy) * (1 - mode.x);
+            xy = clamp(uv + shift, p.to.xy, p.to.zw);
+            uv = xy - shift;
+        }
         if (mode.z > 0) { xy = polar(xy.x, xy.y); uv = polar(uv.x, uv.y); }
         return {float4(2 * xy.x - 1, 1 - 2 * xy.y, 0, 1), uv};
     }

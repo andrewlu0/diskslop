@@ -1,6 +1,14 @@
 import AppKit
 import CoreServices
 
+func performOnMainRunLoop(_ action: @escaping () -> Void) {
+    // AppKit runs the modal loop while waiting for a deferred termination reply.
+    let loop = CFRunLoopGetMain()
+    let modes = [RunLoop.Mode.default.rawValue, RunLoop.Mode.modalPanel.rawValue]
+    CFRunLoopPerformBlock(loop, modes as CFArray, action)
+    CFRunLoopWakeUp(loop)
+}
+
 extension StartupSnapshot {
     init(_ base: Self, through event: FSEventStreamEventId) {
         root = base.root; identity = base.identity; file = base.file; journal = base.journal
@@ -8,71 +16,85 @@ extension StartupSnapshot {
     }
 }
 
-/// Publishes the newest committed inventory on a bounded cadence without retaining an evicted scan.
 final class LiveCheckpointWriter {
     private struct Candidate {
         weak var model: ScanModel?
         let snapshot: StartupSnapshot
-    }
-    private let queue = DispatchQueue(label: "local.diskslop.live-checkpoints", qos: .utility)
-    private let ordinaryInterval: TimeInterval, busyInterval: TimeInterval
-    private var candidate: Candidate?, work: ScanProgress?, timer: DispatchWorkItem?
-    private var notices = 0
-    private var firstChange: TimeInterval = 0, scheduled: TimeInterval = 0, earliest: TimeInterval = 0
+        let began: TimeInterval
+        let notices: Int
+        var notBefore: TimeInterval = 0
 
-    init(ordinaryInterval: TimeInterval = 900, busyInterval: TimeInterval = 120) {
-        self.ordinaryInterval = ordinaryInterval; self.busyInterval = busyInterval
+        var due: TimeInterval { max(notBefore, began + (notices >= 512 ? 120 : 900)) }
     }
 
-    func consider(_ scan: RecentScan, notices newNotices: Int) {
-        guard let snapshot = scan.startupSnapshot, newNotices > 0 || candidate != nil else { return }
-        if candidate == nil { firstChange = CACurrentMediaTime() }
-        candidate = Candidate(model: scan.model, snapshot: snapshot)
-        notices = min(512, notices + newNotices)
+    private let queue = DispatchQueue(label: "local.diskslop.scan-checkpoints", qos: .utility)
+    private var pending: [URL: Candidate] = [:]
+    private var timer: DispatchWorkItem?
+    private var flushing = false
+
+    func consider(_ scan: RecentScan, notices: Int) {
+        guard let snapshot = scan.startupSnapshot else { return }
+        let old = pending[snapshot.file]
+        guard notices > 0 || old != nil else { return }
+        pending[snapshot.file] = Candidate(model: scan.model, snapshot: snapshot,
+            began: old?.began ?? CACurrentMediaTime(), notices: min(512, (old?.notices ?? 0) + notices),
+            notBefore: old?.notBefore ?? 0)
         schedule()
     }
 
-    func cancel() {
+    func save(_ model: ScanModel, to snapshot: StartupSnapshot, replacingInode: UInt64 = 0) {
+        if let old = pending[snapshot.file], old.snapshot.checkpoint <= snapshot.checkpoint {
+            pending.removeValue(forKey: snapshot.file)
+            schedule()
+        }
+        queue.async { snapshot.save(model, progress: ScanProgress(), replacingInode: replacingInode) }
+    }
+
+    func flush(_ completion: @escaping () -> Void) {
+        flushing = true
         timer?.cancel(); timer = nil
-        candidate = nil; notices = 0
-        if let work { dt_cancel(work.handle) }
+        let candidates = Array(pending.values)
+        pending.removeAll()
+        for candidate in candidates {
+            if let model = candidate.model { save(model, to: candidate.snapshot) }
+        }
+        queue.async {
+            FileKindCatalog.shared.flush()
+            performOnMainRunLoop(completion)
+        }
     }
 
     private func schedule() {
-        guard candidate != nil, work == nil else { return }
-        let deadline = max(earliest, firstChange + (notices >= 512 ? busyInterval : ordinaryInterval))
-        if timer != nil && scheduled <= deadline { return }
-        timer?.cancel()
-        let task = DispatchWorkItem { [weak self] in self?.write() }
-        timer = task; scheduled = deadline
-        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, deadline - CACurrentMediaTime()), execute: task)
+        timer?.cancel(); timer = nil
+        pending = pending.filter { $0.value.model != nil }
+        guard let due = pending.values.map(\.due).min() else { return }
+        let task = DispatchWorkItem { [weak self] in self?.writeDue() }
+        timer = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, due - CACurrentMediaTime()), execute: task)
     }
 
-    private func write() {
+    private func writeDue() {
         timer = nil
-        guard let pending = candidate, let model = pending.model else { candidate = nil; notices = 0; return }
-        let weight = notices, progress = ScanProgress(), start = CACurrentMediaTime()
-        candidate = nil; notices = 0; work = progress
-        let minimum = busyInterval, regular = ordinaryInterval
-        queue.async {
-            let file = pending.snapshot.file
-            let info = try? file.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey, .volumeAvailableCapacityKey])
-            let age = info?.contentModificationDate.map { max(0, -$0.timeIntervalSinceNow) } ?? minimum
-            var delay = max(0, minimum - age)
-            if let size = info?.fileSize, let free = info?.volumeAvailableCapacity, free - free / 5 < size { delay = regular }
-            if delay == 0, !dt_is_cancelled(progress.handle), !pending.snapshot.save(model, progress: progress) { delay = regular }
-            let elapsed = CACurrentMediaTime() - start, retryAfter = delay
-            DispatchQueue.main.async {
-                self.work = nil
-                if !dt_is_cancelled(progress.handle) {
-                    self.earliest = CACurrentMediaTime() + (retryAfter > 0 ? retryAfter : max(minimum, elapsed * 100))
-                    if retryAfter > 0, self.candidate == nil {
-                        self.candidate = pending; self.firstChange = start - regular; self.notices = weight
-                    }
+        let now = CACurrentMediaTime()
+        let ready = pending.filter { $0.value.due <= now }
+        for (file, candidate) in ready {
+            pending.removeValue(forKey: file)
+            guard let model = candidate.model else { continue }
+            queue.async {
+                let space = try? file.resourceValues(forKeys: [.fileSizeKey, .volumeAvailableCapacityKey])
+                let free = space?.volumeAvailableCapacity ?? Int.max
+                let size = space?.fileSize ?? 0
+                if free - free / 5 >= size, candidate.snapshot.save(model, progress: ScanProgress()) { return }
+                DispatchQueue.main.async {
+                    guard !self.flushing, self.pending[file] == nil else { return }
+                    var retry = candidate
+                    retry.notBefore = CACurrentMediaTime() + 900
+                    self.pending[file] = retry
+                    self.schedule()
                 }
-                self.schedule()
             }
         }
+        schedule()
     }
 }
 

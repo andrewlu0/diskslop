@@ -406,6 +406,12 @@ impl Scene {
         }))
     }
 
+    fn identity(&self, key: Key) -> (u64, u64, &[u8]) {
+        let folder = &self.folders[key.folder as usize];
+        let slot = key.slot as usize;
+        (folder.inode, folder.entries[slot].inode, folder.name(slot))
+    }
+
     fn bounds(&self, mut key: Key) -> Option<Rect> {
         let mut path = vec![key];
         while key.folder != self.root {
@@ -651,6 +657,7 @@ extern "C" fn dt_map_memory(s: &Scene) -> usize {
 struct ReflowTile {
     from: [f32; 4],
     to: [f32; 4],
+    gap: [f32; 4],
 }
 
 // A screen-space partition bounds the work even when the inventory contains millions of files.
@@ -664,9 +671,12 @@ unsafe extern "C" fn dt_map_reflow(
     out: *mut ReflowTile,
     capacity: usize,
 ) -> usize {
-    if previous.root != next.root
-        || width == 0
-        || height == 0
+    let (w, h) = (width as usize, height as usize);
+    if previous.folders[previous.root as usize].inode != next.folders[next.root as usize].inode
+        || w == 0
+        || h == 0
+        || w > 192
+        || h > 192
         || port.w <= 0.0
         || port.h <= 0.0
         || capacity == 0
@@ -674,35 +684,78 @@ unsafe extern "C" fn dt_map_reflow(
     {
         return 0;
     }
-    let (w, h) = (f64::from(width), f64::from(height));
     let project = |r: Rect| {
-        let x = |v: f64| (((v - port.x) * w / port.w).round().clamp(0.0, w) / w) as f32;
-        let y = |v: f64| (((v - port.y) * h / port.h).round().clamp(0.0, h) / h) as f32;
+        let x = |v: f64| {
+            ((v - port.x) * w as f64 / port.w)
+                .round()
+                .clamp(0.0, w as f64) as usize
+        };
+        let y = |v: f64| {
+            ((v - port.y) * h as f64 / port.h)
+                .round()
+                .clamp(0.0, h as f64) as usize
+        };
         [x(r.x), y(r.y), x(r.x + r.w), y(r.y + r.h)]
     };
-    let mut count = 0;
-    let mut moved = false;
-    next.walk(
-        |r| {
-            let b = project(r);
-            b[2] > b[0] && b[3] > b[1]
-        },
-        |r| r.w * r.h * w * h > port.w * port.h,
-        |key, rect, _| {
-            let to = project(rect);
-            let from = previous.bounds(key).map(project).unwrap_or_else(|| {
-                let (x, y) = ((to[0] + to[2]) * 0.5, (to[1] + to[3]) * 0.5);
-                [x, y, x, y]
-            });
-            moved |= from != to;
-            unsafe {
-                out.add(count).write(ReflowTile { from, to });
+    let visible = |rect| {
+        let [x, y, right, bottom] = project(rect);
+        right > x && bottom > y
+    };
+    let descend = |r: Rect| r.w * r.h * (w * h) as f64 > port.w * port.h;
+    let normalize = |[x, y, right, bottom]: [usize; 4]| {
+        [
+            x as f32 / w as f32,
+            y as f32 / h as f32,
+            right as f32 / w as f32,
+            bottom as f32 / h as f32,
+        ]
+    };
+    let mut prior = HashMap::new();
+    previous.walk(visible, descend, |key, rect, _| {
+        prior.insert(previous.identity(key), project(rect));
+        false
+    });
+    let mut tiles = Vec::with_capacity(prior.len());
+    next.walk(visible, descend, |key, rect, _| {
+        let to = project(rect);
+        tiles.push((prior.remove(&next.identity(key)).unwrap_or(to), to));
+        false
+    });
+    if prior.is_empty() || tiles.len() > capacity {
+        return 0;
+    }
+    let mut vacant = vec![false; w * h];
+    for [x, y, right, bottom] in prior.into_values() {
+        for row in y..bottom {
+            vacant[row * w + x..row * w + right].fill(true);
+        }
+    }
+    let mut changed = false;
+    for (i, &(from, to)) in tiles.iter().enumerate() {
+        let [x, y, right, bottom] = to;
+        let mut gap = [right, bottom, x, y];
+        for row in y..bottom {
+            for col in x..right {
+                if vacant[row * w + col] {
+                    gap = [
+                        gap[0].min(col),
+                        gap[1].min(row),
+                        gap[2].max(col + 1),
+                        gap[3].max(row + 1),
+                    ];
+                }
             }
-            count += 1;
-            count == capacity
-        },
-    );
-    if moved { count } else { 0 }
+        }
+        changed |= gap[0] < gap[2];
+        unsafe {
+            out.add(i).write(ReflowTile {
+                from: normalize(from),
+                to: normalize(to),
+                gap: normalize(gap),
+            });
+        }
+    }
+    if changed { tiles.len() } else { 0 }
 }
 
 #[unsafe(no_mangle)]

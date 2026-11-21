@@ -168,43 +168,84 @@ final class NativeTableSurface: NSView {
     }
 }
 
+private final class NumberFlash: NSView, CAAnimationDelegate {
+    private var tint = NSColor.clear
+    private var revision = 0
+    override var isFlipped: Bool { superview?.isFlipped ?? false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func show(_ color: NSColor) {
+        tint = color
+        isHidden = false
+        needsDisplay = true
+        revision &+= 1
+        let fade = CAKeyframeAnimation(keyPath: "opacity")
+        fade.values = [1, 1, 0]
+        fade.keyTimes = [0, 0.1, 1]
+        fade.timingFunctions = [CAMediaTimingFunction(name: .linear), CAMediaTimingFunction(name: .easeInEaseOut)]
+        fade.duration = 1.2
+        fade.preferredFrameRateRange = chartFrameRate(displayRefreshRate)
+        fade.fillMode = .forwards
+        fade.isRemovedOnCompletion = false
+        fade.setValue(revision, forKey: "revision")
+        fade.delegate = self
+        layer?.add(fade, forKey: "liveChange")
+    }
+
+    func animationDidStop(_ animation: CAAnimation, finished: Bool) {
+        guard finished, animation.value(forKey: "revision") as? Int == revision else { return }
+        isHidden = true
+        layer?.removeAnimation(forKey: "liveChange")
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        tint.withAlphaComponent(0.26).setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 0, dy: 2), xRadius: 4, yRadius: 4).fill()
+        (superview as? TableTextCell)?.drawChangeText(tint, in: self)
+    }
+}
+
 class TableTextCell: NSTableCellView {
-    private var pulse: CALayer?
+    private var flash: NumberFlash?
     override func prepareForReuse() {
         super.prepareForReuse()
-        pulse?.removeFromSuperlayer(); pulse = nil
+        flash?.layer?.removeAnimation(forKey: "liveChange")
+        flash?.removeFromSuperview()
+        flash = nil
     }
 
     func highlightChange(from previous: UInt64?, to current: UInt64) {
         guard previous != current, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
-        wantsLayer = true
-        guard let layer else { return }
-        let tint: NSColor
-        if let previous { tint = current > previous ? .systemGreen : .systemOrange }
-        else { tint = .controlAccentColor }
-        pulse?.removeFromSuperlayer()
-        let glow = CALayer()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        glow.frame = layer.bounds.insetBy(dx: 0, dy: 2)
-        glow.cornerRadius = 4
-        glow.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-        effectiveAppearance.performAsCurrentDrawingAppearance { glow.backgroundColor = tint.cgColor }
-        glow.opacity = 0
-        layer.insertSublayer(glow, at: 0)
-        pulse = glow
-        CATransaction.commit()
-        let fade = CABasicAnimation(keyPath: "opacity")
-        fade.preferredFrameRateRange = chartFrameRate(displayRefreshRate)
-        fade.fromValue = 0.26; fade.toValue = 0; fade.duration = 0.48
-        fade.timingFunction = ChartMotion.timingFunction
-        glow.add(fade, forKey: "liveChange")
-        DispatchQueue.main.asyncAfter(deadline: .now() + fade.duration) { [weak self, weak glow] in
-            guard let self, let glow, self.pulse === glow else { return }
-            glow.removeFromSuperlayer()
-            self.pulse = nil
+        let overlay: NumberFlash
+        if let flash { overlay = flash }
+        else {
+            overlay = NumberFlash(frame: bounds)
+            overlay.wantsLayer = true
+            overlay.autoresizingMask = [.width, .height]
+            overlay.setAccessibilityElement(false)
+            addSubview(overlay)
+            flash = overlay
         }
+        let tint: NSColor
+        if let previous { tint = current > previous ? .systemGreen : .systemRed }
+        else { tint = .controlAccentColor }
+        overlay.show(tint)
     }
+
+    func drawChangeText(_ tint: NSColor, in overlay: NSView) {
+        guard let field = textField, let ink = field.cell?.copy() as? NSTextFieldCell,
+              let context = NSGraphicsContext.current?.cgContext else { return }
+        ink.backgroundStyle = .normal
+        ink.textColor = tint
+        let rect = overlay.convert(field.bounds, from: field)
+        let flipped = overlay.isFlipped != field.isFlipped
+        context.saveGState()
+        context.translateBy(x: rect.minX, y: flipped ? rect.maxY : rect.minY)
+        if flipped { context.scaleBy(x: 1, y: -1) }
+        ink.drawInterior(withFrame: field.bounds, in: field)
+        context.restoreGState()
+    }
+
     static let sizeFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
     static let sizeColumnMinimum: CGFloat = {
         // Reserve the widest localized unit and precision before the first row is displayed.

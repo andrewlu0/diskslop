@@ -127,7 +127,13 @@ private final class RingArtwork {
         NSGraphicsContext.restoreGraphicsState()
         guard !cancelled(), let image = context.makeImage() else { return nil }
         self.image = image; self.style = style
-        texture = side <= 2048 ? ChartRenderer.shared?.texture(from: context) : nil
+        if side <= 2048 {
+            texture = ChartRenderer.shared?.texture(from: context)
+        } else {
+            texture = ChartRenderer.shared?.snapshot(width: 2048, height: 2048) { bitmap in
+                bitmap.draw(image, in: CGRect(x: 0, y: 0, width: 2048, height: 2048))
+            }
+        }
     }
 }
 
@@ -216,6 +222,44 @@ struct Rings {
         let stops = self.stops.indices.map { previous.stops[min($0, previous.stops.count - 1)] }
         return changed ? Self(bands: bands, stops: stops) : nil
     }
+    func reflowPatches(from previous: Self, hubRatio: Float, fillingGaps: Bool) -> [ChartPatch] {
+        func radiusAt(_ stop: CGFloat) -> Float { hubRatio + (1 - hubRatio) * Float(stop) }
+        var patches = [ChartPatch]()
+        for (level, band) in bands.enumerated() {
+            let oldBand = level < previous.bands.count ? previous.bands[level] : []
+            let old = Dictionary(oldBand.map { ($0.identity, $0) }, uniquingKeysWith: { first, _ in first })
+            let surviving = fillingGaps ? Set(band.map(\.identity)) : []
+            let gaps = fillingGaps ? oldBand.filter { !surviving.contains($0.identity) } : []
+            var firstGap = 0
+            let inside = radiusAt(stops[level]), outside = radiusAt(stops[level + 1])
+            let oldInside = radiusAt(previous.stops[min(level, previous.stops.count - 1)])
+            let oldOutside = radiusAt(previous.stops[min(level + 1, previous.stops.count - 1)])
+            var cursor: Float = 0
+            for sector in band {
+                let to = SIMD4(Float(sector.start), inside, Float(sector.end), outside)
+                let prior = old[sector.identity]
+                if fillingGaps {
+                    while firstGap < gaps.count && gaps[firstGap].end <= sector.start { firstGap += 1 }
+                    var gapStart = sector.end, gapEnd = sector.start, i = firstGap
+                    while i < gaps.count && gaps[i].start < sector.end {
+                        gapStart = min(gapStart, max(sector.start, gaps[i].start))
+                        gapEnd = max(gapEnd, min(sector.end, gaps[i].end))
+                        i += 1
+                    }
+                    let gap = SIMD4(Float(gapStart), inside, Float(gapEnd), outside)
+                    let source = prior.map { SIMD4(Float($0.start), inside, Float($0.end), outside) } ?? to
+                    patches.append(.filling(gap, from: source, to: to, radial: true))
+                    continue
+                }
+                let from = SIMD4(prior.map { Float($0.start) } ?? cursor, oldInside,
+                    prior.map { Float($0.end) } ?? cursor, oldOutside)
+                cursor = from.z
+                patches.append(ChartPatch(from: from, to: to))
+            }
+        }
+        return patches
+    }
+
     func interpolated(from old: Self, fraction: CGFloat) -> Self {
         let stops = zip(old.stops, self.stops).map { $0 + ($1 - $0) * fraction }
         let bands = zip(old.bands, self.bands).map { from, to in
@@ -300,6 +344,7 @@ private struct RingFrame {
 final class Sunburst: NSView {
     var choose: (([[DiskItem]], SelectionMode) -> Void)?
     var menuForRoute: (([DiskItem]) -> NSMenu?)?
+    var artworkReady: ((CGImage?, MapColorMode) -> Void)?
     var enter: (([DiskItem]) -> Void)?
     var up: (() -> Void)?
     var hovered: ((URL?, UInt32?) -> Void)?
@@ -327,7 +372,13 @@ final class Sunburst: NSView {
         focusColors = colors
         overlay.needsDisplay = true
     }
-    var selection = Set<UInt64>() { didSet { if oldValue != selection { overlay.needsDisplay = true } } }
+    var selection = Set<UInt64>() {
+        didSet {
+            guard oldValue != selection else { return }
+            endTrashReflow()
+            overlay.needsDisplay = true
+        }
+    }
     var scopeKeys = Set<UInt64>() { didSet { if oldValue != scopeKeys { overlay.needsDisplay = true } } }
     func containsWedge(for key: UInt64) -> Bool { rings?.bands.contains { $0.contains { $0.item.key == key } } == true }
     private var list: FolderListing?, colors: MapBreakdown?, rings: Rings?
@@ -425,6 +476,7 @@ final class Sunburst: NSView {
         departure = nil
         rings = result; ringList = list; ringColors = colors
         needsDisplay = true; overlay.needsDisplay = true
+        artworkReady?(result.artwork?.image, colors?.mode ?? .kind)
         guard let trip, trip.target === list else { if !staying { endZoom() }; return }
         guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { endZoom(); return }
         if let zoomView, (list.folder == zoomView.parentID || list.folder == zoomView.childID),
@@ -467,7 +519,7 @@ final class Sunburst: NSView {
             if departure?.target !== next || next == nil {
                 departure = nil; endZoom()
                 let sameRoot = next != nil && ringList?.model === next?.model && ringList?.folder == next?.folder
-                if !keepingLayout && !sameRoot { rings = nil; ringList = nil; ringColors = nil; discardTrashBacking() }
+                if !keepingLayout && !sameRoot { rings = nil; ringList = nil; ringColors = nil }
             }
             hoverKey = nil; toolTip = nil; needsDisplay = true; overlay.needsDisplay = true
         }
@@ -477,32 +529,15 @@ final class Sunburst: NSView {
         guard let view = trashTransition else { return }
         view.cancel(); trashTransition = nil; needsDisplay = true; overlay.needsDisplay = true
     }
-    private func animateReflow(from previous: Rings, to layout: Rings, duration: CFTimeInterval) -> Bool {
+    private func animateReflow(from previous: Rings, to layout: Rings, duration: CFTimeInterval, fillingGaps: Bool = false) -> Bool {
         guard !layout.bands.isEmpty, let zoomRenderer, window?.isVisible == true else { return false }
         let hubRatio = Float(hub / radius)
-        func radiusAt(_ stop: CGFloat) -> Float { hubRatio + (1 - hubRatio) * Float(stop) }
-        var patches = [ChartPatch]()
-        for (level, band) in layout.bands.enumerated() {
-            let oldBand = level < previous.bands.count ? previous.bands[level] : []
-            let old = Dictionary(uniqueKeysWithValues: oldBand.map { ($0.item.key, $0) })
-            let inside = radiusAt(layout.stops[level]), outside = radiusAt(layout.stops[level + 1])
-            let oldInside = radiusAt(previous.stops[min(level, previous.stops.count - 1)])
-            let oldOutside = radiusAt(previous.stops[min(level + 1, previous.stops.count - 1)])
-            var cursor: Float = 0
-            for sector in band {
-                let to = SIMD4(Float(sector.start), inside, Float(sector.end), outside)
-                let prior = old[sector.item.key]
-                let from = SIMD4(prior.map { Float($0.start) } ?? cursor, oldInside,
-                    prior.map { Float($0.end) } ?? cursor, oldOutside)
-                cursor = from.z
-                patches.append(ChartPatch(from: from, to: to))
-            }
-        }
+        var patches = layout.reflowPatches(from: previous, hubRatio: hubRatio, fillingGaps: fillingGaps)
         guard patches.contains(where: { $0.from != $0.to }) else { return true }
         let hubBox = SIMD4<Float>(0, 0, 1, hubRatio)
         patches.append(ChartPatch(from: hubBox, to: hubBox))
-        guard let texture = snapshot(using: zoomRenderer),
-              let view = ChartReflow(frame: chartFrame, renderer: zoomRenderer, texture: texture, patches: patches, radial: true, duration: duration) else { return false }
+        guard let texture = fillingGaps ? layout.artwork?.texture : snapshot(using: zoomRenderer),
+              let view = ChartReflow(frame: chartFrame, renderer: zoomRenderer, texture: texture, patches: patches, radial: true, sliding: fillingGaps, duration: duration) else { return false }
         trashTransition = view; addSubview(view)
         view.completed = { [weak self] in self?.endTrashReflow(); self?.refreshHover() }
         view.start()
@@ -511,22 +546,24 @@ final class Sunburst: NSView {
     func showLive(_ next: FolderListing, colors: MapBreakdown?, layout: Rings, sameFolder: Bool, afterTrash: Bool = false) {
         endTrashReflow()
         if afterTrash { departure = nil; endZoom() }
-        task?.cancel(); task = nil; motion.stop(); discardTrashBacking()
+        task?.cancel(); task = nil; motion.stop()
         if let style = layout.artwork?.style, style != liveDimensions {
             list = next; self.colors = colors; rebuild(); return
         }
         list = next; self.colors = colors; lastRadius = radius
         let previous = rings
+        let deletion = afterTrash || (!next.model.isScanPreview && (ringList?.summary.entries ?? 0) > next.summary.entries)
         install(layout, for: next, colors: colors, sameFolder: sameFolder)
         guard departure == nil else { return }
         setAccessibilityValue("\(layout.bands.count) rings · \(formatBytes(next.summary.bytes))")
         if sameFolder, zoomView == nil, let previous, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            if afterTrash && animateReflow(from: previous, to: layout, duration: 0.36) {
+            if deletion {
+                _ = animateReflow(from: previous, to: layout, duration: 0.24, fillingGaps: true)
                 refreshHover()
                 return
             }
             if let start = layout.starting(at: previous) {
-                if !afterTrash && animateReflow(from: start, to: layout, duration: ChartMotion.duration) {
+                if animateReflow(from: start, to: layout, duration: ChartMotion.duration) {
                     refreshHover()
                     return
                 }
@@ -555,7 +592,7 @@ final class Sunburst: NSView {
         super.layout()
         if let view = trashTransition, view.frame != chartFrame { endTrashReflow() }
         if let zoomView, zoomView.frame != chartFrame { endZoom() }
-        if abs(radius - lastRadius) > 2 { departure = nil; discardTrashBacking(); rebuild() }
+        if abs(radius - lastRadius) > 2 { departure = nil; rebuild() }
     }
     override func viewDidHide() { super.viewDidHide(); endTrashReflow(); endZoom() }
     override func viewDidChangeBackingProperties() { super.viewDidChangeBackingProperties(); departure = nil; endTrashReflow(); endZoom(); rebuild() }
@@ -574,7 +611,6 @@ final class Sunburst: NSView {
             DispatchQueue.main.async {
                 guard let self, self.task === work, !work.isCancelled else { return }
                 self.task = nil
-                self.discardTrashBacking()
                 self.install(result, for: list, colors: colors)
                 self.setAccessibilityValue("\(result.bands.count) rings · \(formatBytes(list.summary.bytes))")
                 if let window = self.window { self.hover(self.convert(window.mouseLocationOutsideOfEventStream, from: nil), force: true) }

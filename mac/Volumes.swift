@@ -17,7 +17,7 @@ struct VolumeCapacity {
 
     static func startup() -> Self? {
         var stats = statfs()
-        guard statfs(MountedVolume.startupPath, &stats) == 0 else { return nil }
+        guard statfs(StartupSnapshot.startupPath, &stats) == 0 else { return nil }
         return Self(stats)
     }
 
@@ -82,7 +82,6 @@ final class VolumeUsageBar: NSView {
 }
 
 private struct MountedVolume {
-    static let startupPath = FileManager.default.fileExists(atPath: "/System/Volumes/Data") ? "/System/Volumes/Data" : "/"
     let url: URL, name: String, symbol: String
     let capacity: VolumeCapacity, hidden: Bool, startup: Bool
     static func all() -> [MountedVolume] {
@@ -99,7 +98,7 @@ private struct MountedVolume {
                 URL(fileURLWithFileSystemRepresentation: bytes.baseAddress!.assumingMemoryBound(to: CChar.self), isDirectory: true, relativeTo: nil)
             }
             let path = url.path
-            let boot = path == startupPath
+            let boot = path == StartupSnapshot.startupPath
             let local = m.f_flags & UInt32(MNT_LOCAL) != 0
             let ownName = path == "/" ? "System volume" : url.lastPathComponent
             let hidden = !boot && (path == "/" || m.f_flags & UInt32(MNT_DONTBROWSE) != 0 || path == "/dev" || path.hasPrefix("/System/Volumes/"))
