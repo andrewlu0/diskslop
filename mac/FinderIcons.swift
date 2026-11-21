@@ -32,6 +32,14 @@ final class FinderIcons {
     }
 
     func display(_ url: URL?, in imageView: NSImageView, row: DTRow) {
+        display(url, in: imageView, placeholder: row.isFolder ? folder : row.kind == 2 ? link : file)
+    }
+
+    func displayFolder(_ url: URL, in imageView: NSImageView) {
+        display(url, in: imageView, placeholder: folder)
+    }
+
+    private func display(_ url: URL?, in imageView: NSImageView, placeholder: NSImage) {
         if let url, requests.object(forKey: imageView)?.url == url { return }
         requests.removeObject(forKey: imageView)
         imageView.contentTintColor = nil
@@ -44,7 +52,7 @@ final class FinderIcons {
             imageView.image = icon
             return
         }
-        imageView.image = row.isFolder ? folder : row.kind == 2 ? link : file
+        imageView.image = placeholder
         let job = BlockOperation()
         let request = Request(url: url, job: job)
         requests.setObject(request, forKey: imageView)

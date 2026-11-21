@@ -52,6 +52,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private lazy var appUpdater = SPUUpdater(hostBundle: .main, applicationBundle: .main,
                                              userDriver: updateDriver, delegate: updateDriver)
     private lazy var appearance = AppearanceSettings(updater: appUpdater)
+    private let folderIcon = NSImageView()
     private let folderLabel = NSTextField(labelWithString: "DiskSlop")
     private let pathLabel = NSTextField(labelWithString: "Choose a folder or scan your startup data volume.")
     private let sizeLabel = NSTextField(labelWithString: "")
@@ -374,6 +375,10 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         spinner.style = .spinning
         spinner.controlSize = .small
         spinner.isDisplayedWhenStopped = false
+        folderIcon.translatesAutoresizingMaskIntoConstraints = false
+        folderIcon.setAccessibilityElement(false)
+        NSLayoutConstraint.activate([folderIcon.widthAnchor.constraint(equalToConstant: 30),
+            folderIcon.heightAnchor.constraint(equalTo: folderIcon.widthAnchor)])
         folderLabel.font = .systemFont(ofSize: 26, weight: .semibold)
         folderLabel.lineBreakMode = .byTruncatingMiddle
         folderLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -407,7 +412,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         liveLabel.font = .systemFont(ofSize: 12, weight: .medium)
         liveLabel.setAccessibilityElement(false)
         updates.refresh = { [weak self] entry, progress, changes in self?.refreshLive(entry, progress: progress, changes: changes) }
-        let heading = row([folderLabel, spacer(), row([liveDot, liveLabel, liveSwitch], spacing: 5), mapStyle, sizeLabel], spacing: 11)
+        let heading = row([row([folderIcon, folderLabel], spacing: 7), spacer(), row([liveDot, liveLabel, liveSwitch], spacing: 5), mapStyle, sizeLabel], spacing: 11)
         tree.view.selectScope = { [weak self] in self?.selectAll(nil) }
         tree.selectionChanged = { [weak self] in
             guard let self, self.shelf != nil, !self.publishingLive else { return }
@@ -644,8 +649,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         defer { publishingLive = false }
         clearWorkspace()
         locations = [Location(id: 0, url: workspace.root)]
-        folderLabel.stringValue = workspace.root.lastPathComponent.isEmpty ? workspace.root.path : workspace.root.lastPathComponent
-        window.title = "\(folderLabel.stringValue) — DiskSlop"
+        setHeading(workspace.root)
         showHover(nil, kind: nil)
         revealWorkspace()
         controls()
@@ -734,6 +738,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         model = list.model; listing = list
         if previous == nil, let root = list.model.url(folder: 0, directory: true) { locations = [Location(id: 0, url: root)] }
         tree.showLive(list.model, keys: keys, lead: lead)
+        if previous == nil { setHeading(workspace.root) }
         installScanCharts(request, next, continuing: previous != nil)
         if showingLargest, !largest.selected.isEmpty { syncRankedSelection() }
         if let file = pendingParentFile, let parent = list.model.route(to: file.deletingLastPathComponent()) {
@@ -746,8 +751,9 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         controls()
     }
 
-    private func installScanCharts(_ request: ScanMapRequest, _ next: ScanMapFrame, continuing: Bool) {
-        let list = next.list, scope: Set<UInt64> = [DiskItem.scanRootKey]
+    private func installScanCharts(_ request: ScanMapRequest, _ next: ScanMapFrame, continuing: Bool, animate: Bool = true) {
+        let list = next.list
+        let scope = Set(locations.compactMap { $0.item?.key }).union([DiskItem.scanRootKey])
         let matches = colorMode == request.mode, colors = matches ? next.colors : nil
         legend.showLive(list.geometry.kinds, colors: colors, sorted: legend.sort == request.sort ? next.order : nil)
         legend.choosing(colorMode, loading: (colors?.mode ?? .kind) != colorMode)
@@ -756,10 +762,16 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         sunburst.scopeKeys = scope
         if usingSunburst {
             if matches, let rings = next.rings, request.dimensions == sunburst.liveDimensions {
-                sunburst.showLive(list, colors: colors, layout: rings, sameFolder: continuing)
-            } else { sunburst.show(list, colors: colors) }
+                sunburst.showLive(list, colors: colors, layout: rings, sameFolder: continuing && animate)
+            } else { sunburst.show(list, colors: colors, keepingLayout: continuing) }
         }
         if !matches { updateColors(for: list) }
+    }
+
+    private func setHeading(_ url: URL) {
+        folderLabel.stringValue = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
+        window.title = "\(folderLabel.stringValue) — DiskSlop"
+        tree.icons.displayFolder(url, in: folderIcon)
     }
 
     private func showHover(_ url: URL?, kind: UInt32?) {
@@ -1002,8 +1014,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         map.selection = tree.selectedKeys(); sunburst.selection = map.selection
         if showingLargest { largest.table.refreshHover() } else { tree.view.refreshHover() }
         if let here = next.trail.last?.url {
-            folderLabel.stringValue = here.lastPathComponent.isEmpty ? here.path : here.lastPathComponent
-            window.title = "\(folderLabel.stringValue) — DiskSlop"
+            setHeading(here)
         }
         sizeLabel.stringValue = formatBytes(next.list.summary.bytes)
         setScanStatus(["\(formatCount(next.list.summary.entries)) entries", "Updated \(Date().formatted(date: .omitted, time: .standard))"], summary: next.list.summary)
@@ -1244,19 +1255,21 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             }
         }
     }
-    private func display(_ list: FolderListing, message: String? = nil, reloadTree: Bool = false, continuingScan: Bool = false) {
+    private func display(_ list: FolderListing, message: String? = nil, reloadTree: Bool = false, continuingScan: Bool = false,
+                         trashFrame: (ScanMapRequest, ScanMapFrame)? = nil) {
         let previous = applyingNavigation
         applyingNavigation = true
         defer { applyingNavigation = previous }
+        let sameFolder = listing?.folder == list.folder && listing?.model === list.model
         if listing !== list { recentColors.removeAll() }
         listing = list
         if continuingScan { tree.showLive(list.model, keys: Array(tree.selectedKeys()), lead: tree.leadKey) }
         else { tree.show(list.model, refresh: reloadTree) }
         revealWorkspace()
         showHover(nil, kind: nil)
-        if let (request, frame) = finishedScanFrame, frame.list === list {
+        if let (request, frame) = trashFrame ?? finishedScanFrame, frame.list === list {
             if let work = colorWork { dt_cancel(work.handle); colorWork = nil }
-            installScanCharts(request, frame, continuing: continuingScan)
+            installScanCharts(request, frame, continuing: continuingScan || (trashFrame != nil && sameFolder), animate: trashFrame == nil)
         } else {
             legend.show(list.geometry.kinds)
             let scopeKeys = Set(locations.compactMap { $0.item?.key }).union([DiskItem.scanRootKey])
@@ -1270,8 +1283,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         map.selection = tree.selectedKeys()
         sunburst.selection = map.selection
         if let here = locations.last {
-            folderLabel.stringValue = here.url.lastPathComponent.isEmpty ? here.url.path : here.url.lastPathComponent
-            window.title = "\(folderLabel.stringValue) — DiskSlop"
+            setHeading(here.url)
         }
         sizeLabel.stringValue = formatBytes(list.summary.bytes)
         let parts = [message, "\(formatCount(list.summary.entries)) \(list.summary.entries == 1 ? "entry" : "entries")", String(format: "Scan %.2f s", scanTime)].compactMap { $0 }
@@ -1610,7 +1622,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
 
     private func moveToTrash(_ plan: TrashPlan, acknowledged: Bool) {
         movingToTrash = true
-        let trail = locations, aspect = map.aspect
+        let trail = locations, request = scanMapRequest()
         let prior = trail.first.flatMap { cache.read($0.url) }
         let geometry = listing?.geometry, scope = sunburst.scopeKeys
         let viewport = usingSunburst ? CGRect(x: 0, y: 0, width: 1, height: 1) : map.viewport
@@ -1633,7 +1645,8 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                 guard let item = location.item else { return true }
                 return plan.model.url(folder: item.folder, slot: item.slot, directory: true) != nil
             })
-            let fresh = result.moved > 0 ? FolderListing(plan.model, folder: surviving.last?.id ?? 0, aspect: aspect) : nil
+            let fresh = result.moved > 0 ? FolderListing(plan.model, folder: surviving.last?.id ?? 0, aspect: request.aspect) : nil
+            let frame = fresh.flatMap { request.prepare($0, progress: ScanProgress(), animate: false) }
             DispatchQueue.main.async {
                 defer {
                     self.movingToTrash = false
@@ -1642,7 +1655,6 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                         NSApp.reply(toApplicationShouldTerminate: result.failed == 0)
                     }
                 }
-                self.trashGlass.revealNewMap()
                 self.busy = false
                 let message = "\(result.moved.formatted()) moved to Trash"
                 if let fresh {
@@ -1651,7 +1663,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
                             identity: prior.identity, watcher: prior.watcher, elapsed: prior.elapsed, startupSnapshot: prior.startupSnapshot), for: prior.root)
                     }
                     self.locations = surviving
-                    self.display(fresh, message: message, reloadTree: true)
+                    self.display(fresh, message: message, reloadTree: true, trashFrame: frame.map { (request, $0) })
                     self.recordVisit(replace: true)
                 } else {
                     self.status.stringValue = "Selection stayed in place"

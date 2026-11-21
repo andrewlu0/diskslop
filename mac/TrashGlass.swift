@@ -65,9 +65,9 @@ final class TrashGlass {
     let dock = DockTrashLocator()
     private var panels: [NSPanel] = []
     private var clearance: DispatchWorkItem?
-    private var missing: MissingGlass?
+    private weak var missing: MissingGlass?
 
-    func revealNewMap() { missing?.removeFromSuperview(); missing = nil }
+    private func revealNewMap() { missing?.removeFromSuperview(); missing = nil }
 
     func play(_ regions: [TrashGlassRegion], from view: NSView) {
         guard !regions.isEmpty, let window = view.window, window.isVisible, !window.isMiniaturized,

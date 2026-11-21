@@ -142,7 +142,6 @@ final class Sunburst: NSView {
     private var hoverKey: UInt64?
     private var swipeTime: TimeInterval = 0
     private var dragStart: CGPoint?, dragged = false
-    private var dragRoutes: [UInt64: [DiskItem]] = [:]
     private var center: CGPoint { CGPoint(x: bounds.midX, y: bounds.midY) }
     private var radius: CGFloat { max(1, min(bounds.width, bounds.height) / 2 - 10) }
     private var hub: CGFloat { min(70, max(22, radius * 0.23)) }
@@ -168,7 +167,7 @@ final class Sunburst: NSView {
         motion.stop()
         list = next; colors = nextColors
         if !same {
-            if !keepingLayout { rings = nil }
+            if !keepingLayout { rings = nil; discardTrashBacking() }
             hoverKey = nil; toolTip = nil; needsDisplay = true; overlay.needsDisplay = true
         }
         rebuild()
@@ -202,13 +201,12 @@ final class Sunburst: NSView {
         let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
         if bounds.contains(point) { hover(point, force: true) }
     }
-    override func layout() { super.layout(); if abs(radius - lastRadius) > 2 { rebuild() } }
+    override func layout() { super.layout(); if abs(radius - lastRadius) > 2 { discardTrashBacking(); rebuild() } }
     override func viewDidChangeBackingProperties() { super.viewDidChangeBackingProperties(); rebuild() }
     override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); appearanceChanged() }
     @objc private func appearanceChanged() { needsDisplay = true; overlay.needsDisplay = true }
     private func rebuild() {
         motion.stop()
-        discardTrashBacking()
         task?.cancel()
         guard let list, !isHidden, radius > 2 else { return }
         let radius = radius, scale = window?.backingScaleFactor ?? 2, colors = colors
@@ -219,6 +217,7 @@ final class Sunburst: NSView {
             let result = Rings(list, colors: colors, radius: radius, scale: scale) { work.isCancelled }
             DispatchQueue.main.async {
                 guard let self, self.task === work, !work.isCancelled else { return }
+                self.discardTrashBacking()
                 self.rings = result; self.needsDisplay = true; self.overlay.needsDisplay = true
                 self.setAccessibilityValue("\(result.bands.count) rings · \(formatBytes(list.summary.bytes))")
                 if let window = self.window { self.hover(self.convert(window.mouseLocationOutsideOfEventStream, from: nil), force: true) }
@@ -386,19 +385,17 @@ final class Sunburst: NSView {
     override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
     override func mouseExited(with event: NSEvent) { hoverKey = nil; toolTip = nil; hovered?(nil, nil) }
     override func mouseDown(with event: NSEvent) {
-        dragStart = convert(event.locationInWindow, from: nil); dragged = false; dragRoutes.removeAll(keepingCapacity: true)
+        dragStart = convert(event.locationInWindow, from: nil); dragged = false
     }
     override func mouseDragged(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         guard let start = dragStart, hypot(point.x-start.x, point.y-start.y) > 3 else { return }
-        if !dragged, let first = sector(at: start)?.item { dragRoutes[first.key] = route(first) }
         dragged = true
-        if let item = sector(at: point)?.item, dragRoutes[item.key] == nil { dragRoutes[item.key] = route(item) }
     }
     override func mouseUp(with event: NSEvent) {
-        defer { dragStart = nil; dragRoutes.removeAll(keepingCapacity: true) }
+        defer { dragStart = nil }
         let point = convert(event.locationInWindow, from: nil), mode = SelectionMode(event.modifierFlags)
-        if dragged { choose?(Array(dragRoutes.values), mode); return }
+        guard !dragged else { return }
         guard let item = sector(at: point)?.item, let route = route(item) else {
             if hypot(point.x-center.x, point.y-center.y) < hub { up?() }
             return

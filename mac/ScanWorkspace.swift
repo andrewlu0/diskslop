@@ -5,7 +5,7 @@ struct ScanMapRequest {
     let settings: MapRenderSettings?, priorFrame: (FileMap, RenderedFiles)?
     let radial: Bool, dimensions: (radius: CGFloat, scale: CGFloat)
 
-    func prepare(_ list: FolderListing, progress: ScanProgress) -> ScanMapFrame? {
+    func prepare(_ list: FolderListing, progress: ScanProgress, animate: Bool = true) -> ScanMapFrame? {
         guard !dt_is_cancelled(progress.handle) else { return nil }
         let colors = mode == .kind ? nil : MapBreakdown(list, mode: mode, progress: progress)
         guard !dt_is_cancelled(progress.handle) else { return nil }
@@ -14,7 +14,7 @@ struct ScanMapRequest {
             order = MapGroupOrder(colors.handle, key: sort.key, ascending: sort.ascending)
         }
         let frame = settings.flatMap { spec in
-            spec.render(list.geometry, colors: colors).map { LiveMapFrame($0, geometry: list.geometry, settings: spec, source: priorFrame) }
+            spec.render(list.geometry, colors: colors).map { LiveMapFrame($0, geometry: list.geometry, settings: spec, colors: colors, source: animate ? priorFrame : nil) }
         }
         let rings = radial ? Rings(list, colors: colors, radius: dimensions.radius, scale: dimensions.scale) {
             dt_is_cancelled(progress.handle)

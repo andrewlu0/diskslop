@@ -30,11 +30,40 @@ final class RankedTable: NSTableView {
         let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
         if visibleRect.contains(point) { hovered?(row(at: point)) }
     }
+    private var trackingClick = false
+    private var rangeAnchor: Int?
+    override func mouseDown(with event: NSEvent) {
+        let index = row(at: convert(event.locationInWindow, from: nil))
+        guard index >= 0, event.clickCount == 1 else { super.mouseDown(with: event); return }
+        window?.makeFirstResponder(self)
+        trackingClick = true
+        let mode = SelectionMode(event.modifierFlags)
+        switch mode {
+        case .replace:
+            selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+            rangeAnchor = index
+        case .toggle:
+            if isRowSelected(index) { deselectRow(index) }
+            else { selectRowIndexes(IndexSet(integer: index), byExtendingSelection: true) }
+            rangeAnchor = index
+        case .range, .addRange:
+            let start = rangeAnchor.flatMap { isRowSelected($0) ? $0 : nil } ?? (selectedRow >= 0 ? selectedRow : index)
+            selectRowIndexes(IndexSet(integersIn: min(start, index)...max(start, index)), byExtendingSelection: mode == .addRange)
+            rangeAnchor = start
+        }
+    }
+    override func mouseDragged(with event: NSEvent) {
+        if !trackingClick { super.mouseDragged(with: event) }
+    }
+    override func mouseUp(with event: NSEvent) {
+        if trackingClick { trackingClick = false } else { super.mouseUp(with: event) }
+    }
     override func menu(for event: NSEvent) -> NSMenu? {
         let index = row(at: convert(event.locationInWindow, from: nil))
         guard index >= 0 else { return nil }
         if event.modifierFlags.contains(.control) {
             if selectedRowIndexes.contains(index) { deselectRow(index) } else { selectRowIndexes(IndexSet(integer: index), byExtendingSelection: true) }
+            rangeAnchor = index
             return nil
         }
         if !selectedRowIndexes.contains(index) { selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false) }

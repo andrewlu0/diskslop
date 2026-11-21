@@ -72,26 +72,6 @@ final class FileMap: @unchecked Sendable {
         var key = DTKey()
         return dt_map_hit(handle, p.x, p.y, &key) ? key : nil
     }
-    func keys(in area: CGRect) -> [DTKey] {
-        guard let selected = dt_map_selection(handle, DTRect(area)) else { return [] }
-        defer { dt_selection_free(selected) }
-        var count = 0
-        let keys = dt_selection_keys(selected, &count)
-        return Array(UnsafeBufferPointer(start: keys, count: count))
-    }
-    func routes(_ keys: [DTKey]) -> [[DiskItem]] {
-        var parents: [UInt32: [DiskItem]] = [:]
-        return keys.compactMap { key in
-            if let parent = parents[key.folder] {
-                var row = DTRow()
-                guard dt_entry(model.handle, key.folder, key.slot, &row) else { return nil }
-                return parent + [DiskItem(row, folder: key.folder)]
-            }
-            guard let path = model.route(to: key, from: folder) else { return nil }
-            parents[key.folder] = Array(path.dropLast())
-            return path
-        }
-    }
     func kind(at key: DTKey) -> UInt32 { dt_map_kind(handle, key) }
     func motionTiles(in frame: RenderedFiles) -> [MapItemName: (key: UInt64, rect: CGRect)] {
         var tiles = Dictionary(frame.labels.map { ($0.identity, (key: $0.key, rect: $0.rect)) }, uniquingKeysWith: { first, _ in first })

@@ -1,7 +1,7 @@
 import AppKit
 
 enum SelectionMode {
-    case replace, toggle, range, addRange, add
+    case replace, toggle, range, addRange
     init(_ flags: NSEvent.ModifierFlags) {
         let additive = flags.contains(.control) || flags.contains(.command)
         if flags.contains(.shift) { self = additive ? .addRange : .range }
@@ -56,10 +56,7 @@ final class FileOutlineView: NSOutlineView {
         if let selectScope { selectScope() } else { super.selectAll(sender) }
     }
     var gestureEnded: (() -> Void)?
-    var trackingSelection: Bool { dragOrigin >= 0 }
-    private var dragOrigin = -1
-    private var dragBase = IndexSet()
-    private var dragMode = SelectionMode.replace
+    private(set) var trackingSelection = false
     override func menu(for event: NSEvent) -> NSMenu? {
         if event.modifierFlags.contains(.control) { return nil }
         let r = row(at: convert(event.locationInWindow, from: nil))
@@ -72,31 +69,16 @@ final class FileOutlineView: NSOutlineView {
         let i = row(at: p)
         guard i >= 0, event.clickCount == 1, !frameOfOutlineCell(atRow: i).contains(p) else { super.mouseDown(with: event); return }
         window?.makeFirstResponder(self)
-        dragMode = SelectionMode(event.modifierFlags)
-        dragBase = selectedRowIndexes
-        dragOrigin = i
-        selectGesture?(i, dragMode)
+        trackingSelection = true
+        selectGesture?(i, SelectionMode(event.modifierFlags))
     }
     override func mouseDragged(with event: NSEvent) {
-        guard dragOrigin >= 0 else { super.mouseDragged(with: event); return }
-        autoscroll(with: event)
-        let i = row(at: convert(event.locationInWindow, from: nil))
-        guard i >= 0 else { return }
-        let span = IndexSet(integersIn: min(i, dragOrigin)...max(i, dragOrigin))
-        let result: IndexSet
-        switch dragMode {
-        case .toggle: result = dragBase.symmetricDifference(span)
-        case .add, .addRange: result = dragBase.union(span)
-        default: result = span
-        }
-        selectRowIndexes(result, byExtendingSelection: false)
+        if !trackingSelection { super.mouseDragged(with: event) }
     }
     override func mouseUp(with event: NSEvent) {
-        let finished = trackingSelection
-        if dragOrigin < 0 { super.mouseUp(with: event) }
-        dragOrigin = -1
-        dragBase.removeAll()
-        if finished { gestureEnded?() }
+        guard trackingSelection else { super.mouseUp(with: event); return }
+        trackingSelection = false
+        gestureEnded?()
     }
     override func rightMouseDown(with event: NSEvent) {
         if event.modifierFlags.contains(.control) {
@@ -155,7 +137,7 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
     private var expanded: [UInt64: TreeRow] = [:]
     private var anchor: TreeRow?
     private var applyingSelection = false
-    private let icons = FinderIcons()
+    let icons = FinderIcons()
 
     override init() {
         super.init()
@@ -378,7 +360,6 @@ final class Outline: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         var result = view.selectedRowIndexes
         switch mode {
         case .replace: result = indexes
-        case .add: result.formUnion(indexes)
         case .toggle: result.formSymmetricDifference(indexes)
         case .range, .addRange:
             guard let last = indexes.last else { return }
