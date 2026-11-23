@@ -88,11 +88,14 @@ hdiutil attach -quiet -readonly -nobrowse -noautoopen -mountpoint "$mountpoint" 
 mounted=true
 installed="$mountpoint/DiskSlop.app"
 [ "$(readlink "$mountpoint/Applications")" = /Applications ]
-architectures=$(xcrun lipo -archs "$installed/Contents/MacOS/DiskSlop")
-case "$architectures" in
-    'arm64 x86_64'|'x86_64 arm64') printf 'Verified app architectures: %s\n' "$architectures" ;;
-    *) echo "Expected a universal app, found $architectures." >&2; exit 1 ;;
-esac
+for binary in "$installed/Contents/MacOS/DiskSlop" "$installed/Contents/Helpers/diskslop"; do
+    architectures=$(xcrun lipo -archs "$binary")
+    case "$architectures" in
+        'arm64 x86_64'|'x86_64 arm64') printf 'Verified %s: %s\n' "$binary" "$architectures" ;;
+        *) echo "Expected a universal binary, found $architectures." >&2; exit 1 ;;
+    esac
+done
+"$installed/Contents/Helpers/diskslop" --json --summary "$installed/Contents/MacOS" | plutil -extract allocated_bytes raw -o - -
 codesign --verify --deep --strict --all-architectures "$installed"
 test -s "$installed/Contents/Resources/THIRD-PARTY-NOTICES.txt"
 test -x "$installed/Contents/Frameworks/Sparkle.framework/Autoupdate"

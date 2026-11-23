@@ -29,5 +29,7 @@ jobs:
       - name: Verify the app and scan a folder
         run: |
           codesign --verify --deep --strict DiskSlop.app
-          target/release/diskslop --summary mac
+          cli=DiskSlop.app/Contents/Helpers/diskslop
+          "$cli" --summary mac
+          "$cli" --json --top 1 mac | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["entries"] > 1 and r["errors"] == 0 and len(r["children"]) == 1'
           ./scripts/third-party-notices.py | diff - THIRD-PARTY-NOTICES.txt

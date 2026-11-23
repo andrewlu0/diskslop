@@ -82,7 +82,13 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private var applyingNavigation = false
     private var scanning: ScanProgress?
     private var timer: Timer?
-    private var busy = false
+    private var busy = false {
+        didSet {
+            if !busy, pendingURL != nil {
+                DispatchQueue.main.async { [weak self] in self?.openPendingFolder() }
+            }
+        }
+    }
     private var pendingURL: URL?
     private var trashLayoutWork: ScanProgress?
     private var movingToTrash = false
@@ -134,12 +140,15 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let url = urls.first else { return }
-        if window == nil { pendingURL = url }
-        else if reopeningStartup {
-            guard url.path != StartupSnapshot.startupPath else { return }
-            pendingURL = url
-            cancel()
-        } else if !busy { scan(url) }
+        if reopeningStartup && url.path == StartupSnapshot.startupPath && pendingURL == nil { return }
+        pendingURL = url
+        if busy, scanning != nil { cancel() }
+        openPendingFolder()
+    }
+    private func openPendingFolder() {
+        guard window != nil, !busy, !waitingToQuit, let url = pendingURL else { return }
+        pendingURL = nil
+        scan(url)
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -159,6 +168,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     }
 
     @objc private func installAvailableUpdate() { updateDriver.installAvailableUpdate() }
+    @objc private func installTerminalCommand() { TerminalCommand.install() }
     @objc private func checkForAppUpdates() { updateDriver.checkFromMenu(using: appUpdater) }
 
     private func buildMenus() {
@@ -179,6 +189,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
         let app = menu("DiskSlop")
         command(app, "About DiskSlop", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), responder: true)
         command(app, "Check for Updates…", #selector(checkForAppUpdates))
+        command(app, "Install Terminal Command", #selector(installTerminalCommand))
         app.addItem(.separator())
         app.addItem(withTitle: "Settings…", action: #selector(AppearanceSettings.show(_:)), keyEquivalent: ",").target = appearance
         app.addItem(.separator())
@@ -256,6 +267,7 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
     private var browserIsKey: Bool { window?.isKeyWindow == true && window.attachedSheet == nil }
     private var hasSelection: Bool { showingLargest ? largest.table.numberOfSelectedRows > 0 : tree.view.numberOfSelectedRows > 0 }
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(installTerminalCommand) { return true }
         if menuItem.action == #selector(checkForAppUpdates) {
             menuItem.title = updateDriver.menuTitle
             return updateDriver.hasOffer || appUpdater.canCheckForUpdates
@@ -1139,13 +1151,10 @@ final class DiskApp: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSSp
             previewed = entry.model
             self.showRoot(entry, message: "Checking cached scan")
         }) { result, scanVisit in
-            if self.reopeningStartup {
-                self.reopeningStartup = false
-                if let requested = self.pendingURL {
-                    self.pendingURL = nil
-                    self.scan(requested)
-                    return
-                }
+            self.reopeningStartup = false
+            if self.pendingURL != nil {
+                self.openPendingFolder()
+                return
             }
             switch result {
             case .success(let entry):

@@ -27,7 +27,17 @@ brew install --cask andrewlu0/tap/diskslop
 
 ## Install on macOS
 
-Open the DMG and drag DiskSlop to Applications. To build from source, use Rust and the macOS 26 SDK or later.
+Open the DMG and drag DiskSlop to Applications. Choose **DiskSlop → Install Terminal Command** to use `diskslop` in Terminal. Homebrew installs the command automatically.
+
+```sh
+diskslop --top 10 .
+diskslop --json .
+diskslop open .
+```
+
+The CLI scans the folder and lists its largest immediate children by allocated bytes. Use `--summary` for totals alone. JSON includes the entry count, allocated bytes, scan errors, mount boundaries, elapsed seconds, and the ranked children. A partial scan still prints its results and exits with a nonzero status. `diskslop open .` opens the current directory in the graphical app.
+
+To build from source, use Rust and the macOS 26 SDK or later.
 
 ```sh
 ./build-app.sh

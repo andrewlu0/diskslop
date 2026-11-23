@@ -25,7 +25,8 @@ mkdir -p "$build_dir/swift-cache" "$output_dir"
 build_dir=$(cd "$build_dir" && pwd -P)
 app="$(cd "$output_dir" && pwd -P)/DiskSlop.app"
 bundle="$app/Contents"
-mkdir -p "$bundle/MacOS" "$bundle/Resources"
+mkdir -p "$bundle/MacOS" "$bundle/Helpers" "$bundle/Resources"
+cli="$bundle/Helpers/diskslop"
 sdk=$(xcrun --sdk macosx --show-sdk-path)
 sparkle=$(./scripts/sparkle.sh)
 compile_app() {
@@ -48,6 +49,7 @@ build_rust() (
     cargo build --locked --release "$@"
 )
 build_rust
+cp "$build_dir/release/diskslop" "$cli"
 compile_app "$host_arch" "$build_dir/release" "$bundle/MacOS/DiskSlop"
 if [ "${1:-}" = --universal ]; then
     case "$host_arch" in
@@ -55,8 +57,9 @@ if [ "${1:-}" = --universal ]; then
         x86_64) other_arch=arm64; other_target=aarch64-apple-darwin ;;
         *) echo "Unsupported macOS architecture: $host_arch" >&2; exit 1 ;;
     esac
-    build_rust --lib --target "$other_target"
+    build_rust --target "$other_target"
     other_dir="$build_dir/$other_target/release"
+    xcrun lipo -create "$build_dir/release/diskslop" "$other_dir/diskslop" -output "$cli"
     thin=$(mktemp "$build_dir/.DiskSlop-$other_arch.XXXXXX")
     trap 'rm -f "$thin"' EXIT
     compile_app "$other_arch" "$other_dir" "$thin"
@@ -64,7 +67,7 @@ if [ "${1:-}" = --universal ]; then
     mv "$bundle/MacOS/DiskSlop.universal" "$bundle/MacOS/DiskSlop"
 fi
 xcrun strip -S "$bundle/MacOS/DiskSlop"
-for binary in "$bundle/MacOS/DiskSlop" "$build_dir/release/diskslop"; do
+for binary in "$bundle/MacOS/DiskSlop" "$cli"; do
     for prefix in "$HOME" "$PWD" "$build_dir" "${CARGO_HOME:-$HOME/.cargo}"; do
         if LC_ALL=C grep -aFq -- "$prefix/" "$binary"; then
             echo "A compiled executable contains an absolute build path." >&2
@@ -104,4 +107,5 @@ else
 fi
 codesign "$@" "$fw_version/Autoupdate" "$fw_version/Updater.app"
 codesign "$@" "$framework"
+codesign "$@" --identifier local.diskslop.cli "$cli"
 codesign "$@" "$app"

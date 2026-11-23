@@ -264,24 +264,8 @@ pub(super) fn load(
             });
         }
     }
-    let mut scan = Inventory {
-        root,
-        device: meta.dev(),
-        folders: folders.into(),
-        order: orders.into(),
-        revision: Arc::new(()),
-        scan_id: None,
-        provisional: false,
-        delta: None,
-        rebuilt_from: None,
-        groups: Arc::default(),
-        owners: Arc::default(),
-        dirty_order: Vec::new(),
-        protected: Vec::new(),
-        issues: 0,
-        boundaries: 0,
-    };
-    scan.finish(progress)?;
+    let mut scan = Inventory::from_folders(root, meta.dev(), folders, progress)?;
+    scan.order = orders.into();
     scan.protected = trash::protected_folders(&scan);
     scan.folders.iter_mut().for_each(Folder::freeze);
     Ok((scan, checkpoint))

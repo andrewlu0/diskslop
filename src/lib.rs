@@ -919,26 +919,10 @@ impl Inventory {
             return Err(err);
         }
         let previous = build.reuse.as_ref().map(|r| r.scan);
-        let mut inventory = Self {
-            root,
-            device: meta.dev(),
-            folders: build.folders.into_inner().unwrap().into(),
-            revision: Arc::new(()),
-            scan_id: build.feed.as_ref().map(|f| f.id.clone()),
-            provisional: false,
-            delta: None,
-            rebuilt_from: previous.map(|p| p.revision.clone()),
-            groups: Arc::default(),
-            owners: Arc::default(),
-            order: Vec::new().into(),
-            dirty_order: Vec::new(),
-            protected: Vec::new(),
-            issues: 0,
-            boundaries: 0,
-        };
+        let mut folders = build.folders.into_inner().unwrap();
         let links = build.changed_links.into_inner().unwrap();
         if !links.is_empty() {
-            for f in inventory.folders.iter_mut() {
+            for f in &mut folders {
                 for slot in 0..f.entries.len() {
                     let e = &f.entries[slot];
                     if e.kind != EntryKind::Directory
@@ -953,7 +937,9 @@ impl Inventory {
                 }
             }
         }
-        inventory.finish(progress)?;
+        let mut inventory = Self::from_folders(root, meta.dev(), folders, progress)?;
+        inventory.scan_id = build.feed.as_ref().map(|f| f.id.clone());
+        inventory.rebuilt_from = previous.map(|p| p.revision.clone());
         inventory.protected = trash::protected_folders(&inventory);
         if index {
             let mut order = vec![Arc::default(); inventory.folders.len()];
@@ -983,21 +969,29 @@ impl Inventory {
         Ok(inventory)
     }
 
-    fn finish(&mut self, progress: &Progress) -> io::Result<()> {
+    fn from_folders(
+        root: PathBuf,
+        device: u64,
+        mut folders: Vec<Folder>,
+        progress: &Progress,
+    ) -> io::Result<Self> {
+        let mut groups = HashMap::new();
+        let mut issues = 0;
+        let mut boundaries = 0;
         let mut ordinal = 0;
         let mut stack = vec![(0usize, false)];
         while let Some((dir, leaving)) = stack.pop() {
             if leaving {
-                self.folders[dir].end = ordinal;
+                folders[dir].end = ordinal;
                 continue;
             }
             progress.check()?;
-            let f = &mut self.folders[dir];
+            let f = &mut folders[dir];
             f.pre = ordinal;
             ordinal += 1;
             stack.push((dir, true));
-            self.issues += f.issues;
-            self.boundaries += f.boundaries;
+            issues += f.issues;
+            boundaries += f.boundaries;
             f.count = f.entries.len() as u64;
             f.contains_mount = f.boundaries != 0;
             let shape = f
@@ -1019,14 +1013,11 @@ impl Inventory {
                     folder: dir as u32,
                     slot: slot as u32,
                 };
-                let group = Arc::get_mut(&mut self.groups)
-                    .unwrap()
-                    .entry(e.inode)
-                    .or_insert_with(|| LinkGroup {
-                        bytes: e.bytes,
-                        owner: key,
-                        members: Vec::new(),
-                    });
+                let group = groups.entry(e.inode).or_insert_with(|| LinkGroup {
+                    bytes: e.bytes,
+                    owner: key,
+                    members: Vec::new(),
+                });
                 group.members.push(key);
                 if group.owner != key && e.bytes != 0 {
                     f.entries[slot].bytes = 0;
@@ -1035,29 +1026,42 @@ impl Inventory {
             }
             f.shape = Some(shape);
         }
-        Arc::get_mut(&mut self.groups)
-            .unwrap()
-            .retain(|_, g| g.members.len() > 1);
-        for (inode, group) in self.groups.iter() {
-            Arc::get_mut(&mut self.owners).unwrap().insert(
-                (
-                    self.folders[group.owner.folder as usize].pre,
-                    group.owner.slot,
-                ),
+        groups.retain(|_, g| g.members.len() > 1);
+        let mut owners = BTreeMap::new();
+        for (inode, group) in &groups {
+            owners.insert(
+                (folders[group.owner.folder as usize].pre, group.owner.slot),
                 *inode,
             );
         }
         // A parent's slot is reserved before its children can be scheduled.
-        for id in (1..self.folders.len()).rev() {
-            let f = &self.folders[id];
+        for id in (1..folders.len()).rev() {
+            let f = &folders[id];
             let (bytes, count, files, has_mount) = (f.total, f.count, f.files, f.contains_mount);
-            let parent = f.parent.unwrap().folder as usize;
-            self.folders[parent].total += bytes;
-            self.folders[parent].count += count;
-            self.folders[parent].files += files;
-            self.folders[parent].contains_mount |= has_mount;
+            let parent_id = f.parent.unwrap().folder as usize;
+            let parent = &mut folders[parent_id];
+            parent.total += bytes;
+            parent.count += count;
+            parent.files += files;
+            parent.contains_mount |= has_mount;
         }
-        Ok(())
+        Ok(Self {
+            root,
+            device,
+            folders: folders.into(),
+            revision: Arc::new(()),
+            scan_id: None,
+            provisional: false,
+            delta: None,
+            rebuilt_from: None,
+            groups: Arc::new(groups),
+            owners: Arc::new(owners),
+            order: Vec::new().into(),
+            dirty_order: Vec::new(),
+            protected: Vec::new(),
+            issues,
+            boundaries,
+        })
     }
 
     pub fn root(&self) -> &Path {
